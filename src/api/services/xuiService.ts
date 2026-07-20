@@ -186,6 +186,8 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
   try {
     const inbounds = await getInbounds();
     
+    console.log("Searching for email:", email);
+    
     for (const inbound of inbounds) {
       let settingsObj: { clients?: XuiClient[] } = {};
       try {
@@ -200,7 +202,9 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       const clientStats = inbound.clientStats || [];
       
       for (const c of clients) {
-        if (c.email === email) {
+        console.log("Comparing:", `"${c.email}"`, "with", `"${email}"`);
+        if (c.email.trim().toLowerCase() === email.trim().toLowerCase()) {
+          console.log("MATCH FOUND");
           const stat = clientStats.find((s) => s.email === email);
           
           let total = c.totalGB || 0;
@@ -244,6 +248,7 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
         }
       }
     }
+    console.log("NO MATCH FOUND");
     return null;
   } catch (error: any) {
     console.error(`[XUI Service] Error looking up client by email (${email}):`, error.message);
