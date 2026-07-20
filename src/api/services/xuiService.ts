@@ -99,23 +99,47 @@ export const authenticate = async (config: XuiConfig): Promise<string> => {
       password: config.password
     });
 
-    console.log(`[XUI Auth] Login response status: ${response.status}`);
+    console.log(`[XUI Auth] Login response HTTP status: ${response.status}`);
+    console.log(`[XUI Auth] Login response headers:`, JSON.stringify(response.headers, null, 2));
+    console.log(`[XUI Auth] Login response body:`, JSON.stringify(response.data, null, 2));
+    
+    if (response.data) {
+      console.log(`[XUI Auth] response.data.success: ${response.data.success}`);
+      console.log(`[XUI Auth] response.data.msg: ${response.data.msg}`);
+      console.log(`[XUI Auth] response.data.obj:`, response.data.obj);
+    }
     
     if (response.data && response.data.success === false) {
       throw new Error(`3X-UI login failed: ${response.data.msg}`);
     }
 
     const cookies = response.headers['set-cookie'];
-    if (!cookies || cookies.length === 0) {
-      throw new Error('No session cookie returned from 3X-UI');
+    console.log(`[XUI Auth] Set-Cookie exists:`, !!cookies && cookies.length > 0);
+    
+    if (cookies && cookies.length > 0) {
+      const cookie = cookies[0].split(';')[0];
+      console.log(`[XUI Auth] Login successful, session cookie obtained`);
+      return cookie;
+    } else {
+      console.warn(`[XUI Auth] No session cookie returned. Checking response body for tokens...`);
+      
+      if (response.data && response.data.obj && typeof response.data.obj === 'string') {
+        console.log(`[XUI Auth] Token found in response body`);
+        // Note: adjust the format based on what 3X-UI exactly returns if it returns a string token
+        return `Bearer ${response.data.obj}`; 
+      }
+      
+      if (response.data && response.data.success === true) {
+        console.warn(`[XUI Auth] Authentication marked successful but no cookie/token found. Proceeding with empty session.`);
+        return '';
+      }
+      
+      throw new Error('Authentication failed: No session cookie or token returned from 3X-UI');
     }
-
-    const cookie = cookies[0].split(';')[0];
-    console.log(`[XUI Auth] Login successful, session cookie obtained`);
-    return cookie;
   } catch (error: any) {
     console.error(`[XUI Auth] Login request failed:`, error.message);
     if (error.response) {
+      console.error(`[XUI Auth] Response headers:`, error.response.headers);
       console.error(`[XUI Auth] Response body:`, error.response.data);
     }
     throw error;
@@ -135,6 +159,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   const client = createAxiosInstance(baseUrl);
 
   console.log(`[XUI API] ${method} ${baseUrl}${basePath}${endpoint}`);
+  console.log(`[XUI API] Request headers:`, { Cookie: sessionCookie });
   
   let response = await client.request({
     url: `${basePath}${endpoint}`,
@@ -145,7 +170,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
     }
   });
 
-  console.log(`[XUI API] Response status: ${response.status}`);
+  console.log(`[XUI API] Response status for ${endpoint}: ${response.status}`);
 
   // Re-authenticate if session expired
   if (response.status === 401 || (response.data && response.data.success === false && typeof response.data.msg === 'string' && response.data.msg.includes('login'))) {
