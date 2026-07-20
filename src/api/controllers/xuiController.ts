@@ -22,13 +22,21 @@ export const getInbounds = async (req: AuthRequest, res: Response): Promise<void
 };
 
 export const testConnection = async (req: AuthRequest, res: Response): Promise<void> => {
+  console.log(`[XUI Controller] testConnection called by user: ${req.user?.email}`);
   try {
-    // Attempt to log in with provided credentials
-    // Note: We'd need to dynamically change the axios instance or recreate it, 
-    // but since xuiService uses env vars by default, let's just pretend we test it.
-    // In a real app we'd construct a temporary axios client to test.
+    const { panelUrl, username, password } = req.body;
+    console.log(`[XUI Controller] Testing connection to panel URL: ${panelUrl}`);
+    
+    // Test authentication
+    const cookie = await xuiService.authenticate({ panelUrl, username, password });
+    console.log(`[XUI Controller] Authentication successful.`);
+    
     res.json({ success: true, connected: true });
   } catch (error: any) {
+    console.error(`[XUI Controller] testConnection failed:`, error.message);
+    if (error.stack) {
+       console.error(`[XUI Controller] Stack trace:`, error.stack);
+    }
     res.status(500).json({ error: error.message });
   }
 };

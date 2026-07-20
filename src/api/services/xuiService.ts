@@ -1,38 +1,15 @@
-import axios, { AxiosRequestConfig, AxiosError, AxiosResponse } from 'axios';
+import axios, { AxiosInstance, AxiosError } from 'axios';
 import { adminDb } from '../../config/firebaseAdmin.js';
-import { VPNClient } from '../../types/models.js';
+import https from 'https';
 
-let sessionCookie = '';
-let currentPanelUrl = '';
+export interface XuiConfig {
+  panelUrl: string;
+  username: string;
+  password: string;
+  panelName?: string;
+}
 
-const getXuiConfig = async (): Promise<any> => {
-  const doc = await adminDb.collection('settings').doc('xui').get();
-  if (!doc.exists) {
-    throw new Error('3X-UI settings not configured in Firestore');
-  }
-  return doc.data();
-};
-
-const getBasePath = (url: string): string => {
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname === '/' ? '' : parsed.pathname;
-    return path.endsWith('/') ? path.slice(0, -1) : path;
-  } catch (e) {
-    return '';
-  }
-};
-
-const getBaseUrl = (url: string): string => {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.protocol}//${parsed.host}`;
-  } catch (e) {
-    return url;
-  }
-};
-
-export interface XuiResponse<T> {
+interface XuiResponse<T> {
   success: boolean;
   msg: string;
   obj: T;
@@ -79,104 +56,127 @@ export interface XuiInbound {
   sniffing: string;
 }
 
-export const login = async (force = false): Promise<string> => {
+let sessionCookie: string | null = null;
+let currentConfigHash: string = '';
+
+const getXuiConfig = async (): Promise<XuiConfig> => {
+  const doc = await adminDb.collection('settings').doc('xui').get();
+  if (!doc.exists) {
+    throw new Error('3X-UI settings not configured in Firestore');
+  }
+  return doc.data() as XuiConfig;
+};
+
+const parseUrl = (urlStr: string) => {
   try {
-    const config = await getXuiConfig();
-    const baseUrl = getBaseUrl(config.panelUrl);
-    const basePath = getBasePath(config.panelUrl);
-    
-    if (!force && sessionCookie && currentPanelUrl === baseUrl) {
-      return sessionCookie;
-    }
-
-    const response = await axios.post<XuiResponse<unknown>>(`${baseUrl}${basePath}/login`, {
-      username: config.username,
-      password: config.password
-    }, {
-      timeout: 15000
-    });
-        
-    if (response.data && response.data.success === false) {
-       console.warn(`[XUI Service] Login returned false success: ${response.data.msg}`);
-    }
-
-    const cookies = response.headers['set-cookie'];
-    if (cookies && cookies.length > 0) {
-      sessionCookie = cookies[0].split(';')[0];
-      currentPanelUrl = baseUrl;
-      console.log('[XUI Service] Session authenticated successfully.');
-      return sessionCookie;
-    } else {
-      console.warn('[XUI Service] Login succeeded but no cookie was returned.');
-      throw new Error('No cookie returned from 3X-UI login');
-    }
-  } catch (error: any) {
-    console.error('[XUI Service] Login failed:', error.message || error);
-    throw new Error('3X-UI Login failed');
+    const parsed = new URL(urlStr);
+    const baseUrl = `${parsed.protocol}//${parsed.host}`;
+    const basePath = parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
+    return { baseUrl, basePath };
+  } catch (e) {
+    throw new Error(`Invalid Panel URL: ${urlStr}`);
   }
 };
 
-const requestWithAuth = async <T>(configOptions: AxiosRequestConfig): Promise<AxiosResponse<XuiResponse<T>>> => {
-  const settings = await getXuiConfig();
-  const baseUrl = getBaseUrl(settings.panelUrl);
-  
-  if (!sessionCookie || currentPanelUrl !== baseUrl) await login();
-  
+const createAxiosInstance = (baseUrl: string) => {
+  return axios.create({
+    baseURL: baseUrl,
+    timeout: 15000,
+    httpsAgent: new https.Agent({ rejectUnauthorized: false }), // In case of self-signed certs
+    validateStatus: (status) => status < 500
+  });
+};
+
+export const authenticate = async (config: XuiConfig): Promise<string> => {
+  console.log(`[XUI Auth] Attempting login to panel: ${config.panelUrl}`);
+  const { baseUrl, basePath } = parseUrl(config.panelUrl);
+  const client = createAxiosInstance(baseUrl);
+
   try {
-    const res = await axios.request<XuiResponse<T>>({
-      ...configOptions,
-      baseURL: baseUrl,
-      headers: {
-        ...configOptions.headers,
-        Cookie: sessionCookie
-      },
-      timeout: 15000
+    console.log(`[XUI Auth] POST ${baseUrl}${basePath}/login`);
+    const response = await client.post(`${basePath}/login`, {
+      username: config.username,
+      password: config.password
     });
 
-    if (res.data && res.data.success === false && typeof res.data.msg === 'string' && res.data.msg.includes('login')) {
-       console.log('[XUI Service] Session expired, re-authenticating...');
-       await login(true);
-       return axios.request<XuiResponse<T>>({
-         ...configOptions,
-         baseURL: baseUrl,
-         headers: {
-           ...configOptions.headers,
-           Cookie: sessionCookie
-         },
-         timeout: 15000
-       });
+    console.log(`[XUI Auth] Login response status: ${response.status}`);
+    
+    if (response.data && response.data.success === false) {
+      throw new Error(`3X-UI login failed: ${response.data.msg}`);
     }
-    return res;
+
+    const cookies = response.headers['set-cookie'];
+    if (!cookies || cookies.length === 0) {
+      throw new Error('No session cookie returned from 3X-UI');
+    }
+
+    const cookie = cookies[0].split(';')[0];
+    console.log(`[XUI Auth] Login successful, session cookie obtained`);
+    return cookie;
   } catch (error: any) {
-    if (error instanceof AxiosError) {
-      if (error.response?.status === 401 || error.response?.status === 403) {
-        console.log('[XUI Service] Session invalid (401/403), re-authenticating...');
-        await login(true);
-        return axios.request<XuiResponse<T>>({
-          ...configOptions,
-          baseURL: baseUrl,
-          headers: {
-            ...configOptions.headers,
-            Cookie: sessionCookie
-          },
-          timeout: 15000
-        });
-      }
-      console.error(`[XUI Service] Request to ${configOptions.url} failed: ${error.message}`);
+    console.error(`[XUI Auth] Login request failed:`, error.message);
+    if (error.response) {
+      console.error(`[XUI Auth] Response body:`, error.response.data);
     }
     throw error;
   }
 };
 
+const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
+  const config = await getXuiConfig();
+  const configHash = `${config.panelUrl}:${config.username}`;
+  
+  if (!sessionCookie || currentConfigHash !== configHash) {
+    sessionCookie = await authenticate(config);
+    currentConfigHash = configHash;
+  }
+
+  const { baseUrl, basePath } = parseUrl(config.panelUrl);
+  const client = createAxiosInstance(baseUrl);
+
+  console.log(`[XUI API] ${method} ${baseUrl}${basePath}${endpoint}`);
+  
+  let response = await client.request({
+    url: `${basePath}${endpoint}`,
+    method,
+    data,
+    headers: {
+      Cookie: sessionCookie
+    }
+  });
+
+  console.log(`[XUI API] Response status: ${response.status}`);
+
+  // Re-authenticate if session expired
+  if (response.status === 401 || (response.data && response.data.success === false && typeof response.data.msg === 'string' && response.data.msg.includes('login'))) {
+    console.log(`[XUI API] Session invalid, re-authenticating...`);
+    sessionCookie = await authenticate(config);
+    currentConfigHash = configHash;
+    
+    response = await client.request({
+      url: `${basePath}${endpoint}`,
+      method,
+      data,
+      headers: {
+        Cookie: sessionCookie
+      }
+    });
+  }
+
+  if (response.status !== 200) {
+    throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
+  }
+
+  if (response.data && response.data.success === false) {
+    throw new Error(`3X-UI API Error: ${response.data.msg}`);
+  }
+
+  return response.data.obj;
+};
+
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   try {
-    const config = await getXuiConfig();
-    const basePath = getBasePath(config.panelUrl);
-    const response = await requestWithAuth<XuiInbound[]>({
-       url: `${basePath}/panel/api/inbounds/list`,
-       method: 'GET'
-     });
-    return response.data.obj || [];
+    return await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
   } catch (error: any) {
     console.error('[XUI Service] Failed to retrieve inbounds:', error.message);
     return [];
@@ -186,7 +186,7 @@ export const getInbounds = async (): Promise<XuiInbound[]> => {
 export const getClientByEmail = async (email: string): Promise<any | null> => {
   try {
     const inbounds = await getInbounds();
-        
+    
     for (const inbound of inbounds) {
       let settingsObj: { clients?: XuiClient[] } = {};
       try {
@@ -194,13 +194,12 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
           settingsObj = JSON.parse(inbound.settings);
         }
       } catch (parseError) {
-        console.warn(`[XUI Service] Failed to parse settings for inbound ID: ${inbound.id}`);
         continue;
       }
-            
+      
       const clients = settingsObj.clients || [];
       const clientStats = inbound.clientStats || [];
-            
+      
       for (const c of clients) {
         if (c.email === email) {
           const stat = clientStats.find((s) => s.email === email);
@@ -217,14 +216,12 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
           
           let streamSettings: any = {};
           try {
-             if (inbound.streamSettings) {
-                streamSettings = JSON.parse(inbound.streamSettings);
-             }
+             if (inbound.streamSettings) streamSettings = JSON.parse(inbound.streamSettings);
           } catch(e) {}
-
+          
           const config = await getXuiConfig();
-          const baseUrl = getBaseUrl(config.panelUrl);
-
+          const { baseUrl } = parseUrl(config.panelUrl);
+          
           return {
             email: c.email,
             uuid: c.id,
@@ -236,7 +233,7 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
             remainingTraffic: remaining,
             expiryTime: c.expiryTime || 0,
             enableStatus: c.enable,
-            onlineStatus: c.enable && remaining >= 0, // simple heuristic
+            onlineStatus: c.enable && (total === 0 || remaining > 0),
             subId: c.subId || '',
             port: inbound.port,
             protocol: inbound.protocol,
@@ -249,21 +246,15 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       }
     }
     return null;
-  } catch (error) {
-    console.error(`[XUI Service] Error looking up client by email (${email}):`, error);
+  } catch (error: any) {
+    console.error(`[XUI Service] Error looking up client by email (${email}):`, error.message);
     return null;
   }
 };
 
 export const getSystemStatus = async (): Promise<Record<string, unknown>> => {
   try {
-    const config = await getXuiConfig();
-    const basePath = getBasePath(config.panelUrl);
-    const response = await requestWithAuth<Record<string, unknown>>({
-       url: `${basePath}/server/status`,
-       method: 'GET'
-     });
-    return response.data.obj || {};
+    return await requestApi<Record<string, unknown>>('/server/status');
   } catch (error: any) {
     console.error('[XUI Service] Failed to retrieve system status:', error.message);
     return {};
@@ -283,10 +274,14 @@ export const getTrafficUsage = async (email: string): Promise<{ up: number; down
 export const getSubscriptionUriHelper = async (email: string): Promise<string | null> => {
   const client = await getClientByEmail(email);
   if (!client || !client.subId) return null;
-  const config = await getXuiConfig();
-  const baseUrl = getBaseUrl(config.panelUrl);
-  const basePath = getBasePath(config.panelUrl);
-  return `${baseUrl}${basePath}/sub/${client.subId}`;
+  
+  try {
+    const config = await getXuiConfig();
+    const { baseUrl, basePath } = parseUrl(config.panelUrl);
+    return `${baseUrl}${basePath}/sub/${client.subId}`;
+  } catch (e) {
+    return null;
+  }
 };
 
 export const getClientExpiry = async (email: string): Promise<number | null> => {
