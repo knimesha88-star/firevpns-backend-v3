@@ -11,10 +11,7 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
     }
     const client = await clientService.getClientStatus(email);
     console.log("VPN DATA:", JSON.stringify(client, null, 2));
-    return res.json({
-      success: true,
-      vpn: client
-    });
+    res.json({ success: true, data: client });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
