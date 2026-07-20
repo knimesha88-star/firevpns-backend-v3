@@ -4,8 +4,9 @@ import https from 'https';
 
 export interface XuiConfig {
   panelUrl: string;
-  username: string;
-  password: string;
+  username?: string;
+  password?: string;
+  apiToken?: string;
   panelName?: string;
 }
 
@@ -56,9 +57,6 @@ export interface XuiInbound {
   sniffing: string;
 }
 
-let sessionCookie: string | null = null;
-let currentConfigHash: string = '';
-
 const getXuiConfig = async (): Promise<XuiConfig> => {
   const doc = await adminDb.collection('settings').doc('xui').get();
   if (!doc.exists) {
@@ -87,120 +85,30 @@ const createAxiosInstance = (baseUrl: string) => {
   });
 };
 
-export const authenticate = async (config: XuiConfig): Promise<string> => {
-  console.log(`[XUI Auth] Attempting login to panel: ${config.panelUrl}`);
-  const { baseUrl, basePath } = parseUrl(config.panelUrl);
-  const client = createAxiosInstance(baseUrl);
-
-  const endpointsToTry = [
-    '/login',
-    '/panel/login',
-    '/panel/api/login',
-    '/IC2MamSLiBbf1a6qEQ/login',
-    '/IC2MamSLiBbf1a6qEQ/panel/login',
-    `${basePath}/login`,
-    `${basePath}/panel/login`
-  ];
-
-  const uniqueEndpoints = [...new Set(endpointsToTry)];
-
-  for (const endpoint of uniqueEndpoints) {
-    console.log(`\n[XUI Auth] Trying endpoint: POST ${baseUrl}${endpoint}`);
-    try {
-      const response = await client.post(endpoint, {
-        username: config.username,
-        password: config.password
-      });
-
-      console.log(`[XUI Auth] HTTP status: ${response.status}`);
-      console.log(`[XUI Auth] Response headers:`, JSON.stringify(response.headers, null, 2));
-      console.log(`[XUI Auth] Response body:`, JSON.stringify(response.data, null, 2));
-      
-      let isSuccess = false;
-      if (response.data) {
-        console.log(`[XUI Auth] response.data.success: ${response.data.success}`);
-        console.log(`[XUI Auth] response.data.msg: ${response.data.msg}`);
-        console.log(`[XUI Auth] response.data.obj:`, response.data.obj);
-        isSuccess = response.data.success === true;
-      }
-      
-      const cookies = response.headers['set-cookie'];
-      console.log(`[XUI Auth] Set-Cookie exists:`, !!cookies && cookies.length > 0);
-
-      if (isSuccess || (response.status >= 200 && response.status < 300 && (cookies && cookies.length > 0 || (response.data && response.data.success !== false)))) {
-        console.log(`[XUI Auth] SUCCESS at endpoint: ${endpoint}`);
-        if (cookies && cookies.length > 0) {
-          const cookie = cookies[0].split(';')[0];
-          console.log(`[XUI Auth] Login successful, session cookie obtained`);
-          return cookie;
-        } else {
-          console.warn(`[XUI Auth] No session cookie returned. Checking response body for tokens...`);
-          if (response.data && response.data.obj && typeof response.data.obj === 'string') {
-            console.log(`[XUI Auth] Token found in response body`);
-            return `Bearer ${response.data.obj}`; 
-          }
-          if (response.data && response.data.success === true) {
-            console.warn(`[XUI Auth] Authentication marked successful but no cookie/token found. Proceeding with empty session.`);
-            return '';
-          }
-        }
-      } else {
-         console.log(`[XUI Auth] Endpoint ${endpoint} did not return success criteria.`);
-      }
-    } catch (error: any) {
-      console.error(`[XUI Auth] Request failed for ${endpoint}:`, error.message);
-      if (error.response) {
-        console.error(`[XUI Auth] HTTP status: ${error.response.status}`);
-        console.error(`[XUI Auth] Response headers:`, JSON.stringify(error.response.headers, null, 2));
-        console.error(`[XUI Auth] Response body:`, JSON.stringify(error.response.data, null, 2));
-      }
-    }
-  }
-
-  throw new Error('Authentication failed: Exhausted all login endpoints without success.');
-};
-
 const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
   const config = await getXuiConfig();
-  const configHash = `${config.panelUrl}:${config.username}`;
   
-  if (!sessionCookie || currentConfigHash !== configHash) {
-    sessionCookie = await authenticate(config);
-    currentConfigHash = configHash;
+  // The frontend stores the token in the password field, or fallback to apiToken if provided
+  const token = config.apiToken || config.password;
+  if (!token) {
+    throw new Error('API token is missing in 3X-UI settings');
   }
 
   const { baseUrl, basePath } = parseUrl(config.panelUrl);
   const client = createAxiosInstance(baseUrl);
 
   console.log(`[XUI API] ${method} ${baseUrl}${basePath}${endpoint}`);
-  console.log(`[XUI API] Request headers:`, { Cookie: sessionCookie });
   
-  let response = await client.request({
+  const response = await client.request({
     url: `${basePath}${endpoint}`,
     method,
     data,
     headers: {
-      Cookie: sessionCookie
+      Authorization: `Bearer ${token}`
     }
   });
 
   console.log(`[XUI API] Response status for ${endpoint}: ${response.status}`);
-
-  // Re-authenticate if session expired
-  if (response.status === 401 || (response.data && response.data.success === false && typeof response.data.msg === 'string' && response.data.msg.includes('login'))) {
-    console.log(`[XUI API] Session invalid, re-authenticating...`);
-    sessionCookie = await authenticate(config);
-    currentConfigHash = configHash;
-    
-    response = await client.request({
-      url: `${basePath}${endpoint}`,
-      method,
-      data,
-      headers: {
-        Cookie: sessionCookie
-      }
-    });
-  }
 
   if (response.status !== 200) {
     throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
@@ -211,6 +119,38 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   }
 
   return response.data.obj;
+};
+
+export const testApiConnection = async (config: XuiConfig): Promise<boolean> => {
+  const token = config.apiToken || config.password;
+  if (!token) {
+    throw new Error('API token is missing');
+  }
+
+  const { baseUrl, basePath } = parseUrl(config.panelUrl);
+  const client = createAxiosInstance(baseUrl);
+
+  console.log(`[XUI API] Testing connection with GET ${baseUrl}${basePath}/panel/api/inbounds/list`);
+  
+  const response = await client.request({
+    url: `${basePath}/panel/api/inbounds/list`,
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+
+  console.log(`[XUI API] Test connection response status: ${response.status}`);
+
+  if (response.status !== 200) {
+    throw new Error(`Connection test failed: ${response.status} ${response.statusText}`);
+  }
+
+  if (response.data && response.data.success === false) {
+    throw new Error(`Connection test failed: ${response.data.msg}`);
+  }
+
+  return true;
 };
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {

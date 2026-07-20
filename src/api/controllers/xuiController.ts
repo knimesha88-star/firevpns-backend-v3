@@ -27,8 +27,9 @@ export const testConnection = async (req: AuthRequest, res: Response): Promise<v
     const { panelUrl, username, password } = req.body;
     console.log(`[XUI Controller] Testing connection to panel URL: ${panelUrl}`);
     
-    // Test authentication
-    const cookie = await xuiService.authenticate({ panelUrl, username, password });
+    // Test authentication using the new API token flow
+    // Frontend sends the token in the 'password' field currently
+    await xuiService.testApiConnection({ panelUrl, apiToken: password, username });
     console.log(`[XUI Controller] Authentication successful.`);
     
     res.json({ success: true, connected: true });
