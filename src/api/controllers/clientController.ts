@@ -9,8 +9,12 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
       res.status(400).json({ error: 'No email found in token' });
       return;
     }
-    const status = await clientService.getClientStatus(email);
-    res.json({ success: true, data: status });
+    const client = await clientService.getClientStatus(email);
+    console.log("VPN DATA:", JSON.stringify(client, null, 2));
+    return res.json({
+      success: true,
+      vpn: client
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
