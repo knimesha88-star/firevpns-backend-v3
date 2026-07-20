@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg-primary: var(--bg-primary);
+  --color-bg-secondary: var(--bg-secondary);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-border-color: var(--border-color);
+}
+
+@layer base {
+  :root {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f8fafc;
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --border-color: #e2e8f0;
+  }
+
+  .dark {
+    --bg-primary: #05060F;
+    --bg-secondary: #0A0C1A;
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --border-color: rgba(255, 255, 255, 0.05);
+  }
+
+  body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+  }
+}
