@@ -155,7 +155,11 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   try {
-    return await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
+    const response = { data: await requestApi<XuiInbound[]>('/panel/api/inbounds/list') };
+    console.log("=== 3XUI INBOUNDS RESPONSE ===");
+    console.log(JSON.stringify(response.data, null, 2));
+    console.log("==============================");
+    return response.data;
   } catch (error: any) {
     console.error('[XUI Service] Failed to retrieve inbounds:', error.message);
     return [];
