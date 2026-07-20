@@ -155,11 +155,27 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   try {
-    const response = await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
-    console.log("========== RESPONSE START ==========");
-    console.log(JSON.stringify(response, null, 2)); // note: requestApi returns obj, so response.data would be undefined.
-    console.log("========== RESPONSE END ==========");
-    return response;
+    const inboundsData = await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
+    const response = { data: { obj: inboundsData } };
+
+    console.log("Total inbounds:", response.data.obj.length);
+
+    response.data.obj.forEach((inbound: any) => {
+        console.log("Inbound:", inbound.id, inbound.remark);
+
+        const settings =
+            typeof inbound.settings === "string"
+                ? JSON.parse(inbound.settings)
+                : inbound.settings;
+
+        console.log("Clients in this inbound:", settings.clients.length);
+
+        settings.clients.forEach((c: any) => {
+            console.log("Client:", c.email);
+        });
+    });
+
+    return inboundsData;
   } catch (error: any) {
     console.error('[XUI Service] Failed to retrieve inbounds:', error.message);
     return [];
