@@ -192,7 +192,7 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       let settingsObj: { clients?: XuiClient[] } = {};
       try {
         if (inbound.settings) {
-          settingsObj = JSON.parse(inbound.settings);
+          settingsObj = typeof inbound.settings === "string" ? JSON.parse(inbound.settings) : inbound.settings;
         }
       } catch (parseError) {
         continue;
@@ -202,10 +202,10 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       const clientStats = inbound.clientStats || [];
       
       for (const c of clients) {
-        console.log("Comparing:", `"${c.email}"`, "with", `"${email}"`);
-        if (c.email.trim().toLowerCase() === email.trim().toLowerCase()) {
+        console.log("Comparing:", c.email, "==", email);
+        if (String(c.email).trim().toLowerCase() === String(email).trim().toLowerCase()) {
           console.log("MATCH FOUND");
-          const stat = clientStats.find((s) => s.email === email);
+          const stat = (inbound.clientStats || []).find((s) => s.email === c.email);
           
           let total = c.totalGB || 0;
           let up = stat?.up || 0;
@@ -219,7 +219,9 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
           
           let streamSettings: any = {};
           try {
-             if (inbound.streamSettings) streamSettings = JSON.parse(inbound.streamSettings);
+             if (inbound.streamSettings) {
+                 streamSettings = typeof inbound.streamSettings === "string" ? JSON.parse(inbound.streamSettings) : inbound.streamSettings;
+             }
           } catch(e) {}
           
           const config = await getXuiConfig();
@@ -248,7 +250,7 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
         }
       }
     }
-    console.log("NO MATCH FOUND");
+    console.log("NO MATCH FOUND AFTER CHECKING ALL CLIENTS");
     return null;
   } catch (error: any) {
     console.error(`[XUI Service] Error looking up client by email (${email}):`, error.message);
