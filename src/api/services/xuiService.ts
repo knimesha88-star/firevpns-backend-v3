@@ -320,15 +320,10 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
         const newExpiryTime = date.getTime();
         
         await requestApi<any>(`/panel/api/clients/update/${c.email}`, 'POST', {
+          ...c,
           id: String(c.id),
-          settings: JSON.stringify({
-            clients: [
-              {
-                ...c,
-                expiryTime: newExpiryTime
-              }
-            ]
-          })
+          email: c.email,
+          expiryTime: newExpiryTime
         });
         
         return newExpiryTime;
