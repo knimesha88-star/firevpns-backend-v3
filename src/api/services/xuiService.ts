@@ -295,3 +295,47 @@ export const getClientExpiry = async (email: string): Promise<number | null> => 
   if (!client) return null;
   return client.expiryTime;
 };
+
+export const updateClientExpiry = async (email: string, durationMonths: number): Promise<number> => {
+  const inbounds = await getInbounds();
+  
+  for (const inbound of inbounds) {
+    let settingsObj: { clients?: XuiClient[] } = {};
+    try {
+      if (inbound.settings) {
+        settingsObj = typeof inbound.settings === 'string' ? JSON.parse(inbound.settings) : inbound.settings;
+      }
+    } catch (parseError) {
+      continue;
+    }
+    
+    const clients = settingsObj.clients || [];
+    for (const c of clients) {
+      if (String(c.email).trim().toLowerCase() === String(email).trim().toLowerCase()) {
+        const currentExpiry = c.expiryTime || 0;
+        
+        let baseTime = currentExpiry > Date.now() ? currentExpiry : Date.now();
+        const date = new Date(baseTime);
+        date.setMonth(date.getMonth() + durationMonths);
+        const newExpiryTime = date.getTime();
+        
+        await requestApi<any>(`/panel/api/clients/update/${c.email}`, 'POST', {
+          id: inbound.id,
+          settings: JSON.stringify({
+            clients: [
+              {
+                ...c,
+                expiryTime: newExpiryTime
+              }
+            ]
+          })
+        });
+        
+        return newExpiryTime;
+      }
+    }
+  }
+  
+  throw new Error(`Client with email ${email} not found in 3X-UI inbounds`);
+};
+

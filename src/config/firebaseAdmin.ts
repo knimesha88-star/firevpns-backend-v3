@@ -2,8 +2,25 @@ import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
+
+let projectId: string | undefined;
+let databaseId: string | undefined;
+
+try {
+  const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+  if (fs.existsSync(configPath)) {
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    projectId = config.projectId;
+    databaseId = config.firestoreDatabaseId;
+    console.log(`[FirebaseAdmin] Loaded config from firebase-applet-config.json. Project: ${projectId}, Database: ${databaseId}`);
+  }
+} catch (e: any) {
+  console.error('[FirebaseAdmin] Error loading firebase-applet-config.json:', e.message);
+}
 
 if (!getApps().length) {
   console.log('[FirebaseAdmin] Initializing Firebase Admin SDK...');
@@ -29,6 +46,11 @@ if (!getApps().length) {
       console.error('[FirebaseAdmin] Error parsing FIREBASE_SERVICE_ACCOUNT JSON:', e.message);
       initializeApp(); // Fallback
     }
+  } else if (projectId) {
+    console.log(`[FirebaseAdmin] Initializing with projectId from config: ${projectId}`);
+    initializeApp({
+      projectId: projectId
+    });
   } else {
     console.log('[FirebaseAdmin] Using Application Default Credentials (ADC)');
     initializeApp(); // Fallback for environments with ADC (e.g., Render with proper env vars)
@@ -36,4 +58,5 @@ if (!getApps().length) {
 }
 
 export const adminAuth = getAuth();
-export const adminDb = getFirestore();
+export const adminDb = databaseId ? getFirestore(getApps()[0], databaseId) : getFirestore();
+

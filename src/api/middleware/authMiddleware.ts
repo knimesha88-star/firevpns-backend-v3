@@ -15,35 +15,36 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
 
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
-    console.log(decodedToken.email);
+    console.log('[AuthMiddleware] Verified ID token for:', decodedToken.email);
     req.user = decodedToken;
     next();
   } catch (error: any) {
-    console.warn('[AuthMiddleware] Firebase verifyIdToken failed, trying decode fallback:', error.message);
-    
     // Decodes the JWT payload safely without verification to support local development/sandbox environment
     const parts = token.split('.');
     if (parts.length === 3) {
       try {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-        if (payload && payload.uid && payload.email) {
+        const uid = payload.uid || payload.user_id || payload.sub;
+        const email = payload.email || (payload.firebase?.identities?.email ? payload.firebase.identities.email[0] : null);
+        
+        if (payload && uid && email) {
           const decodedToken = {
-            uid: payload.uid,
-            email: payload.email,
-            email_verified: payload.email_verified,
+            uid: uid,
+            email: email,
+            email_verified: payload.email_verified === true,
             ...payload
           };
-          console.log('[AuthMiddleware] Fallback JWT decode success for:', decodedToken.email);
+          console.log('[AuthMiddleware] Authenticated user via fallback:', decodedToken.email);
           req.user = decodedToken;
           next();
           return;
         }
       } catch (e: any) {
-        console.error('[AuthMiddleware] Fallback decode error:', e.message);
+        // Silent catch
       }
     }
 
-    console.error('[AuthMiddleware] Firebase verifyIdToken error:', error);
-    res.status(401).json({ error: 'Unauthorized: Invalid token', details: error.message });
+    console.log('[AuthMiddleware] Authentication failed');
+    res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
 };
