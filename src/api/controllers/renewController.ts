@@ -3,7 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { adminDb } from '../../config/firebaseAdmin.js';
 import { FieldValue } from 'firebase-admin/firestore';
-import { sendRenewNotification } from '../services/telegramService.js';
+import { sendRenewNotification, sendRenewApprovedNotification } from '../services/telegramService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -91,6 +91,19 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     });
     
     console.log(`[RenewController] Firestore document ${requestId} updated successfully.`);
+    
+    // Trigger Telegram approved notification asynchronously without breaking approval flow if it fails
+    const approvedAtNow = new Date();
+    sendRenewApprovedNotification({
+      email: email,
+      userEmail: email,
+      planName: data.planName || data.plan || 'N/A',
+      durationMonths: durationMonths,
+      newExpiry: newExpiryTime,
+      approvedAt: approvedAtNow,
+    }).catch((telegramErr) => {
+      console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
+    });
     
     res.json({
       success: true,
