@@ -3,6 +3,39 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { adminDb } from '../../config/firebaseAdmin.js';
 import { FieldValue } from 'firebase-admin/firestore';
+import { sendRenewNotification } from '../services/telegramService.js';
+
+export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+    const customerEmail = data.email || data.userEmail || req.user?.email || '';
+
+    const notificationData = {
+      email: customerEmail,
+      userEmail: customerEmail,
+      planName: data.planName || data.plan || '',
+      durationMonths: data.durationMonths || data.duration || 1,
+      amount: data.amount ?? 0,
+      receiptNumber: data.receiptNumber || '',
+      message: data.message || '',
+      paymentDate: data.paymentDate || '',
+      status: 'Pending'
+    };
+
+    // Send Telegram Notification safely without crashing or rejecting request
+    sendRenewNotification(notificationData).catch((err) => {
+      console.error('[RenewController] Telegram notification error:', err?.message || err);
+    });
+
+    res.json({
+      success: true,
+      message: 'Renewal request notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[RenewController] Error processing renewal notification request:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
 
 export const approveRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   const { requestId } = req.params;
