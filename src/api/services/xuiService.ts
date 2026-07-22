@@ -79,6 +79,29 @@ const parseUrl = (urlStr: string) => {
   }
 };
 
+const getApiEndpointUrl = (panelUrl: string, endpoint: string) => {
+  const { baseUrl, basePath } = parseUrl(panelUrl);
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+
+  let fullPath = '';
+  if (basePath) {
+    if (basePath.endsWith('/panel') && cleanEndpoint.startsWith('/panel/')) {
+      fullPath = basePath + cleanEndpoint.slice(6);
+    } else {
+      fullPath = basePath + cleanEndpoint;
+    }
+  } else {
+    fullPath = cleanEndpoint;
+  }
+
+  return {
+    baseUrl,
+    basePath,
+    fullPath,
+    fullUrl: `${baseUrl}${fullPath}`
+  };
+};
+
 const createAxiosInstance = (baseUrl: string) => {
   return axios.create({
     baseURL: baseUrl,
@@ -97,13 +120,13 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
     throw new Error('API token is missing in 3X-UI settings');
   }
 
-  const { baseUrl, basePath } = parseUrl(config.panelUrl);
+  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
-  console.log(`[XUI API] ${method} ${baseUrl}${basePath}${endpoint}`);
+  console.log(`[XUI API] ${method} ${fullUrl}`);
   
   const response = await client.request({
-    url: `${basePath}${endpoint}`,
+    url: fullPath,
     method,
     data,
     headers: {
@@ -130,13 +153,13 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
     throw new Error('API token is missing');
   }
 
-  const { baseUrl, basePath } = parseUrl(config.panelUrl);
+  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, '/panel/api/inbounds/list');
   const client = createAxiosInstance(baseUrl);
 
-  console.log(`[XUI API] Testing connection with GET ${baseUrl}${basePath}/panel/api/inbounds/list`);
+  console.log(`[XUI API] Testing connection with GET ${fullUrl}`);
   
   const response = await client.request({
-    url: `${basePath}/panel/api/inbounds/list`,
+    url: fullPath,
     method: 'GET',
     headers: {
       Authorization: `Bearer ${token}`
@@ -287,7 +310,8 @@ export const getSubscriptionUriHelper = async (email: string): Promise<string | 
   try {
     const config = await getXuiConfig();
     const { baseUrl, basePath } = parseUrl(config.panelUrl);
-    return `${baseUrl}${basePath}/sub/${client.subId}`;
+    const subBasePath = basePath.endsWith('/panel') ? basePath.slice(0, -6) : basePath;
+    return `${baseUrl}${subBasePath}/sub/${client.subId}`;
   } catch (e) {
     return null;
   }
@@ -459,31 +483,68 @@ export const add3XUiClient = async (
     subId: string;
   }
 ): Promise<any> => {
-  const clientPayload = {
-    id: clientData.uuid,
-    alterId: 0,
-    email: clientData.email,
-    limitIp: 1,
-    totalGB: clientData.totalBytes,
-    expiryTime: clientData.expiryMs,
-    enable: true,
-    tgId: '',
-    subId: clientData.subId
+  const config = await getXuiConfig();
+  const token = config.apiToken || config.password;
+  if (!token) {
+    throw new Error('API token is missing in 3X-UI settings');
+  }
+
+  const endpoint = '/panel/api/clients/add';
+  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
+  const client = createAxiosInstance(baseUrl);
+
+  const payload = {
+    client: {
+      id: clientData.uuid,
+      email: clientData.email,
+      flow: '',
+      limitIp: 0,
+      totalGB: clientData.totalBytes,
+      expiryTime: clientData.expiryMs,
+      enable: true,
+      tgId: '',
+      subId: clientData.subId
+    },
+    inboundIds: [inboundId]
   };
 
-  const body = {
-    id: inboundId,
-    settings: JSON.stringify({
-      clients: [clientPayload]
-    })
-  };
+  console.log("==================================================");
+  console.log("Request URL:", fullUrl);
+  console.log("Request payload:", JSON.stringify(payload, null, 2));
 
-  console.log(JSON.stringify(body, null, 2));
+  try {
+    const response = await client.request({
+      url: fullPath,
+      method: 'POST',
+      data: payload,
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
 
-  const res = await requestApi<any>('/panel/api/inbounds/addClient', 'POST', body);
-  console.log("");
-  console.log("3X-UI Response:", typeof res === 'object' ? JSON.stringify(res, null, 2) : res);
-  return res;
+    console.log("HTTP status:", response.status);
+    console.log("Response body:", typeof response.data === 'object' ? JSON.stringify(response.data, null, 2) : response.data);
+    console.log("==================================================");
+
+    if (response.status !== 200 && response.status !== 201) {
+      throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
+    }
+
+    if (!response.data || response.data.success === false) {
+      const errorMsg = response.data?.msg || 'API returned success=false';
+      throw new Error(`3X-UI API Error: ${errorMsg}`);
+    }
+
+    console.log(`[3X-UI] Client created successfully at endpoint: ${endpoint}`);
+    return response.data;
+  } catch (err: any) {
+    if (err.response) {
+      console.log("HTTP status:", err.response.status);
+      console.log("Response body:", typeof err.response.data === 'object' ? JSON.stringify(err.response.data, null, 2) : err.response.data);
+      console.log("==================================================");
+    }
+    throw err;
+  }
 };
 
 export const provisionOrderClient = async (orderId: string): Promise<any> => {
@@ -644,32 +705,13 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   const subId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 10);
 
   // 5. Create client on 3X-UI panel
-  const finalRemark = remark;
-  const finalInboundId = inboundId;
-  const finalAddress = address;
-  const finalSni = sni;
-
-  console.log("Creating client with:");
-  console.log({
-    remark: finalRemark,
-    inboundId: finalInboundId,
-    address: finalAddress,
-    sni: finalSni
+  await add3XUiClient(inboundId, {
+    uuid,
+    email: remark,
+    totalBytes,
+    expiryMs,
+    subId
   });
-
-  try {
-    await add3XUiClient(inboundId, {
-      uuid,
-      email: remark,
-      totalBytes,
-      expiryMs,
-      subId
-    });
-  } catch (xuiErr: any) {
-    console.log("");
-    console.log("3X-UI Error:", xuiErr?.response?.data || xuiErr?.message || xuiErr);
-    console.warn(`[3X-UI Provisioning] Panel client add warning/error: ${xuiErr.message}. Proceeding with VLESS link generation.`);
-  }
 
   // 6. Fetch inbound info from 3X-UI to construct VLESS link
   const inbounds = await getInbounds();
