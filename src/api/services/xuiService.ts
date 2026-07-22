@@ -505,16 +505,63 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   const customerName = order.configurationName || order.customerName || order.name || order.fullName || (order.email ? order.email.split('@')[0] : 'Customer');
   const customerId = order.customerId || order.uid || order.userId || '';
 
-  console.log("==============================");
-  console.log("FIREVPNs Provisioning Started");
-  console.log("==============================");
+  console.log("==================================================");
+  console.log("TEMPLATE LOOKUP START");
+  console.log("==================================================");
+  console.log("Order ID:", order.orderId || orderSnap.id);
+  console.log("Customer Email:", order.email);
+  console.log("Customer Name:", customerName);
+  console.log("order.package:", order.package);
+  console.log("order.packageName:", order.packageName);
+  console.log("order.plan:", order.plan);
+  console.log("order.category:", order.category);
+  console.log("order.server:", order.server);
   console.log("");
-  console.log(`Order ID: ${order.orderId || orderSnap.id}`);
-  console.log(`Package: ${packageName}`);
-  console.log(`Customer Name: ${customerName}`);
-  console.log(`Customer UID: ${customerId || 'N/A'}`);
-  console.log("");
-  console.log("Searching Firestore template...");
+  console.log("Searching collection: provisionTemplates");
+
+  let matchingDocs: any[] = [];
+  try {
+    const provSnap = await adminDb.collection('provisionTemplates').get();
+    const targetName = packageName.trim().toLowerCase();
+
+    for (const docSnap of provSnap.docs) {
+      const data = docSnap.data();
+      const enabled = data.enabled !== false;
+      const docPackageName = String(data.packageName || data.name || docSnap.id).trim().toLowerCase();
+
+      if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
+        matchingDocs.push({ id: docSnap.id, ...data });
+      }
+    }
+
+    console.log("Number of matching templates:", matchingDocs.length);
+
+    if (matchingDocs.length > 0) {
+      matchingDocs.forEach(t => {
+        console.log("Document ID:", t.id);
+        console.log("packageName:", t.packageName || t.name);
+        console.log("enabled:", t.enabled !== false);
+        console.log("category:", t.category);
+        console.log("server:", t.server);
+        console.log("inboundId:", t.inboundId);
+        console.log("address:", t.address);
+        console.log("sni:", t.sni);
+        console.log("remarkTemplate:", t.remarkTemplate || t.remarkFormat);
+      });
+    } else {
+      console.log("No matching template found. Fetching ALL documents from provisionTemplates collection:");
+      for (const docSnap of provSnap.docs) {
+        const data = docSnap.data();
+        console.log("Document ID:", docSnap.id);
+        console.log("packageName:", data.packageName || data.name);
+        console.log("enabled:", data.enabled !== false);
+        console.log("category:", data.category);
+        console.log("server:", data.server);
+      }
+    }
+  } catch (err) {
+    console.error("Error debugging provisionTemplates collection:", err);
+  }
 
   if (!packageName) {
     throw new Error('Provisioning template not found.');
@@ -525,6 +572,15 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   if (!template) {
     throw new Error('Provisioning template not found.');
   }
+
+  console.log("========== TEMPLATE ==========");
+  console.log(template);
+  console.log("Package:", order.packageName);
+  console.log("Inbound:", template.inboundId);
+  console.log("Address:", template.address);
+  console.log("SNI:", template.sni);
+  console.log("Remark Template:", template.remarkTemplate);
+  console.log("==============================");
 
   // 3. Extract template values
   const inboundId = Number(template.inboundId) || 1;
@@ -588,6 +644,19 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   const subId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 10);
 
   // 5. Create client on 3X-UI panel
+  const finalRemark = remark;
+  const finalInboundId = inboundId;
+  const finalAddress = address;
+  const finalSni = sni;
+
+  console.log("Creating client with:");
+  console.log({
+    remark: finalRemark,
+    inboundId: finalInboundId,
+    address: finalAddress,
+    sni: finalSni
+  });
+
   try {
     await add3XUiClient(inboundId, {
       uuid,
@@ -621,32 +690,42 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   console.log("");
   console.log(`Subscription URL: ${vlessUrl}`);
 
-  // 8. Update Firestore subcollection & order document
+  // 8. Save VPN configuration in Firestore under users/{customerUid}/vpnConfigs/{vpnId}
   let configDocId = '';
+  const customerUid = customerId || order.customerId || order.uid || order.userId || '';
 
-  if (customerId) {
-    try {
-      const vpnConfigRef = await adminDb.collection('users').doc(customerId).collection('vpnConfigs').add({
-        orderId: order.orderId || orderSnap.id,
-        uuid,
-        email: order.email || '',
-        uid: customerId,
-        package: packageName,
-        packageType: order.packageType || 'SIM Unlimited',
-        server: template.server || order.server || 'Singapore',
-        duration: duration,
-        subscriptionUrl: vlessUrl,
-        vlessUrl: vlessUrl,
-        inboundId: inboundId,
-        trafficLimit: totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
-        expiryDate: new Date(expiryMs).toISOString(),
-        status: 'Active',
-        createdAt: FieldValue.serverTimestamp()
-      });
-      configDocId = vpnConfigRef.id;
-    } catch (docErr) {
-      console.error('[3X-UI Provisioning] Failed to create vpnConfigs subcollection doc:', docErr);
-    }
+  if (!customerUid) {
+    const errorMsg = 'Customer UID is missing for this order. Cannot save VPN configuration.';
+    console.error('[3X-UI Provisioning]', errorMsg);
+    throw new Error(errorMsg);
+  }
+
+  try {
+    const vpnConfigRef = await adminDb.collection('users').doc(customerUid).collection('vpnConfigs').add({
+      orderId: order.orderId || orderSnap.id,
+      packageName: packageName,
+      package: packageName,
+      packageType: order.packageType || 'SIM Unlimited',
+      configName: order.configurationName || customerName,
+      uuid: uuid,
+      subscriptionUrl: vlessUrl,
+      vlessUrl: vlessUrl,
+      serverAddress: address,
+      server: template.server || order.server || 'Singapore',
+      sni: sni,
+      inboundId: inboundId,
+      trafficLimit: trafficLimitStr,
+      expiryTime: new Date(expiryMs).toISOString(),
+      expiryDate: new Date(expiryMs).toISOString(),
+      enabled: true,
+      status: 'Active',
+      createdAt: FieldValue.serverTimestamp()
+    });
+    configDocId = vpnConfigRef.id;
+  } catch (docErr: any) {
+    const errorDetails = docErr?.message || String(docErr);
+    console.error('[3X-UI Provisioning] Failed to save VPN configuration in Firestore:', docErr);
+    throw new Error(`Failed to save VPN configuration in Firestore: ${errorDetails}`);
   }
 
   await orderRef.update({
