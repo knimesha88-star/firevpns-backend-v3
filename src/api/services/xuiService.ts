@@ -530,7 +530,7 @@ export const add3XUiClient = async (
   };
 
   console.log("Request URL:", fullUrl);
-  console.log("Request payload:", JSON.stringify(payload, null, 2));
+  console.log("Request Body:", JSON.stringify(payload, null, 2));
 
   try {
     const response = await client.request({
@@ -542,25 +542,30 @@ export const add3XUiClient = async (
       }
     });
 
-    console.log("HTTP status:", response.status);
-    console.log("Response body:", typeof response.data === 'object' ? JSON.stringify(response.data, null, 2) : response.data);
+    console.log("HTTP Status:", response.status);
+    console.log("Complete Response Body:", typeof response.data === 'object' ? JSON.stringify(response.data, null, 2) : response.data);
     console.log("==================================================");
 
     if (response.status !== 200 && response.status !== 201) {
       throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
     }
 
-    if (!response.data || response.data.success === false) {
+    if (!response.data || response.data.success !== true) {
       const errorMsg = response.data?.msg || 'API returned success=false';
       throw new Error(`3X-UI API Error: ${errorMsg}`);
     }
 
-    console.log(`[3X-UI] Client created successfully at endpoint: ${endpoint}`);
+    if (response.data.obj === undefined || response.data.obj === null) {
+      const errorMsg = response.data?.msg || 'API response missing obj field';
+      throw new Error(`3X-UI API Error: ${errorMsg}`);
+    }
+
+    console.log("Client Created Successfully");
     return response.data;
   } catch (err: any) {
     if (err.response) {
-      console.log("HTTP status:", err.response.status);
-      console.log("Response body:", typeof err.response.data === 'object' ? JSON.stringify(err.response.data, null, 2) : err.response.data);
+      console.log("HTTP Status:", err.response.status);
+      console.log("Complete Response Body:", typeof err.response.data === 'object' ? JSON.stringify(err.response.data, null, 2) : err.response.data);
       console.log("==================================================");
     }
     throw err;
