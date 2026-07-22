@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { approveRenewRequest, createRenewRequest, createOrderNotification } from '../controllers/renewController.js';
+import { approveRenewRequest, createRenewRequest, createOrderNotification, notifyOrderApprove, notifyOrderReject } from '../controllers/renewController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { adminMiddleware } from '../middleware/adminMiddleware.js';
 
@@ -18,5 +18,7 @@ router.post('/order-notify', createOrderNotification);
 router.use(adminMiddleware);
 
 router.post('/approve/:requestId', approveRenewRequest);
+router.post('/order-approve', notifyOrderApprove);
+router.post('/order-reject', notifyOrderReject);
 
 export default router;

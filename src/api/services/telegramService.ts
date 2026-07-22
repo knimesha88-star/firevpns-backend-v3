@@ -278,3 +278,120 @@ Status:
   }
 };
 
+export interface OrderApprovedNotificationData {
+  customerEmail?: string;
+  email?: string;
+  package?: string;
+  plan?: string;
+  server?: string;
+  duration?: string;
+  uuid?: string;
+  status?: string;
+}
+
+export const sendOrderApprovedNotification = async (data: OrderApprovedNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram order approved notification.');
+    return;
+  }
+
+  const email = data.customerEmail || data.email || 'N/A';
+  const pkg = data.package || data.plan || 'N/A';
+  const server = data.server || 'N/A';
+  const duration = data.duration || 'N/A';
+  const uuid = data.uuid || 'N/A';
+  const status = data.status || 'Completed';
+
+  const text = `✅ VPN Created Successfully
+
+Customer:
+${email}
+
+Package:
+${pkg}
+
+Server:
+${server}
+
+Duration:
+${duration}
+
+UUID:
+${uuid}
+
+Status:
+${status}`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    } else {
+      console.log('[TelegramService] Order approved Telegram notification sent successfully.');
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram order approved notification:', err?.message || err);
+  }
+};
+
+export interface OrderRejectedNotificationData {
+  customerEmail?: string;
+  email?: string;
+  reason?: string;
+}
+
+export const sendOrderRejectedNotification = async (data: OrderRejectedNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram order rejected notification.');
+    return;
+  }
+
+  const email = data.customerEmail || data.email || 'N/A';
+  const reason = data.reason || 'Payment verification failed.';
+
+  const text = `❌ Order Rejected
+
+Customer:
+${email}
+
+Reason:
+${reason}`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    } else {
+      console.log('[TelegramService] Order rejected Telegram notification sent successfully.');
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram order rejected notification:', err?.message || err);
+  }
+};
+

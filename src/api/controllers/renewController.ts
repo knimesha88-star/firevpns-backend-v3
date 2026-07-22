@@ -3,7 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { adminDb } from '../../config/firebaseAdmin.js';
 import { FieldValue } from 'firebase-admin/firestore';
-import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification } from '../services/telegramService.js';
+import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -148,6 +148,56 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
     });
   } catch (error: any) {
     console.error('[RenewController] Error processing order notification:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const notifyOrderApprove = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+    
+    const notificationData = {
+      customerEmail: data.customerEmail || data.email || 'N/A',
+      package: data.package || data.plan || 'N/A',
+      server: data.server || 'N/A',
+      duration: data.duration || 'N/A',
+      uuid: data.uuid || 'N/A',
+      status: data.status || 'Completed'
+    };
+
+    sendOrderApprovedNotification(notificationData).catch((err) => {
+      console.error('[RenewController] Telegram order approve notification error:', err?.message || err);
+    });
+
+    res.json({
+      success: true,
+      message: 'Order approved Telegram notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[RenewController] Error processing order approve notification:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const notifyOrderReject = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+
+    const notificationData = {
+      customerEmail: data.customerEmail || data.email || 'N/A',
+      reason: data.reason || 'Payment not received'
+    };
+
+    sendOrderRejectedNotification(notificationData).catch((err) => {
+      console.error('[RenewController] Telegram order reject notification error:', err?.message || err);
+    });
+
+    res.json({
+      success: true,
+      message: 'Order rejected Telegram notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[RenewController] Error processing order reject notification:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
