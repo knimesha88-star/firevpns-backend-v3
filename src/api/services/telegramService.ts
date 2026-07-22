@@ -159,3 +159,122 @@ ${approvedAt}
     console.error('[TelegramService] Failed to send Telegram approved notification:', err?.message || err);
   }
 };
+
+export interface OrderNotificationData {
+  email?: string;
+  plan?: string;
+  server?: string;
+  duration?: string;
+  packageType?: string;
+  amount?: number | string;
+  transactionRef?: string;
+  paymentDate?: string;
+  notes?: string;
+  orderId?: string;
+}
+
+export const sendNewOrderNotification = async (data: OrderNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram new order notification.');
+    return;
+  }
+
+  const email = data.email || 'N/A';
+  const plan = data.plan || 'N/A';
+  const server = data.server || 'N/A';
+  const duration = data.duration || 'N/A';
+  const packageType = data.packageType || 'N/A';
+  const amount = data.amount !== undefined && data.amount !== null ? data.amount : '0';
+  const orderId = data.orderId || 'N/A';
+
+  const priceStr = typeof amount === 'number' ? amount.toLocaleString() : Number(amount).toLocaleString();
+
+  let currentDateTime = '';
+  try {
+    currentDateTime = new Date().toLocaleString('en-US', {
+      timeZone: 'Asia/Colombo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+  } catch (e) {
+    currentDateTime = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  }
+
+  const text = `🛒 NEW FIREVPNs ORDER
+
+━━━━━━━━━━━━━━━━━━
+
+👤 Customer
+Email: ${email}
+
+📦 Package
+Package: ${plan}
+
+📡 Package Type
+${packageType}
+
+🌍 Server
+${server}
+
+📅 Duration
+${duration}
+
+💰 Total Price
+LKR ${priceStr}
+
+━━━━━━━━━━━━━━━━━━
+
+🏦 Bank Payment
+
+Bank:
+Commercial Bank
+
+Account:
+G.K Nimesha
+
+Branch:
+Ganemulla
+
+━━━━━━━━━━━━━━━━━━
+
+🕒 Order Time
+${currentDateTime}
+
+🆔 Order ID
+${orderId}
+
+━━━━━━━━━━━━━━━━━━
+
+Status:
+🟡 Waiting for Payment Verification`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    } else {
+      console.log('[TelegramService] New order notification sent successfully via Telegram.');
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram new order notification:', err?.message || err);
+  }
+};
+

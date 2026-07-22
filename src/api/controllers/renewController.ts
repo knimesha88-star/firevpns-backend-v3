@@ -3,7 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { adminDb } from '../../config/firebaseAdmin.js';
 import { FieldValue } from 'firebase-admin/firestore';
-import { sendRenewNotification, sendRenewApprovedNotification } from '../services/telegramService.js';
+import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification } from '../services/telegramService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -116,6 +116,38 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     });
   } catch (error: any) {
     console.error(`[RenewController] Error approving renewal request ${requestId}:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const createOrderNotification = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+    
+    const notificationData = {
+      orderId: data.orderId || 'N/A',
+      email: data.email || req.user?.email || 'N/A',
+      plan: data.plan || 'N/A',
+      server: data.server || 'N/A',
+      duration: data.duration || 'N/A',
+      packageType: data.packageType || 'N/A',
+      amount: data.amount !== undefined && data.amount !== null ? data.amount : '0',
+      transactionRef: data.transactionRef || 'N/A',
+      paymentDate: data.paymentDate || 'N/A',
+      notes: data.notes || '',
+    };
+
+    // Send Telegram Notification safely without crashing or rejecting request
+    sendNewOrderNotification(notificationData).catch((err) => {
+      console.error('[RenewController] Telegram new order notification error:', err?.message || err);
+    });
+
+    res.json({
+      success: true,
+      message: 'New order Telegram notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[RenewController] Error processing order notification:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
