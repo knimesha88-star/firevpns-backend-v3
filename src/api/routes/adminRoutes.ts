@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getStats, getUsers } from '../controllers/adminController.js';
+import { getStats, getUsers, approveOrder } from '../controllers/adminController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { adminMiddleware } from '../middleware/adminMiddleware.js';
 
@@ -10,5 +10,7 @@ router.use(adminMiddleware);
 
 router.get('/stats', getStats);
 router.get('/users', getUsers);
+router.post('/approve-order', approveOrder);
+router.post('/orders/:orderId/approve', approveOrder);
 
 export default router;
