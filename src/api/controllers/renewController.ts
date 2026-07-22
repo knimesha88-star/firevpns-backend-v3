@@ -158,11 +158,14 @@ export const notifyOrderApprove = async (req: AuthRequest, res: Response): Promi
     
     const notificationData = {
       customerEmail: data.customerEmail || data.email || 'N/A',
-      package: data.package || data.plan || 'N/A',
+      packageName: data.packageName || data.package || data.plan || 'N/A',
+      packageType: data.packageType || 'SIM Unlimited',
       server: data.server || 'N/A',
       duration: data.duration || 'N/A',
+      price: data.price !== undefined ? data.price : (data.amount !== undefined ? data.amount : 0),
       uuid: data.uuid || 'N/A',
-      status: data.status || 'Completed'
+      orderId: data.orderId || 'N/A',
+      status: '🟢 COMPLETED'
     };
 
     sendOrderApprovedNotification(notificationData).catch((err) => {

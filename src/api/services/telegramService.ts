@@ -281,11 +281,16 @@ Status:
 export interface OrderApprovedNotificationData {
   customerEmail?: string;
   email?: string;
+  packageName?: string;
   package?: string;
   plan?: string;
+  packageType?: string;
   server?: string;
   duration?: string;
+  price?: number | string;
+  amount?: number | string;
   uuid?: string;
+  orderId?: string;
   status?: string;
 }
 
@@ -298,32 +303,54 @@ export const sendOrderApprovedNotification = async (data: OrderApprovedNotificat
     return;
   }
 
-  const email = data.customerEmail || data.email || 'N/A';
-  const pkg = data.package || data.plan || 'N/A';
+  const customerEmail = data.customerEmail || data.email || 'N/A';
+  const packageName = data.packageName || data.package || data.plan || 'N/A';
+  const packageType = data.packageType || 'SIM Unlimited';
   const server = data.server || 'N/A';
   const duration = data.duration || 'N/A';
+  const rawPrice = data.price !== undefined ? data.price : (data.amount !== undefined ? data.amount : 0);
+  const priceStr = typeof rawPrice === 'number' ? rawPrice.toLocaleString() : Number(rawPrice).toLocaleString();
   const uuid = data.uuid || 'N/A';
-  const status = data.status || 'Completed';
+  const orderId = data.orderId || 'N/A';
 
-  const text = `✅ VPN Created Successfully
+  const text = `✅ FIREVPNs ORDER APPROVED
 
-Customer:
-${email}
+━━━━━━━━━━━━━━━━━━━━
 
-Package:
-${pkg}
+👤 Customer
+${customerEmail}
 
-Server:
+📦 Package
+${packageName}
+
+📡 Package Type
+${packageType}
+
+🌍 Server
 ${server}
 
-Duration:
+📅 Duration
 ${duration}
+
+💰 Amount
+LKR ${priceStr}
+
+━━━━━━━━━━━━━━━━━━━━
+
+🔑 VPN Created Successfully
 
 UUID:
 ${uuid}
 
+━━━━━━━━━━━━━━━━━━━━
+
+Order ID:
+${orderId}
+
 Status:
-${status}`;
+🟢 COMPLETED
+
+VPN has been generated successfully.`;
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
