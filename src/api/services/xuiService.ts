@@ -387,10 +387,21 @@ export const findProvisioningTemplate = async (packageName: string): Promise<any
   return null;
 };
 
-export const formatClientRemark = (templateFormat: string, customerName: string): string => {
+export const formatClientRemark = (templateFormat: string, customerName: string, orderId?: string): string => {
   const name = (customerName || '').trim() || 'Customer';
   const format = templateFormat || '{{customerName}}';
-  return format.replace(/\{\{\s*customerName\s*\}\}/g, name);
+  let formatted = format.replace(/\{\{\s*customerName\s*\}\}/g, name);
+  
+  if (orderId) {
+    const cleanOrderId = orderId.trim();
+    if (cleanOrderId && !formatted.includes(cleanOrderId)) {
+      formatted = `${formatted}-${cleanOrderId}`;
+    }
+  } else {
+    const randomSuffix = crypto.randomBytes(4).toString('hex').toUpperCase();
+    formatted = `${formatted}-${randomSuffix}`;
+  }
+  return formatted;
 };
 
 export const buildVlessLink = (
@@ -481,6 +492,7 @@ export const add3XUiClient = async (
     totalBytes: number;
     expiryMs: number;
     subId: string;
+    flow?: string;
   }
 ): Promise<any> => {
   const config = await getXuiConfig();
@@ -493,11 +505,20 @@ export const add3XUiClient = async (
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
+  const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
+
+  console.log("==================================================");
+  console.log("[3X-UI add3XUiClient] Sending client payload with generated values:");
+  console.log(`1. client.id (UUID v4): ${clientData.uuid}`);
+  console.log(`2. client.subId: ${clientData.subId}`);
+  console.log(`3. client.email (remark): ${clientData.email}`);
+  console.log(`4. client.flow: ${clientFlow}`);
+
   const payload = {
     client: {
       id: clientData.uuid,
       email: clientData.email,
-      flow: '',
+      flow: clientFlow,
       limitIp: 0,
       totalGB: clientData.totalBytes,
       expiryTime: clientData.expiryMs,
@@ -508,7 +529,6 @@ export const add3XUiClient = async (
     inboundIds: [inboundId]
   };
 
-  console.log("==================================================");
   console.log("Request URL:", fullUrl);
   console.log("Request payload:", JSON.stringify(payload, null, 2));
 
@@ -643,22 +663,14 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   console.log("Remark Template:", template.remarkTemplate);
   console.log("==============================");
 
-  // 3. Extract template values
+  // 3. Extract template values & format unique remark
   const inboundId = Number(template.inboundId) || 1;
   const address = template.address || '';
   const sni = template.sni || '';
   const remarkFormat = template.remarkTemplate || template.remarkFormat || '{{customerName}}';
 
-  console.log("");
-  console.log("Template Found");
-  console.log("");
-  console.log(`Package: ${template.packageName || packageName}`);
-  console.log(`Inbound ID: ${inboundId}`);
-  console.log(`Address: ${address}`);
-  console.log(`SNI: ${sni}`);
-  console.log(`Remark Template: ${remarkFormat}`);
-
-  const remark = formatClientRemark(remarkFormat, customerName);
+  const orderDisplayId = (order.orderId || orderSnap.id || '').trim();
+  const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
   // 4. Calculate duration & traffic
   const duration = order.duration || '1 Month';
@@ -691,29 +703,13 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   const trafficLimitStr = totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited';
 
-  console.log("");
-  console.log(`Generated Client Remark: ${remark}`);
-  console.log("");
-  console.log(`Generated Traffic Limit: ${trafficLimitStr}`);
-  console.log("");
-  console.log(`Generated Expiry: ${new Date(expiryMs).toISOString()}`);
-  console.log("");
-  console.log("Creating client in 3X-UI...");
+  // 1. client.id: Fresh UUID v4 for every request
+  const uuid = crypto.randomUUID();
 
-  // Generate UUID & subId
-  const uuid = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 10) + '-' + Math.random().toString(36).substring(2, 6) + '-' + Math.random().toString(36).substring(2, 6);
-  const subId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 10);
+  // 2. client.subId: Fresh random subId for every request
+  const subId = crypto.randomBytes(12).toString('hex');
 
-  // 5. Create client on 3X-UI panel
-  await add3XUiClient(inboundId, {
-    uuid,
-    email: remark,
-    totalBytes,
-    expiryMs,
-    subId
-  });
-
-  // 6. Fetch inbound info from 3X-UI to construct VLESS link
+  // Fetch inbound info from 3X-UI to determine 4. client.flow and build VLESS link
   const inbounds = await getInbounds();
   const inbound = inbounds.find((i: any) => Number(i.id) === inboundId) || {
     id: inboundId,
@@ -722,7 +718,45 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     streamSettings: JSON.stringify({ network: 'tcp', security: 'reality' })
   };
 
-  // 7. Generate VLESS link using template address & SNI, plus inbound settings
+  let streamObj: any = {};
+  if (typeof inbound.streamSettings === 'string') {
+    try { streamObj = JSON.parse(inbound.streamSettings); } catch (e) {}
+  } else if (inbound.streamSettings) {
+    streamObj = inbound.streamSettings;
+  }
+
+  const network = streamObj.network || 'tcp';
+  const security = streamObj.security || 'none';
+
+  // 4. client.flow: Determined flow for client
+  let flow = '';
+  if (security === 'reality') {
+    const reality = streamObj.realitySettings || streamObj.realitySettings?.settings || {};
+    const settings = reality.settings || reality;
+    flow = template.flow || settings.flow || reality.flow || 'xtls-rprx-vision';
+  } else {
+    flow = template.flow || '';
+  }
+
+  console.log("==================================================");
+  console.log("[3X-UI Provisioning] GENERATED VALUES FOR NEW CLIENT:");
+  console.log(`1. client.id (UUID v4): ${uuid}`);
+  console.log(`2. client.subId: ${subId}`);
+  console.log(`3. client.email (remark): ${remark}`);
+  console.log(`4. client.flow: ${flow}`);
+  console.log("==================================================");
+
+  // 5. Create client on 3X-UI panel
+  await add3XUiClient(inboundId, {
+    uuid,
+    email: remark,
+    totalBytes,
+    expiryMs,
+    subId,
+    flow
+  });
+
+  // 6. Generate VLESS link using template address & SNI, plus inbound settings
   const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
 
   console.log("");
