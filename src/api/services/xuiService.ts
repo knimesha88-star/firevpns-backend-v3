@@ -38,7 +38,7 @@ export interface XuiClient {
   totalGB: number;
   expiryTime: number;
   enable: boolean;
-  tgId: string;
+  tgId?: string | number;
   subId: string;
   reset: number;
 }
@@ -531,7 +531,6 @@ export const add3XUiClient = async (
       totalGB: clientData.totalBytes,
       expiryTime: clientData.expiryMs,
       enable: true,
-      tgId: '',
       subId: clientData.subId
     },
     inboundIds: [inboundId]
