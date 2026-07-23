@@ -45,12 +45,15 @@ export const saveSettings = async (req: AuthRequest, res: Response): Promise<voi
     const { panelUrl, username, password, panelName } = req.body;
     await supabase.from('settings').upsert({
       id: 'xui',
-      panelUrl,
-      username,
-      password,
-      panelName,
-      status: 'connected',
-      lastSync: new Date().toISOString()
+      data: {
+        panelUrl,
+        apiToken: password, // Store password as apiToken
+        username,
+        panelName,
+        status: 'connected',
+        lastSync: new Date().toISOString()
+      },
+      updated_at: new Date().toISOString()
     }, { onConflict: 'id' });
     res.json({ success: true, connected: true });
   } catch (error: any) {

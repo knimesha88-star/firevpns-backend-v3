@@ -64,7 +64,14 @@ const getXuiConfig = async (): Promise<XuiConfig> => {
   if (error || !doc) {
     throw new Error('3X-UI settings not configured');
   }
-  return doc as XuiConfig;
+  
+  const data = doc.data || {};
+  
+  return {
+    panelUrl: data.panelUrl || '',
+    apiToken: data.apiToken || '',
+    panelName: data.panelName || ''
+  } as XuiConfig;
 };
 
 const parseUrl = (urlStr: string) => {
