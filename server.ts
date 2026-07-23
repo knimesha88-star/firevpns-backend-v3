@@ -15,7 +15,6 @@ import { errorMiddleware } from './src/api/middleware/errorMiddleware.js';
 app.use('/api/renew', renewRoutes);
 app.use('/api/vpn', vpnRoutes);
 
-
 dotenv.config();
 
 const app = express();
