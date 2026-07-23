@@ -731,7 +731,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   // Traffic plan (Only two plans: 100 GB = 100 * 1024 * 1024 * 1024 bytes, Unlimited = 0 bytes)
   let totalBytes = 0; // Default Unlimited (0)
-  const combinedPlanStr = `${order.packageType || ''} ${order.plan || ''} ${order.packageName || ''} ${order.packageOption || ''} ${order.traffic || ''}`.toLowerCase();
+  const combinedPlanStr = `${order.packageType || ''} ${packageName || ''} ${order.plan || ''} ${order.packageOption || ''} ${order.traffic || ''}`.toLowerCase();
 
   const is100GB = combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100');
 
@@ -785,6 +785,23 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   console.log(`3. client.email (remark): ${remark}`);
   console.log(`4. client.flow: ${flow}`);
   console.log("==================================================");
+
+  const trafficPlan = is100GB ? "100GB" : "Unlimited";
+  const totalGB = totalBytes;
+  const client = {
+    id: uuid,
+    email: remark,
+    totalGB: totalGB,
+    expiryTime: expiryMs,
+    enable: true,
+    subId: subId,
+    flow: flow
+  };
+
+  console.log("Package:", packageName);
+  console.log("Traffic Plan:", trafficPlan);
+  console.log("Calculated totalGB:", totalGB);
+  console.log("Client Payload:", client);
 
   // 5. Create client on 3X-UI panel
   await add3XUiClient(inboundId, {
