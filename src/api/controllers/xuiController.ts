@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
-import { adminDb } from '../../config/firebaseAdmin.js';
+import { supabase } from '../../lib/supabase.js';
 
 export const getServerStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -27,8 +27,6 @@ export const testConnection = async (req: AuthRequest, res: Response): Promise<v
     const { panelUrl, username, password } = req.body;
     console.log(`[XUI Controller] Testing connection to panel URL: ${panelUrl}`);
     
-    // Test authentication using the new API token flow
-    // Frontend sends the token in the 'password' field currently
     await xuiService.testApiConnection({ panelUrl, apiToken: password, username });
     console.log(`[XUI Controller] Authentication successful.`);
     
@@ -45,14 +43,15 @@ export const testConnection = async (req: AuthRequest, res: Response): Promise<v
 export const saveSettings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { panelUrl, username, password, panelName } = req.body;
-    await adminDb.collection('settings').doc('xui').set({
+    await supabase.from('settings').upsert({
+      id: 'xui',
       panelUrl,
       username,
       password,
       panelName,
       status: 'connected',
-      lastSync: new Date()
-    });
+      lastSync: new Date().toISOString()
+    }, { onConflict: 'id' });
     res.json({ success: true, connected: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -61,7 +60,7 @@ export const saveSettings = async (req: AuthRequest, res: Response): Promise<voi
 
 export const deleteSettings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    await adminDb.collection('settings').doc('xui').delete();
+    await supabase.from('settings').delete().eq('id', 'xui');
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

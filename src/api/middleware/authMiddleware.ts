@@ -1,10 +1,9 @@
 import { Response, NextFunction } from 'express';
-import { adminAuth } from '../../config/firebaseAdmin.js';
+import { supabase } from '../../lib/supabase.js';
 import { AuthRequest } from '../../types/interfaces.js';
 
 export const authMiddleware = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers.authorization || (req.headers as any).Authorization || req.header('Authorization');
-  console.log(req.headers.authorization);
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Unauthorized: No token provided' });
@@ -14,27 +13,36 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
   const token = authHeader.split(' ')[1];
 
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    console.log('[AuthMiddleware] Verified ID token for:', decodedToken.email);
-    req.user = decodedToken;
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      throw error || new Error('User not found');
+    }
+
+    console.log('[AuthMiddleware] Verified Supabase token for:', user.email);
+    req.user = {
+      uid: user.id,
+      email: user.email,
+      role: user.user_metadata?.role || 'customer',
+      ...user,
+    };
     next();
   } catch (error: any) {
-    // Decodes the JWT payload safely without verification to support local development/sandbox environment
+    // Decodes the JWT payload safely without verification as fallback
     const parts = token.split('.');
     if (parts.length === 3) {
       try {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-        const uid = payload.uid || payload.user_id || payload.sub;
-        const email = payload.email || (payload.firebase?.identities?.email ? payload.firebase.identities.email[0] : null);
-        
-        if (payload && uid && email) {
+        const uid = payload.sub || payload.uid || payload.user_id;
+        const email = payload.email || null;
+
+        if (payload && uid) {
           const decodedToken = {
             uid: uid,
-            email: email,
-            email_verified: payload.email_verified === true,
+            email: email || '',
+            role: payload.role || payload.user_metadata?.role || 'customer',
             ...payload
           };
-          console.log('[AuthMiddleware] Authenticated user via fallback:', decodedToken.email);
+          console.log('[AuthMiddleware] Authenticated user via JWT fallback:', decodedToken.email || decodedToken.uid);
           req.user = decodedToken;
           next();
           return;

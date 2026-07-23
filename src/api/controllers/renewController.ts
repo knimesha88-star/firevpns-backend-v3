@@ -1,8 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
-import { adminDb } from '../../config/firebaseAdmin.js';
-import { FieldValue } from 'firebase-admin/firestore';
+import { supabase } from '../../lib/supabase.js';
 import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -46,18 +45,25 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    // Read the renewRequests document from Firestore
-    const requestDocRef = adminDb.collection('renewRequests').doc(requestId);
-    const docSnap = await requestDocRef.get();
+    // Read the renewRequests/renew_requests record from Supabase
+    let { data, error: fetchErr } = await supabase
+      .from('renew_requests')
+      .select('*')
+      .eq('id', requestId)
+      .single();
     
-    if (!docSnap.exists) {
-      res.status(404).json({ error: 'Renewal request not found' });
-      return;
+    if (fetchErr || !data) {
+      const fallback = await supabase
+        .from('renewRequests')
+        .select('*')
+        .eq('id', requestId)
+        .single();
+      data = fallback.data;
+      fetchErr = fallback.error;
     }
     
-    const data = docSnap.data();
-    if (!data) {
-      res.status(404).json({ error: 'Renewal request data is empty' });
+    if (fetchErr || !data) {
+      res.status(404).json({ error: 'Renewal request not found' });
       return;
     }
     
@@ -80,19 +86,32 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     // Call the service to update client's expiry time in 3X-UI
     const newExpiryTime = await xuiService.updateClientExpiry(email, durationMonths);
     
-    console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${newExpiryTime}. Updating Firestore...`);
+    console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${newExpiryTime}. Updating Supabase...`);
     
-    // Update Firestore document upon success
-    await requestDocRef.update({
+    const nowIso = new Date().toISOString();
+    // Update Supabase document upon success
+    const { error: updateErr } = await supabase.from('renew_requests').update({
       status: 'Approved',
-      approvedAt: FieldValue.serverTimestamp(),
-      processedAt: FieldValue.serverTimestamp(),
-      newExpiry: newExpiryTime
-    });
+      approvedAt: nowIso,
+      approved_at: nowIso,
+      processedAt: nowIso,
+      processed_at: nowIso,
+      newExpiry: newExpiryTime,
+      new_expiry: newExpiryTime
+    }).eq('id', requestId);
+
+    if (updateErr) {
+      await supabase.from('renewRequests').update({
+        status: 'Approved',
+        approvedAt: nowIso,
+        processedAt: nowIso,
+        newExpiry: newExpiryTime
+      }).eq('id', requestId);
+    }
     
-    console.log(`[RenewController] Firestore document ${requestId} updated successfully.`);
+    console.log(`[RenewController] Supabase record ${requestId} updated successfully.`);
     
-    // Trigger Telegram approved notification asynchronously without breaking approval flow if it fails
+    // Trigger Telegram approved notification asynchronously
     const approvedAtNow = new Date();
     sendRenewApprovedNotification({
       email: email,
@@ -137,7 +156,6 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       notes: data.notes || '',
     };
 
-    // Send Telegram Notification safely without crashing or rejecting request
     sendNewOrderNotification(notificationData).catch((err) => {
       console.error('[RenewController] Telegram new order notification error:', err?.message || err);
     });

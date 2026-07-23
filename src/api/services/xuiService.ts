@@ -1,6 +1,5 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { adminDb } from '../../config/firebaseAdmin.js';
-import { FieldValue } from 'firebase-admin/firestore';
+import { supabase } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
 import crypto from 'crypto';
 import https from 'https';
@@ -61,11 +60,11 @@ export interface XuiInbound {
 }
 
 const getXuiConfig = async (): Promise<XuiConfig> => {
-  const doc = await adminDb.collection('settings').doc('xui').get();
-  if (!doc.exists) {
-    throw new Error('3X-UI settings not configured in Firestore');
+  const { data: doc, error } = await supabase.from('settings').select('*').eq('id', 'xui').single();
+  if (error || !doc) {
+    throw new Error('3X-UI settings not configured');
   }
-  return doc.data() as XuiConfig;
+  return doc as XuiConfig;
 };
 
 const parseUrl = (urlStr: string) => {
@@ -377,14 +376,15 @@ export const findProvisioningTemplate = async (packageName: string): Promise<any
 
   for (const colName of collectionsToCheck) {
     try {
-      const snapshot = await adminDb.collection(colName).get();
-      for (const docSnap of snapshot.docs) {
-        const data = docSnap.data();
-        const enabled = data.enabled !== false;
-        const docPackageName = String(data.packageName || data.name || docSnap.id).trim().toLowerCase();
+      const { data: snapshot } = await supabase.from(colName).select('*');
+      if (snapshot) {
+        for (const item of snapshot) {
+          const enabled = item.enabled !== false;
+          const docPackageName = String(item.packageName || item.name || item.id).trim().toLowerCase();
 
-        if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
-          return { id: docSnap.id, ...data };
+          if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
+            return { id: item.id, ...item };
+          }
         }
       }
     } catch (e) {
@@ -607,50 +607,57 @@ export const add3XUiClient = async (
 };
 
 export const provisionOrderClient = async (orderId: string): Promise<any> => {
-  // 1. Fetch order document from Firestore
-  let orderRef = adminDb.collection('orders').doc(orderId);
-  let orderSnap = await orderRef.get();
+  let { data: order } = await supabase.from('orders').select('*').eq('id', orderId).single();
 
-  if (!orderSnap.exists) {
-    const querySnap = await adminDb.collection('orders').where('orderId', '==', orderId).limit(1).get();
-    if (querySnap.empty) {
+  if (!order) {
+    const { data: queryOrder } = await supabase.from('orders').select('*').eq('order_id', orderId).single();
+    if (!queryOrder) {
       throw new Error('Provisioning template not found.');
     }
-    orderSnap = querySnap.docs[0];
-    orderRef = orderSnap.ref;
+    order = queryOrder;
   }
 
-  const order = orderSnap.data() || {};
-  const packageName = order.packageName || order.plan || order.package || '';
-  const customerName = order.configurationName || order.customerName || order.name || order.fullName || (order.email ? order.email.split('@')[0] : 'Customer');
-  const customerId = order.customerId || order.uid || order.userId || '';
+  // Parse JSON-serialized order metadata from payment_method if applicable
+  let extra: any = {};
+  if (order.payment_method && order.payment_method.startsWith('{')) {
+    try {
+      extra = JSON.parse(order.payment_method);
+    } catch (e) {
+      console.error('[xuiService] Error parsing payment_method JSON:', e);
+    }
+  }
+
+  const packageName = extra.packageName || extra.plan || extra.package || order.package_name || '';
+  const customerName = extra.configurationName || extra.customerName || extra.name || extra.fullName || (order.email ? order.email.split('@')[0] : 'Customer');
+  const customerId = order.customer_id || '';
 
   console.log("==================================================");
   console.log("TEMPLATE LOOKUP START");
   console.log("==================================================");
-  console.log("Order ID:", order.orderId || orderSnap.id);
+  console.log("Order ID:", order.order_id || (order as any).id);
   console.log("Customer Email:", order.email);
   console.log("Customer Name:", customerName);
-  console.log("order.package:", order.package);
-  console.log("order.packageName:", order.packageName);
-  console.log("order.plan:", order.plan);
-  console.log("order.category:", order.category);
-  console.log("order.server:", order.server);
+  console.log("order.package_name:", order.package_name);
+  console.log("extra.packageName:", extra.packageName);
+  console.log("extra.plan:", extra.plan);
+  console.log("extra.category:", extra.category);
+  console.log("extra.server:", extra.server);
   console.log("");
   console.log("Searching collection: provisionTemplates");
 
   let matchingDocs: any[] = [];
   try {
-    const provSnap = await adminDb.collection('provisionTemplates').get();
+    const { data: provTemplates } = await supabase.from('provisionTemplates').select('*');
     const targetName = packageName.trim().toLowerCase();
 
-    for (const docSnap of provSnap.docs) {
-      const data = docSnap.data();
-      const enabled = data.enabled !== false;
-      const docPackageName = String(data.packageName || data.name || docSnap.id).trim().toLowerCase();
+    if (provTemplates) {
+      for (const data of provTemplates) {
+        const enabled = data.enabled !== false;
+        const docPackageName = String(data.packageName || data.name || data.id).trim().toLowerCase();
 
-      if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
-        matchingDocs.push({ id: docSnap.id, ...data });
+        if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
+          matchingDocs.push({ id: data.id, ...data });
+        }
       }
     }
 
@@ -670,13 +677,14 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       });
     } else {
       console.log("No matching template found. Fetching ALL documents from provisionTemplates collection:");
-      for (const docSnap of provSnap.docs) {
-        const data = docSnap.data();
-        console.log("Document ID:", docSnap.id);
-        console.log("packageName:", data.packageName || data.name);
-        console.log("enabled:", data.enabled !== false);
-        console.log("category:", data.category);
-        console.log("server:", data.server);
+      if (provTemplates) {
+        for (const data of provTemplates) {
+          console.log("Document ID:", data.id);
+          console.log("packageName:", data.packageName || data.name);
+          console.log("enabled:", data.enabled !== false);
+          console.log("category:", data.category);
+          console.log("server:", data.server);
+        }
       }
     }
   } catch (err) {
@@ -708,11 +716,11 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   const sni = template.sni || '';
   const remarkFormat = template.remarkTemplate || template.remarkFormat || '{{customerName}}';
 
-  const orderDisplayId = (order.orderId || orderSnap.id || '').trim();
+  const orderDisplayId = (order.order_id || (order as any).id || '').trim();
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
   // 4. Calculate duration & traffic
-  const duration = order.duration || '1 Month';
+  const duration = extra.duration || order.duration || '1 Month';
   let days = 30;
   if (template.durationProfiles && template.durationProfiles[duration]) {
     days = Number(template.durationProfiles[duration]);
@@ -731,7 +739,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   // Traffic plan (Only two plans: 100 GB = 100 * 1024 * 1024 * 1024 bytes, Unlimited = 0 bytes)
   let totalBytes = 0; // Default Unlimited (0)
-  const combinedPlanStr = `${order.packageType || ''} ${packageName || ''} ${order.plan || ''} ${order.packageOption || ''} ${order.traffic || ''}`.toLowerCase();
+  const combinedPlanStr = `${extra.packageType || order.packageType || ''} ${packageName || ''} ${extra.plan || order.plan || ''} ${extra.packageOption || order.packageOption || ''} ${extra.traffic || order.traffic || ''}`.toLowerCase();
 
   const is100GB = combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100');
 
@@ -834,8 +842,9 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   }
 
   try {
-    const vpnConfigRef = await adminDb.collection('users').doc(customerUid).collection('vpnConfigs').add({
-      orderId: order.orderId || orderSnap.id,
+    const { data: insertedConfig, error: insertErr } = await supabase.from('vpnConfigs').insert({
+      customerUid: customerUid,
+      orderId: order.orderId || order.id,
       packageName: packageName,
       package: packageName,
       packageType: order.packageType || 'SIM Unlimited',
@@ -852,16 +861,16 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       expiryDate: new Date(expiryMs).toISOString(),
       enabled: true,
       status: 'Active',
-      createdAt: FieldValue.serverTimestamp()
-    });
-    configDocId = vpnConfigRef.id;
+      createdAt: new Date().toISOString()
+    }).select('id').single();
+    configDocId = insertedConfig?.id || '';
   } catch (docErr: any) {
     const errorDetails = docErr?.message || String(docErr);
-    console.error('[3X-UI Provisioning] Failed to save VPN configuration in Firestore:', docErr);
-    throw new Error(`Failed to save VPN configuration in Firestore: ${errorDetails}`);
+    console.error('[3X-UI Provisioning] Failed to save VPN configuration in Supabase:', docErr);
+    throw new Error(`Failed to save VPN configuration in Supabase: ${errorDetails}`);
   }
 
-  await orderRef.update({
+  await supabase.from('orders').update({
     paymentStatus: 'Approved',
     provisioningStatus: 'Completed',
     configId: configDocId || undefined,
@@ -873,8 +882,8 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       subId: subId,
       inboundId: inboundId
     },
-    approvedAt: FieldValue.serverTimestamp()
-  });
+    approvedAt: new Date().toISOString()
+  }).eq('id', order.id);
 
   // 9. Send Telegram notification
   try {
@@ -886,7 +895,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       duration: duration,
       price: order.amount || 0,
       uuid: uuid,
-      orderId: order.orderId || orderSnap.id,
+      orderId: order.orderId || (order as any).id,
       status: '🟢 COMPLETED'
     });
   } catch (tgErr) {
@@ -895,7 +904,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   return {
     success: true,
-    orderId: order.orderId || orderSnap.id,
+    orderId: order.orderId || (order as any).id,
     uuid,
     vlessUrl,
     remark,

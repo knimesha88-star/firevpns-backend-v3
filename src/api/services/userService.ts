@@ -1,11 +1,15 @@
-import { adminDb } from '../../config/firebaseAdmin.js';
+import { supabase } from '../../lib/supabase.js';
 
 export const getUserProfile = async (uid: string): Promise<any> => {
-  const userDoc = await adminDb.collection('users').doc(uid).get();
-  if (!userDoc.exists) return null;
-  return userDoc.data();
+  const { data: profile } = await supabase.from('profiles').select('*').eq('id', uid).single();
+  if (profile) return profile;
+  const { data: user } = await supabase.from('users').select('*').or(`id.eq.${uid},uid.eq.${uid}`).single();
+  return user || null;
 };
 
 export const updateUserProfile = async (uid: string, data: any): Promise<void> => {
-  await adminDb.collection('users').doc(uid).set(data, { merge: true });
+  const { error } = await supabase.from('profiles').update(data).eq('id', uid);
+  if (error) {
+    await supabase.from('profiles').upsert({ id: uid, ...data }, { onConflict: 'id' });
+  }
 };

@@ -1,4 +1,4 @@
-import { adminDb } from '../../config/firebaseAdmin.js';
+import { supabase } from '../../lib/supabase.js';
 import { getInbounds } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
@@ -8,18 +8,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
 
-  const snapshot = await adminDb.collection('orders').get();
-  const allOrders: any[] = [];
-  snapshot.forEach((doc: any) => {
-    allOrders.push({
-      id: doc.id,
-      data: () => doc.data(),
-      ...doc.data()
-    });
-  });
+  const { data: snapshot, error } = await supabase.from('orders').select('*');
+  const allOrders: any[] = snapshot || [];
 
   const matchedDocs = allOrders.filter(doc => {
-    const data = doc.data ? doc.data() : doc;
+    const data = doc;
     const docUid = String(data.customerUid || data.customerId || data.uid || data.userId || '').trim();
     const docEmail = String(data.customerEmail || data.email || data.userEmail || '').toLowerCase().trim();
     const statusVal = String(data.status || data.paymentStatus || data.provisioningStatus || '').toLowerCase();
@@ -33,18 +26,17 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   console.log("Orders Found:", matchedDocs.length);
 
   const configs: any[] = [];
-  matchedDocs.forEach(doc => {
-    const data = doc.data ? doc.data() : doc;
+  matchedDocs.forEach(data => {
     console.log({
-      orderId: doc.id || data.orderId,
+      orderId: data.id || data.orderId,
       customerUid: data.customerUid || data.customerId || data.uid,
       customerEmail: data.customerEmail || data.email,
       status: data.status || data.paymentStatus
     });
     configs.push({
-      orderId: doc.id || data.orderId,
+      orderId: data.id || data.orderId,
       packageName: data.plan || data.packageName || data.packageType || 'Unknown',
-      configUrl: data.vpnCredentials?.configLink || data.vpnCredentials?.qrcodeData || '',
+      configUrl: data.vpnCredentials?.configLink || data.vpnCredentials?.qrcodeData || data.configUrl || '',
       uuid: data.vpnCredentials?.password || data.uuid || '',
       expiryDate: data.expiryDate || data.expiryTime || '',
       inboundId: data.vpnCredentials?.inboundId || data.inboundId || null,
@@ -145,4 +137,3 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   return resultConfigs;
 };
-
