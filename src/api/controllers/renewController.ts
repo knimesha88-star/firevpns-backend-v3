@@ -67,6 +67,8 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
+    console.log("Renew request loaded:", data);
+    
     // Validate status must equal "pending" (case-insensitive)
     const currentStatus = data.status?.toLowerCase();
     if (currentStatus !== 'pending') {
@@ -74,13 +76,25 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    const email = data.email || data.userEmail;
+    const email = data.user_email || data.userEmail || data.email;
     if (!email) {
       res.status(400).json({ error: 'Client email is missing in the renewal request.' });
       return;
     }
     
-    const durationMonths = Number(data.durationMonths || data.duration || 1);
+    let durationMonths = Number(data.durationMonths || data.duration || 1);
+    if (data.notes) {
+      try {
+        const parsedNotes = typeof data.notes === 'string' ? JSON.parse(data.notes) : data.notes;
+        if (parsedNotes && parsedNotes.durationMonths) {
+          durationMonths = Number(parsedNotes.durationMonths);
+        } else if (parsedNotes && parsedNotes.duration) {
+          durationMonths = Number(parsedNotes.duration);
+        }
+      } catch (e) {
+        console.warn('[RenewController] Error parsing notes JSON for duration:', e);
+      }
+    }
     
     console.log(`[RenewController] Approving renewal request ${requestId} for ${email} with duration of ${durationMonths} months.`);
     
