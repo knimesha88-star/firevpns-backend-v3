@@ -1,17 +1,48 @@
 import { adminDb } from '../../config/firebaseAdmin.js';
 import { getInbounds } from './xuiService.js';
 
-export const getMyConfigs = async (uid: string) => {
-  const snapshot = await adminDb.collection('orders')
-    .where('customerUid', '==', uid)
-    .where('status', '==', 'Approved')
-    .get();
+export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
+  console.log("Current UID:", uid);
+  console.log("Current Email:", email);
+
+  const userEmail = email ? email.toLowerCase().trim() : '';
+  const userUid = uid ? uid.trim() : '';
+
+  const snapshot = await adminDb.collection('orders').get();
+  const allOrders: any[] = [];
+  snapshot.forEach((doc: any) => {
+    allOrders.push({
+      id: doc.id,
+      data: () => doc.data(),
+      ...doc.data()
+    });
+  });
+
+  const matchedDocs = allOrders.filter(doc => {
+    const data = doc.data ? doc.data() : doc;
+    const docUid = String(data.customerUid || data.customerId || data.uid || data.userId || '').trim();
+    const docEmail = String(data.customerEmail || data.email || data.userEmail || '').toLowerCase().trim();
+    const statusVal = String(data.status || data.paymentStatus || data.provisioningStatus || '').toLowerCase();
+
+    const matchesUser = (userUid && docUid === userUid) || (userEmail && docEmail === userEmail);
+    const isApproved = statusVal === 'approved' || statusVal === 'completed' || statusVal === 'paid' || statusVal === 'active';
+
+    return matchesUser && isApproved;
+  });
+
+  console.log("Orders Found:", matchedDocs.length);
 
   const configs: any[] = [];
-  snapshot.forEach(doc => {
-    const data = doc.data();
+  matchedDocs.forEach(doc => {
+    const data = doc.data ? doc.data() : doc;
+    console.log({
+      orderId: doc.id || data.orderId,
+      customerUid: data.customerUid || data.customerId || data.uid,
+      customerEmail: data.customerEmail || data.email,
+      status: data.status || data.paymentStatus
+    });
     configs.push({
-      orderId: doc.id,
+      orderId: doc.id || data.orderId,
       packageName: data.plan || data.packageName || data.packageType || 'Unknown',
       configUrl: data.vpnCredentials?.configLink || data.vpnCredentials?.qrcodeData || '',
       uuid: data.vpnCredentials?.password || data.uuid || '',
@@ -19,7 +50,6 @@ export const getMyConfigs = async (uid: string) => {
       inboundId: data.vpnCredentials?.inboundId || data.inboundId || null,
       trafficLimit: data.trafficLimit || data.traffic || 'Unlimited',
       serverNode: data.server || data.serverNode || 'Default',
-      // Internal fields, stripped before return
       _rawLimit: data.totalBytes || 0,
     });
   });
@@ -37,7 +67,6 @@ export const getMyConfigs = async (uid: string) => {
     let status = 'Disabled';
     let currentExpiryDate = config.expiryDate;
     
-    // Convert trafficLimit string to numeric value for math (or rely on calculation)
     let trafficLimitNum = 0;
     if (String(config.trafficLimit).toLowerCase() !== 'unlimited') {
       const match = String(config.trafficLimit).match(/(\d+(\.\d+)?)/);
@@ -116,3 +145,4 @@ export const getMyConfigs = async (uid: string) => {
 
   return resultConfigs;
 };
+

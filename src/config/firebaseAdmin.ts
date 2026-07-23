@@ -44,7 +44,7 @@ if (!getApps().length) {
       });
     } catch (e: any) {
       console.error('[FirebaseAdmin] Error parsing FIREBASE_SERVICE_ACCOUNT JSON:', e.message);
-      initializeApp(); // Fallback
+      initializeApp();
     }
   } else if (projectId) {
     console.log(`[FirebaseAdmin] Initializing with projectId from config: ${projectId}`);
@@ -53,10 +53,11 @@ if (!getApps().length) {
     });
   } else {
     console.log('[FirebaseAdmin] Using Application Default Credentials (ADC)');
-    initializeApp(); // Fallback for environments with ADC (e.g., Render with proper env vars)
+    initializeApp();
   }
 }
 
 export const adminAuth = getAuth();
 export const adminDb = databaseId ? getFirestore(getApps()[0], databaseId) : getFirestore();
 
+console.log("Firebase Admin initialized successfully");
