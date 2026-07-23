@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 
+import vpnRoutes from './src/api/routes/vpnRoutes.js';
 import authRoutes from './src/api/routes/authRoutes.js';
 import adminRoutes from './src/api/routes/adminRoutes.js';
 import clientRoutes from './src/api/routes/clientRoutes.js';
@@ -11,6 +12,9 @@ import xuiRoutes from './src/api/routes/xuiRoutes.js';
 import threeXuiRoutes from './src/api/routes/threeXuiRoutes.js';
 import renewRoutes from './src/api/routes/renewRoutes.js';
 import { errorMiddleware } from './src/api/middleware/errorMiddleware.js';
+app.use('/api/renew', renewRoutes);
+app.use('/api/vpn', vpnRoutes);
+
 
 dotenv.config();
 
