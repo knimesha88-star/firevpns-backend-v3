@@ -469,10 +469,43 @@ export const buildVlessLink = (
     }
   }
 
-  if (network === 'ws') {
-    const ws = streamObj.wsSettings || {};
-    if (ws.path) params.set('path', ws.path);
-    if (ws.headers && ws.headers.Host) params.set('host', ws.headers.Host);
+  // Handle WebSocket settings (path and host)
+  let wsObj: any = streamObj.wsSettings || {};
+  if (!wsObj.path && !wsObj.headers && streamObj.settings?.wsSettings) {
+    wsObj = streamObj.settings.wsSettings;
+  }
+  if (!wsObj.path && !wsObj.headers && inbound.settings) {
+    let settingsParsed: any = {};
+    if (typeof inbound.settings === 'string') {
+      try { settingsParsed = JSON.parse(inbound.settings); } catch (e) {}
+    } else if (typeof inbound.settings === 'object') {
+      settingsParsed = inbound.settings;
+    }
+    if (settingsParsed.wsSettings) {
+      wsObj = settingsParsed.wsSettings;
+    }
+  }
+
+  let wsPath = wsObj.path || '';
+  let wsHeaders: any = wsObj.headers || {};
+  if (typeof wsHeaders === 'string') {
+    try {
+      wsHeaders = JSON.parse(wsHeaders);
+    } catch (e) {
+      wsHeaders = {};
+    }
+  }
+  let wsHost = '';
+  if (wsHeaders && typeof wsHeaders === 'object') {
+    wsHost = wsHeaders.Host || wsHeaders.host || wsHeaders.HOST || '';
+  }
+  if (!wsHost && (wsObj.host || wsObj.Host)) {
+    wsHost = wsObj.host || wsObj.Host;
+  }
+
+  if (network === 'ws' || wsPath || wsHost) {
+    if (wsPath) params.set('path', wsPath);
+    if (wsHost) params.set('host', wsHost);
   } else if (network === 'grpc') {
     const grpc = streamObj.grpcSettings || {};
     if (grpc.serviceName) params.set('serviceName', grpc.serviceName);
