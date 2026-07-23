@@ -10,6 +10,7 @@ import userRoutes from './src/api/routes/userRoutes.js';
 import xuiRoutes from './src/api/routes/xuiRoutes.js';
 import threeXuiRoutes from './src/api/routes/threeXuiRoutes.js';
 import renewRoutes from './src/api/routes/renewRoutes.js';
+import vpnRoutes from './src/api/routes/vpnRoutes.js';
 import { errorMiddleware } from './src/api/middleware/errorMiddleware.js';
 
 dotenv.config();
@@ -32,6 +33,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/xui', xuiRoutes);
 app.use('/api/3xui', threeXuiRoutes);
 app.use('/api/renew', renewRoutes);
+app.use('/api/vpn', vpnRoutes);
 
 app.use(errorMiddleware);
 
