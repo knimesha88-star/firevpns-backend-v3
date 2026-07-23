@@ -729,15 +729,16 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   }
   const expiryMs = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-  // Traffic
-  let totalBytes = 0; // Default unlimited
-  if (template.trafficProfiles) {
-    const planKey = Object.keys(template.trafficProfiles).find(
-      k => k.toLowerCase() === String(order.plan || '').toLowerCase() || k.toLowerCase() === String(order.packageType || '').toLowerCase()
-    );
-    if (planKey && template.trafficProfiles[planKey] > 0) {
-      totalBytes = template.trafficProfiles[planKey] * 1024 * 1024 * 1024;
-    }
+  // Traffic plan (Only two plans: 100 GB = 100 * 1024 * 1024 * 1024 bytes, Unlimited = 0 bytes)
+  let totalBytes = 0; // Default Unlimited (0)
+  const combinedPlanStr = `${order.packageType || ''} ${order.plan || ''} ${order.packageName || ''} ${order.packageOption || ''} ${order.traffic || ''}`.toLowerCase();
+
+  const is100GB = combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100');
+
+  if (is100GB) {
+    totalBytes = 100 * 1024 * 1024 * 1024;
+  } else {
+    totalBytes = 0;
   }
 
   const trafficLimitStr = totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited';
