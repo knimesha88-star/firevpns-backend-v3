@@ -67,9 +67,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    // Validate status must equal "Pending"
-    if (data.status !== 'Pending') {
-      res.status(400).json({ error: `Cannot approve request with status '${data.status}'. Status must be 'Pending'.` });
+    // Validate status must equal "pending" (case-insensitive)
+    const currentStatus = data.status?.toLowerCase();
+    if (currentStatus !== 'pending') {
+      res.status(400).json({ error: `Cannot approve request with status '${data.status}'. Status must be 'pending'.` });
       return;
     }
     
@@ -89,9 +90,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${newExpiryTime}. Updating Supabase...`);
     
     const nowIso = new Date().toISOString();
-    // Update Supabase document upon success
+    // Update Supabase document upon success with lowercase 'approved'
     const { error: updateErr } = await supabase.from('renew_requests').update({
-      status: 'Approved',
+      status: 'approved',
       approvedAt: nowIso,
       approved_at: nowIso,
       processedAt: nowIso,
@@ -102,7 +103,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
 
     if (updateErr) {
       await supabase.from('renewRequests').update({
-        status: 'Approved',
+        status: 'approved',
         approvedAt: nowIso,
         processedAt: nowIso,
         newExpiry: newExpiryTime
@@ -130,7 +131,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       data: {
         requestId,
         newExpiry: newExpiryTime,
-        status: 'Approved'
+        status: 'approved'
       }
     });
   } catch (error: any) {
