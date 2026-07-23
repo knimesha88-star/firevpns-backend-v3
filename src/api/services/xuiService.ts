@@ -557,13 +557,8 @@ export const add3XUiClient = async (
       throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
     }
 
-    if (!response.data || response.data.success !== true) {
+    if (!response.data || response.data.success === false) {
       const errorMsg = response.data?.msg || 'API returned success=false';
-      throw new Error(`3X-UI API Error: ${errorMsg}`);
-    }
-
-    if (response.data.obj === undefined || response.data.obj === null) {
-      const errorMsg = response.data?.msg || 'API response missing obj field';
       throw new Error(`3X-UI API Error: ${errorMsg}`);
     }
 
