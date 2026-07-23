@@ -125,26 +125,34 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
 
   console.log(`[XUI API] ${method} ${fullUrl}`);
   
-  const response = await client.request({
-    url: fullPath,
-    method,
-    data,
-    headers: {
-      Authorization: `Bearer ${token}`
+  try {
+    const response = await client.request({
+      url: fullPath,
+      method,
+      data,
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    console.log(`[XUI API] Response status for ${endpoint}: ${response.status}`);
+
+    if (response.status !== 200) {
+      throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
     }
-  });
 
-  console.log(`[XUI API] Response status for ${endpoint}: ${response.status}`);
+    if (response.data && response.data.success === false) {
+      throw new Error(`3X-UI API Error: ${response.data.msg}`);
+    }
 
-  if (response.status !== 200) {
-    throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
+    return response.data.obj;
+  } catch (error: any) {
+    console.error("=== 3X-UI ERROR ===");
+    console.error(error.response?.status);
+    console.error(error.response?.data);
+    console.error(error.message);
+    throw error;
   }
-
-  if (response.data && response.data.success === false) {
-    throw new Error(`3X-UI API Error: ${response.data.msg}`);
-  }
-
-  return response.data.obj;
 };
 
 export const testApiConnection = async (config: XuiConfig): Promise<boolean> => {
@@ -530,7 +538,8 @@ export const add3XUiClient = async (
   };
 
   console.log("Request URL:", fullUrl);
-  console.log("Request Body:", JSON.stringify(payload, null, 2));
+  console.log("=== 3X-UI REQUEST ===");
+  console.log(JSON.stringify(payload, null, 2));
 
   try {
     const response = await client.request({
@@ -542,9 +551,8 @@ export const add3XUiClient = async (
       }
     });
 
-    console.log("HTTP Status:", response.status);
-    console.log("Complete Response Body:", typeof response.data === 'object' ? JSON.stringify(response.data, null, 2) : response.data);
-    console.log("==================================================");
+    console.log("=== 3X-UI RESPONSE ===");
+    console.log(JSON.stringify(response.data, null, 2));
 
     if (response.status !== 200 && response.status !== 201) {
       throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
@@ -562,13 +570,12 @@ export const add3XUiClient = async (
 
     console.log("Client Created Successfully");
     return response.data;
-  } catch (err: any) {
-    if (err.response) {
-      console.log("HTTP Status:", err.response.status);
-      console.log("Complete Response Body:", typeof err.response.data === 'object' ? JSON.stringify(err.response.data, null, 2) : err.response.data);
-      console.log("==================================================");
-    }
-    throw err;
+  } catch (error: any) {
+    console.error("=== 3X-UI ERROR ===");
+    console.error(error.response?.status);
+    console.error(error.response?.data);
+    console.error(error.message);
+    throw error;
   }
 };
 
