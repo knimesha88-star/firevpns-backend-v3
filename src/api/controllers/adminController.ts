@@ -52,7 +52,7 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     const { error: updateErr } = await supabaseAdmin
       .from('orders')
       .update({
-        payment_status: 'Verified',
+        payment_status: 'Paid',
         updated_at: new Date().toISOString()
       })
       .eq('id', orderId);
