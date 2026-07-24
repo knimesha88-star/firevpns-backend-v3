@@ -51,7 +51,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       .from('renew_requests')
       .select('*')
       .eq('id', requestId)
-      .single();
+      .maybeSingle();
     
     if (fetchErr || !data) {
       res.status(404).json({ error: 'Renewal request not found' });
@@ -147,7 +147,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       })
       .eq('id', requestId)
       .select()
-      .single();
+      .maybeSingle();
 
     if (updateErr) {
       console.error('[RenewController] Error updating renew_requests table:', updateErr);
@@ -231,7 +231,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       .from('renew_requests')
       .select('*')
       .eq('id', requestId)
-      .single();
+      .maybeSingle();
 
     if (fetchErr || !data) {
       res.status(404).json({ error: 'Renewal request not found' });
@@ -259,7 +259,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       })
       .eq('id', requestId)
       .select()
-      .single();
+      .maybeSingle();
 
     if (updateErr) {
       console.error('[RenewController] Error updating renew_requests on rejection:', updateErr);

@@ -19,7 +19,7 @@ export const adminMiddleware = async (req: AuthRequest, res: Response, next: Nex
       .from('profiles')
       .select('role')
       .eq('id', req.user.uid)
-      .single();
+      .maybeSingle();
 
     let role = profileData?.role;
 
@@ -28,7 +28,7 @@ export const adminMiddleware = async (req: AuthRequest, res: Response, next: Nex
         .from('users')
         .select('role')
         .or(`id.eq.${req.user.uid},uid.eq.${req.user.uid}`)
-        .single();
+        .maybeSingle();
       role = userData?.role;
     }
 

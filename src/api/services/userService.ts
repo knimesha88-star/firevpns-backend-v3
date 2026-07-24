@@ -1,9 +1,9 @@
 import { supabase } from '../../lib/supabase.js';
 
 export const getUserProfile = async (uid: string): Promise<any> => {
-  const { data: profile } = await supabase.from('profiles').select('*').eq('id', uid).single();
+  const { data: profile } = await supabase.from('profiles').select('*').eq('id', uid).maybeSingle();
   if (profile) return profile;
-  const { data: user } = await supabase.from('users').select('*').or(`id.eq.${uid},uid.eq.${uid}`).single();
+  const { data: user } = await supabase.from('users').select('*').or(`id.eq.${uid},uid.eq.${uid}`).maybeSingle();
   return user || null;
 };
 

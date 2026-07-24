@@ -63,7 +63,7 @@ export interface XuiInbound {
 }
 
 const getXuiConfig = async (): Promise<XuiConfig> => {
-  const { data: doc, error } = await supabase.from('settings').select('*').eq('id', 'xui').single();
+  const { data: doc, error } = await supabase.from('settings').select('*').eq('id', 'xui').maybeSingle();
   if (error || !doc) {
     throw new Error('3X-UI settings not configured');
   }
