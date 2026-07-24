@@ -58,10 +58,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    console.log("Renew request loaded:", data);
+    console.log("[RenewController] Loaded renew request for approval:", data);
     
-    // Validate status must equal "pending" (case-insensitive)
-    const currentStatus = data.status?.toLowerCase();
+    // Validate status must equal "pending"
+    const currentStatus = String(data.status || '').toLowerCase();
     if (currentStatus !== 'pending') {
       res.status(400).json({ error: `Cannot approve request with status '${data.status}'. Status must be 'pending'.` });
       return;
@@ -73,7 +73,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    let durationMonths = Number(data.durationMonths || data.duration || 1);
+    let durationMonths = Number(data.durationMonths || data.duration_months || data.duration || 1);
     if (data.notes) {
       try {
         const parsedNotes = typeof data.notes === 'string' ? JSON.parse(data.notes) : data.notes;
@@ -87,76 +87,139 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       }
     }
     
-    console.log(`[RenewController] Approving renewal request ${requestId} for ${email} with duration of ${durationMonths} months.`);
+    // 1. Fetch old expiry date
+    let oldExpiryMs: number | null = null;
+    if (data.old_expiry) {
+      oldExpiryMs = new Date(data.old_expiry).getTime();
+    } else if (data.old_expiry_date) {
+      oldExpiryMs = new Date(data.old_expiry_date).getTime();
+    }
+
+    if (!oldExpiryMs || isNaN(oldExpiryMs)) {
+      try {
+        oldExpiryMs = await xuiService.getClientExpiry(email);
+      } catch (e) {
+        console.warn('[RenewController] Could not fetch live expiry from 3X-UI:', e);
+      }
+    }
+
+    if (!oldExpiryMs || isNaN(oldExpiryMs)) {
+      // Query vpn_accounts fallback
+      const { data: vpnAcc } = await supabase
+        .from('vpn_accounts')
+        .select('expiry_date, expiry_time')
+        .or(`email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`)
+        .maybeSingle();
+
+      if (vpnAcc?.expiry_time) {
+        oldExpiryMs = Number(vpnAcc.expiry_time);
+      } else if (vpnAcc?.expiry_date) {
+        oldExpiryMs = new Date(vpnAcc.expiry_date).getTime();
+      }
+    }
+
+    const oldExpiryIso = oldExpiryMs && !isNaN(oldExpiryMs) ? new Date(oldExpiryMs).toISOString() : new Date().toISOString();
+
+    console.log(`[RenewController] Approving renewal request ${requestId} for ${email} (${durationMonths} month(s)). Old Expiry: ${oldExpiryIso}`);
     
-    // Call the service to update client's expiry time in 3X-UI
-    const new_expiryTime = await xuiService.updateClientExpiry(email, durationMonths);
-    
-    console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${new_expiryTime}. Updating Supabase...`);
+    // 2. Extend client expiry in 3X-UI
+    const new_expiryMs = await xuiService.updateClientExpiry(email, durationMonths);
+    const new_expiryIso = new Date(new_expiryMs).toISOString();
+
+    console.log(`[RenewController] 3X-UI update successful. New expiry time: ${new_expiryIso}. Executing atomic database updates...`);
     
     const nowIso = new Date().toISOString();
-    const adminEmail = req.user?.email || req.user?.uid || 'admin@system';
+    const adminEmail = req.user?.email || req.user?.uid || 'Admin';
 
-    // Update Supabase renew_requests table and return the updated row
+    // 3. Update renew_requests table
     const { data: updatedRow, error: updateErr } = await supabase
       .from('renew_requests')
       .update({
         status: 'approved',
+        old_expiry: oldExpiryIso,
+        old_expiry_date: oldExpiryIso,
+        new_expiry: new_expiryIso,
+        new_expiry_date: new_expiryIso,
         approved_at: nowIso,
         approved_by: adminEmail,
+        updated_at: nowIso,
         processed_at: nowIso,
-        new_expiry: new_expiryTime,
       })
       .eq('id', requestId)
       .select()
       .single();
 
     if (updateErr) {
+      console.error('[RenewController] Error updating renew_requests table:', updateErr);
       throw updateErr;
     }
     
-    console.log(`[RenewController] Supabase record ${requestId} updated successfully:`, updatedRow);
+    // 4. Update vpn_accounts
+    try {
+      await supabase
+        .from('vpn_accounts')
+        .update({
+          expiry_date: new_expiryIso,
+          expiry_time: new_expiryMs,
+          updated_at: nowIso
+        })
+        .or(`email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+    } catch (vErr) {
+      console.warn('[RenewController] vpn_accounts update warning:', vErr);
+    }
+
+    // 5. Update vpn_configs
+    try {
+      await supabase
+        .from('vpn_configs')
+        .update({
+          expiry_date: new_expiryIso,
+          updated_at: nowIso
+        })
+        .or(`user_email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+    } catch (cErr) {
+      console.warn('[RenewController] vpn_configs update warning:', cErr);
+    }
     
-    // Create customer notification
+    // 6. Create customer notification
     try {
       await createCustomerNotification({
         userId: data.user_id || data.userId || null,
         userEmail: email,
         title: 'Renewal Approved',
-        message: `Your VPN renewal request (${data.plan_name || data.planName || 'Plan'}) was approved successfully. Subscription extended!`,
+        message: `Your VPN renewal request (${data.plan_name || data.planName || 'Plan'}) was approved successfully. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
         type: 'renewal_approved'
       });
     } catch (nErr) {
       console.warn('[RenewController] Customer notification creation error:', nErr);
     }
 
-    // Trigger Telegram approved notification asynchronously
-    const approved_atNow = new Date();
+    // 7. Trigger Telegram approved notification
     sendRenewApprovedNotification({
       email: email,
       userEmail: email,
-      planName: data.planName || data.plan || 'N/A',
+      planName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
       durationMonths: durationMonths,
-      new_expiry: new_expiryTime,
-      approved_at: approved_atNow,
+      new_expiry: new_expiryIso,
+      approved_at: new Date(nowIso),
     }).catch((telegramErr) => {
       console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
     });
     
     res.json({
       success: true,
-      message: 'Renewal request approved and 3X-UI client updated successfully.',
+      message: 'Renewal request approved and client subscription extended successfully.',
       data: updatedRow
     });
   } catch (error: any) {
     console.error(`[RenewController] Error approving renewal request ${requestId}:`, error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to approve renewal request' });
   }
 };
 
 export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   const { requestId } = req.params;
-  const reason = req.body?.reason || req.body?.reject_reason || 'Rejected by Admin';
+  const reason = req.body?.reason || req.body?.reject_reason || req.body?.rejection_reason || 'Rejected by Admin';
 
   try {
     if (!requestId) {
@@ -175,6 +238,12 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
+    const currentStatus = String(data.status || '').toLowerCase();
+    if (currentStatus !== 'pending') {
+      res.status(400).json({ error: `Cannot reject request with status '${data.status}'. Status must be 'pending'.` });
+      return;
+    }
+
     const email = data.user_email || data.userEmail || data.email;
     const nowIso = new Date().toISOString();
 
@@ -183,7 +252,9 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       .update({
         status: 'rejected',
         reject_reason: reason,
+        rejection_reason: reason,
         rejected_at: nowIso,
+        updated_at: nowIso,
         processed_at: nowIso
       })
       .eq('id', requestId)
@@ -191,6 +262,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       .single();
 
     if (updateErr) {
+      console.error('[RenewController] Error updating renew_requests on rejection:', updateErr);
       throw updateErr;
     }
 
@@ -214,7 +286,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
     });
   } catch (error: any) {
     console.error(`[RenewController] Error rejecting renewal request ${requestId}:`, error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to reject renewal request' });
   }
 };
 
