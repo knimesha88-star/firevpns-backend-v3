@@ -97,33 +97,21 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   }
 
   const resultConfigs = configs.map(config => {
-    
-    let usedGB = 0;
-    let upBytes = 0;
-    let downBytes = 0;
-    let remainingGB: string | number = 'Unlimited';
-    let status = 'Disabled';
-    let currentExpiryDate = config.expiryDate;
-    
-    let trafficLimitNum = 0;
-    if (String(config.trafficLimit).toLowerCase() !== 'unlimited') {
-      const match = String(config.trafficLimit).match(/(\d+(\.\d+)?)/);
-      if (match) {
-        trafficLimitNum = parseFloat(match[1]);
-        remainingGB = trafficLimitNum;
-      }
-    }
-
-    const inboundIdNum = Number(config.inboundId);
+    let up = 0;
+    let down = 0;
+    let total = config._rawLimit || 0;
+    let expiryTime = 0;
+    let lastOnline = 0;
+    let enable = true;
+    let inboundId = config.inboundId;
+    let clientEmail = userEmail;
     let matchedInbound: any = null;
     let stat: any = null;
+    let foundClient: any = null;
 
-    if (!isNaN(inboundIdNum) && inboundIdNum > 0 && inbounds.length > 0) {
-      matchedInbound = inbounds.find(i => Number(i.id) === inboundIdNum);
-    }
+    const checkedUuids: string[] = [];
 
-    // If no inbound matched by ID, try searching all inbounds for client matching uuid
-    if (!matchedInbound && inbounds.length > 0 && config.uuid) {
+    if (inbounds.length > 0 && config.uuid) {
       for (const ib of inbounds) {
         let settingsObj: any = {};
         try {
@@ -132,68 +120,86 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           }
         } catch (e) {}
         const clients = settingsObj.clients || [];
-        
-        const foundClient = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
-        if (foundClient) {
-          matchedInbound = ib;
-          break;
+        for (const c of clients) {
+          if (c.id) checkedUuids.push(c.id);
+          if (String(c.id || '').toLowerCase() === String(config.uuid).toLowerCase()) {
+            matchedInbound = ib;
+            foundClient = c;
+            break;
+          }
         }
+        if (matchedInbound) break;
       }
     }
 
-    if (matchedInbound) {
-      let settingsObj: any = {};
-      try {
-        if (matchedInbound.settings) {
-          settingsObj = typeof matchedInbound.settings === 'string' ? JSON.parse(matchedInbound.settings) : matchedInbound.settings;
-        }
-      } catch (e) {}
+    if (matchedInbound && foundClient) {
+      inboundId = matchedInbound.id;
+      clientEmail = foundClient.email || userEmail;
+      enable = foundClient.enable !== false;
+      expiryTime = foundClient.expiryTime || 0;
+      if (foundClient.totalBytes !== undefined) {
+        total = foundClient.totalBytes;
+      } else if (foundClient.total !== undefined) {
+        total = foundClient.total;
+      }
 
-      const clients = settingsObj.clients || [];
-      const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
-      
-      if (c) {
-        const clientStats = matchedInbound.clientStats || [];
-        
-        // Match stat by UUID, not email.
-        if (config.uuid) {
-          stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(config.uuid).toLowerCase());
+      const clientStats = matchedInbound.clientStats || [];
+      if (config.uuid) {
+        stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(config.uuid).toLowerCase()) ||
+               clientStats.find((s: any) => String(s.email || '').toLowerCase() === String(clientEmail).toLowerCase());
+      }
+
+      if (stat) {
+        up = stat.up || 0;
+        down = stat.down || 0;
+        if (stat.total !== undefined && stat.total > 0) {
+          total = stat.total;
         }
-        
-        const enable = c.enable !== false;
-        const expiryTime = c.expiryTime || 0;
-        
-        upBytes = stat?.up || 0;
-        downBytes = stat?.down || 0;
-        
-        usedGB = (upBytes + downBytes) / 1024 / 1024 / 1024;
-        
-        if (trafficLimitNum > 0) {
-          let remain = trafficLimitNum - usedGB;
-          remainingGB = remain > 0 ? parseFloat(remain.toFixed(2)) : 0;
-        } else {
-          remainingGB = 'Unlimited';
+        if (stat.expiryTime !== undefined && stat.expiryTime > 0) {
+          expiryTime = stat.expiryTime;
         }
-        
-        usedGB = parseFloat(usedGB.toFixed(2));
-        
-        const now = Date.now();
-        if (!enable) {
-          status = 'Disabled';
-        } else if (expiryTime > 0 && expiryTime < now) {
-          status = 'Expired';
-        } else {
-          status = 'Active';
+        if (stat.enable !== undefined) {
+          enable = stat.enable;
         }
-        
-        if (expiryTime > 0) {
-          currentExpiryDate = new Date(expiryTime).toISOString();
-        }
+        lastOnline = stat.lastOnline || stat.online || stat.time || 0;
       } else {
-        status = 'Active';
+        up = foundClient.up || 0;
+        down = foundClient.down || 0;
+        lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
-      status = 'Active';
+      console.log(`Stored UUID: ${config.uuid}`);
+      console.log(`3X-UI UUIDs checked: ${JSON.stringify(checkedUuids)}`);
+      console.log("No matching UUID found.");
+    }
+
+    const totalUsed = up + down;
+    const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
+
+    console.log(`[VPN Audit] User email: ${userEmail}`);
+    console.log(`[VPN Audit] UUID: ${config.uuid}`);
+    console.log(`[VPN Audit] Inbound ID: ${inboundId}`);
+    console.log(`[VPN Audit] Client email: ${clientEmail}`);
+    console.log(`[VPN Audit] Upload: ${up}`);
+    console.log(`[VPN Audit] Download: ${down}`);
+    console.log(`[VPN Audit] Total: ${total}`);
+    console.log(`[VPN Audit] Remaining: ${remainingTraffic}`);
+    console.log(`[VPN Audit] Last online: ${lastOnline}`);
+
+    const usedGB = parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2));
+    const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : 'Unlimited';
+
+    const now = Date.now();
+    let status = 'Active';
+    if (!enable) {
+      status = 'Disabled';
+    } else if (expiryTime > 0 && expiryTime < now) {
+      status = 'Expired';
+    }
+
+    let currentExpiryDate = config.expiryDate;
+    if (expiryTime > 0) {
+      currentExpiryDate = new Date(expiryTime).toISOString();
     }
 
     let port = 443;
@@ -220,17 +226,17 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       packageName: config.packageName,
       uuid: config.uuid,
       configUrl: config.configUrl,
-      inboundId: config.inboundId,
-      trafficLimit: config.trafficLimit,
+      inboundId,
+      trafficLimit: total > 0 ? `${total / (1024 * 1024 * 1024)}GB` : 'Unlimited',
       usedGB,
       remainingGB,
-      upBytes,
-      downBytes,
-      upload: upBytes,
-      download: downBytes,
-      liveUsageFound: !!matchedInbound && (typeof stat !== 'undefined' ? !!stat : false), // Added flag
-      totalTrafficBytes: trafficLimitNum > 0 ? trafficLimitNum * 1024 * 1024 * 1024 : 0,
-      remainingTrafficBytes: typeof remainingGB === 'number' ? remainingGB * 1024 * 1024 * 1024 : 0,
+      upBytes: up,
+      downBytes: down,
+      upload: up,
+      download: down,
+      liveUsageFound: !!matchedInbound && !!foundClient,
+      totalTrafficBytes: total,
+      remainingTrafficBytes: remainingTraffic,
       expiryDate: currentExpiryDate,
       expiryTime: currentExpiryDate,
       status,

@@ -772,18 +772,20 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
     if (isDuplicate) {
       console.log(`[3X-UI Provisioning] Client '${remark}' already exists on 3X-UI. Reusing existing client...`);
-      const existingClient = await getClientByEmail(remark);
-      if (existingClient) {
-        console.log(`[3X-UI Provisioning] Found existing 3X-UI client: email=${existingClient.email}, uuid=${existingClient.uuid}`);
-        if (existingClient.uuid) uuid = existingClient.uuid;
-        if (existingClient.subId) subId = existingClient.subId;
-      } else {
-        console.warn(`[3X-UI Provisioning] 3X-UI returned duplicate but search returned null. Continuing with generated UUID '${uuid}'.`);
-      }
     } else {
       console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
       throw addErr;
     }
+  }
+
+  // Immediately read back the created client from 3X-UI to get the exact UUID returned
+  const readBackClient = await getClientByEmail(remark);
+  if (readBackClient && readBackClient.uuid) {
+    uuid = readBackClient.uuid;
+    if (readBackClient.subId) subId = readBackClient.subId;
+    console.log(`[3X-UI Provisioning] Read back exact client from 3X-UI: uuid=${uuid}`);
+  } else {
+    console.warn(`[3X-UI Provisioning] Read back client returned null for remark '${remark}', using UUID: ${uuid}`);
   }
 
   // Step 3: Generate the VLESS URL and subscription URL
