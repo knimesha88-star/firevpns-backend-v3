@@ -4,12 +4,15 @@ import * as clientService from '../services/clientService.js';
 
 export const getStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const email = req.user?.email;
-    if (!email) {
-      res.status(400).json({ error: 'No email found in token' });
+    const email = req.user?.email || '';
+    const uid = req.user?.uid || '';
+    const targetUuid = (req.query.uuid as string) || undefined;
+
+    if (!email && !uid) {
+      res.status(400).json({ error: 'No email or uid found in token' });
       return;
     }
-    const client = await clientService.getClientStatus(email);
+    const client = await clientService.getClientStatus(email, targetUuid, uid);
     console.log("VPN DATA:", JSON.stringify(client, null, 2));
     res.json({ success: true, data: client });
   } catch (error: any) {

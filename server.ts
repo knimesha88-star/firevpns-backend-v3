@@ -30,6 +30,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/client', clientRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/user', userRoutes);
 app.use('/api/xui', xuiRoutes);
 app.use('/api/3xui', threeXuiRoutes);
 app.use('/api/renew', renewRoutes);

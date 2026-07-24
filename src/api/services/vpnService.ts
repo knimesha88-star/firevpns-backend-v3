@@ -86,6 +86,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   const resultConfigs = configs.map(config => {
     let usedGB = 0;
+    let upBytes = 0;
+    let downBytes = 0;
     let remainingGB: string | number = 'Unlimited';
     let status = 'Disabled';
     let currentExpiryDate = config.expiryDate;
@@ -100,55 +102,99 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     }
 
     const inboundIdNum = Number(config.inboundId);
-    if (!isNaN(inboundIdNum) && inbounds.length > 0) {
-      const inbound = inbounds.find(i => Number(i.id) === inboundIdNum);
-      if (inbound) {
+    let matchedInbound: any = null;
+
+    if (!isNaN(inboundIdNum) && inboundIdNum > 0 && inbounds.length > 0) {
+      matchedInbound = inbounds.find(i => Number(i.id) === inboundIdNum);
+    }
+
+    // If no inbound matched by ID, try searching all inbounds for client matching uuid
+    if (!matchedInbound && inbounds.length > 0 && config.uuid) {
+      for (const ib of inbounds) {
         let settingsObj: any = {};
         try {
-          if (inbound.settings) {
-            settingsObj = typeof inbound.settings === 'string' ? JSON.parse(inbound.settings) : inbound.settings;
+          if (ib.settings) {
+            settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
           }
         } catch (e) {}
-
         const clients = settingsObj.clients || [];
-        const c = clients.find((client: any) => String(client.id).toLowerCase() === String(config.uuid).toLowerCase());
-        
-        if (c) {
-          const emailStr = c.email || '';
-          const clientStats = inbound.clientStats || [];
-          const stat = clientStats.find((s: any) => s.email === emailStr);
-          
-          const enable = c.enable !== false;
-          const expiryTime = c.expiryTime || 0;
-          
-          const up = stat?.up || 0;
-          const down = stat?.down || 0;
-          
-          usedGB = (up + down) / 1024 / 1024 / 1024;
-          
-          if (trafficLimitNum > 0) {
-            let remain = trafficLimitNum - usedGB;
-            remainingGB = remain > 0 ? parseFloat(remain.toFixed(2)) : 0;
-          } else {
-            remainingGB = 'Unlimited';
-          }
-          
-          usedGB = parseFloat(usedGB.toFixed(2));
-          
-          const now = Date.now();
-          if (!enable) {
-            status = 'Disabled';
-          } else if (expiryTime > 0 && expiryTime < now) {
-            status = 'Expired';
-          } else {
-            status = 'Active';
-          }
-          
-          if (expiryTime > 0) {
-            currentExpiryDate = new Date(expiryTime).toISOString();
-          }
+        const foundClient = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
+        if (foundClient) {
+          matchedInbound = ib;
+          break;
         }
       }
+    }
+
+    if (matchedInbound) {
+      let settingsObj: any = {};
+      try {
+        if (matchedInbound.settings) {
+          settingsObj = typeof matchedInbound.settings === 'string' ? JSON.parse(matchedInbound.settings) : matchedInbound.settings;
+        }
+      } catch (e) {}
+
+      const clients = settingsObj.clients || [];
+      const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase() || (client.email && config.email && String(client.email).toLowerCase() === String(config.email).toLowerCase()));
+      
+      if (c) {
+        const emailStr = c.email || '';
+        const clientStats = matchedInbound.clientStats || [];
+        const stat = clientStats.find((s: any) => s.email === emailStr);
+        
+        const enable = c.enable !== false;
+        const expiryTime = c.expiryTime || 0;
+        
+        upBytes = stat?.up || 0;
+        downBytes = stat?.down || 0;
+        
+        usedGB = (upBytes + downBytes) / 1024 / 1024 / 1024;
+        
+        if (trafficLimitNum > 0) {
+          let remain = trafficLimitNum - usedGB;
+          remainingGB = remain > 0 ? parseFloat(remain.toFixed(2)) : 0;
+        } else {
+          remainingGB = 'Unlimited';
+        }
+        
+        usedGB = parseFloat(usedGB.toFixed(2));
+        
+        const now = Date.now();
+        if (!enable) {
+          status = 'Disabled';
+        } else if (expiryTime > 0 && expiryTime < now) {
+          status = 'Expired';
+        } else {
+          status = 'Active';
+        }
+        
+        if (expiryTime > 0) {
+          currentExpiryDate = new Date(expiryTime).toISOString();
+        }
+      } else {
+        status = 'Active';
+      }
+    } else {
+      status = 'Active';
+    }
+
+    let port = 443;
+    let protocol = 'vless';
+    let network = 'tcp';
+    let security = 'none';
+    let serverAddress = 'singapore.firevpn.com';
+
+    if (config.configUrl) {
+      try {
+        const urlStr = config.configUrl.startsWith('vless://') ? config.configUrl.replace('vless://', 'http://') : config.configUrl;
+        const urlObj = new URL(urlStr);
+        if (urlObj.port) port = Number(urlObj.port);
+        if (urlObj.hostname) serverAddress = urlObj.hostname;
+        const typeParam = urlObj.searchParams.get('type');
+        if (typeParam) network = typeParam;
+        const secParam = urlObj.searchParams.get('security');
+        if (secParam) security = secParam;
+      } catch(e) {}
     }
 
     return {
@@ -160,9 +206,25 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       trafficLimit: config.trafficLimit,
       usedGB,
       remainingGB,
+      upBytes,
+      downBytes,
+      upload: upBytes,
+      download: downBytes,
+      totalTrafficBytes: trafficLimitNum > 0 ? trafficLimitNum * 1024 * 1024 * 1024 : 0,
+      remainingTrafficBytes: typeof remainingGB === 'number' ? remainingGB * 1024 * 1024 * 1024 : 0,
       expiryDate: currentExpiryDate,
+      expiryTime: currentExpiryDate,
       status,
-      serverNode: config.serverNode
+      enableStatus: status !== 'Disabled',
+      onlineStatus: status === 'Active',
+      serverNode: config.serverNode,
+      port,
+      protocol,
+      network,
+      security,
+      serverAddress,
+      subscriptionName: config.packageName,
+      name: config.packageName
     };
   });
 
