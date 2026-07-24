@@ -41,6 +41,35 @@ export const approveOrder = async (req: AuthRequest, res: Response): Promise<voi
   }
 };
 
+export const verifyPayment = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const orderId = req.params.orderId || req.body.orderId;
+    if (!orderId) {
+      res.status(400).json({ error: 'Order ID is required' });
+      return;
+    }
+
+    const { error: updateErr } = await supabaseAdmin
+      .from('orders')
+      .update({
+        payment_status: 'Verified',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', orderId);
+
+    if (updateErr) {
+      console.error('[AdminController] Error verifying payment in DB:', updateErr);
+      res.status(500).json({ error: `Failed to update order: ${updateErr.message}` });
+      return;
+    }
+
+    res.json({ success: true, message: 'Payment verified successfully' });
+  } catch (error: any) {
+    console.error('[AdminController] Payment verification error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to verify payment.' });
+  }
+};
+
 export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const orderId = req.params.orderId || req.body.orderId;

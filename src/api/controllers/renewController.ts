@@ -138,12 +138,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
         status: 'approved',
         old_expiry: oldExpiryIso,
         old_expiry_date: oldExpiryIso,
-        new_expiry: new_expiryIso,
-        new_expiry_date: new_expiryIso,
         approved_at: nowIso,
         approved_by: adminEmail,
         updated_at: nowIso,
-        processed_at: nowIso,
       })
       .eq('id', requestId)
       .select()
@@ -254,8 +251,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
         reject_reason: reason,
         rejection_reason: reason,
         rejected_at: nowIso,
-        updated_at: nowIso,
-        processed_at: nowIso
+        updated_at: nowIso
       })
       .eq('id', requestId)
       .select()
