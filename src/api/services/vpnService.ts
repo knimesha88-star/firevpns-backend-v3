@@ -12,29 +12,51 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   // 1. Query vpn_accounts table
   try {
-    const { data: vpnAccs } = await supabase.from('vpn_accounts').select('*');
+    let query = supabase.from('vpn_accounts').select('*');
+    if (userEmail) {
+      query = query.eq('email', userEmail);
+    } else if (userUid) {
+      query = query.eq('user_id', userUid);
+    }
+    
+    const { data: vpnAccs } = await query.order('created_at', { ascending: false });
+
     if (vpnAccs && Array.isArray(vpnAccs)) {
+      console.log(`[VPN Lookup] Found ${vpnAccs.length} vpn_accounts for user.`);
+      vpnAccs.forEach((acc, index) => {
+        console.log(`[VPN Lookup] Row ${index + 1}: id=${acc.id}, email=${acc.email}, uuid=${acc.uuid}, remark=${acc.remark}, server_id=${acc.server_id}, created_at=${acc.created_at}, status=${acc.status}`);
+      });
+      const latestAccs: Record<string, any> = {};
       vpnAccs.forEach(acc => {
         const docUserId = String(acc.user_id || '').trim();
         const docEmail = String(acc.email || '').toLowerCase().trim();
         const matchesUser = (userUid && docUserId === userUid) || (userEmail && docEmail === userEmail);
+        
         if (matchesUser && acc.vless_url) {
-          configs.push({
-            orderId: acc.order_id || acc.id,
-            packageName: acc.remark || 'FIREVPN Package',
-            configUrl: acc.vless_url,
-            uuid: acc.uuid,
-            expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
-            inboundId: null,
-            trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
-            serverNode: acc.server_name || 'Singapore',
-            _rawLimit: acc.total_bytes || 0,
-          });
+          const key = acc.remark || 'FIREVPN Package';
+          if (!latestAccs[key]) {
+            console.log(`[VPN Lookup] Row ${acc.id} (remark=${acc.remark}) selected as active VPN for key: ${key}`);
+            latestAccs[key] = acc;
+          }
         }
+      });
+      
+      Object.values(latestAccs).forEach(acc => {
+        console.log(`[VPN Lookup] Sending UUID ${acc.uuid} to 3X-UI for config: ${acc.remark}`);
+        configs.push({
+          orderId: acc.order_id || acc.id,
+          packageName: acc.remark || 'FIREVPN Package',
+          configUrl: acc.vless_url,
+          uuid: acc.uuid,
+          expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
+          inboundId: null,
+          trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+          serverNode: acc.server_name || 'Singapore',
+          _rawLimit: acc.total_bytes || 0,
+        });
       });
     }
   } catch (err) {
-    console.warn('[vpnService] vpn_accounts query notice:', err);
   }
 
   // 2. Query orders table
@@ -80,13 +102,10 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   let inbounds: any[] = [];
   try {
     inbounds = await getInbounds();
-    console.log(`[vpnService] Number of inbounds returned: ${inbounds.length}`);
   } catch (error) {
-    console.error('[vpnService] Failed to fetch inbounds from 3X-UI:', error);
   }
 
   const resultConfigs = configs.map(config => {
-    console.log(`[vpnService] Processing config for user: ${email}, UUID: ${config.uuid}, Server (InboundID): ${config.inboundId}`);
     
     let usedGB = 0;
     let upBytes = 0;
@@ -106,17 +125,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
     const inboundIdNum = Number(config.inboundId);
     let matchedInbound: any = null;
+    let stat: any = null;
 
     if (!isNaN(inboundIdNum) && inboundIdNum > 0 && inbounds.length > 0) {
       matchedInbound = inbounds.find(i => Number(i.id) === inboundIdNum);
-      if (matchedInbound) {
-        console.log(`[vpnService] Matched inbound by ID: ${inboundIdNum}, Remark: ${matchedInbound.remark}`);
-      }
     }
 
     // If no inbound matched by ID, try searching all inbounds for client matching uuid
     if (!matchedInbound && inbounds.length > 0 && config.uuid) {
-      console.log(`[vpnService] Searching inbounds for UUID: ${config.uuid}`);
       for (const ib of inbounds) {
         let settingsObj: any = {};
         try {
@@ -125,21 +141,13 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           }
         } catch (e) {}
         const clients = settingsObj.clients || [];
-        // Count scanned clients
-        console.log(`[vpnService] Scanning inbound ${ib.id} (${ib.remark}) with ${clients.length} clients`);
         
         const foundClient = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
         if (foundClient) {
-          console.log(`[vpnService] UUID ${config.uuid} FOUND in inbound ${ib.id}`);
           matchedInbound = ib;
           break;
         }
       }
-      if (!matchedInbound) {
-        console.log(`[vpnService] UUID ${config.uuid} NOT FOUND in any inbound`);
-      }
-    } else if (config.uuid) {
-        console.log(`[vpnService] UUID ${config.uuid} searching ${matchedInbound ? 'skipped (already matched)' : 'skipped (no inbounds)'}`);
     }
 
     if (matchedInbound) {
@@ -154,21 +162,10 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase() || (client.email && config.email && String(client.email).toLowerCase() === String(config.email).toLowerCase()));
       
       if (c) {
-        console.log(`[vpnService] Matched Client (Raw): ${JSON.stringify(c, null, 2)}`);
-        console.log(`[vpnService] Inbound (Raw): ${JSON.stringify(matchedInbound, null, 2)}`);
-        
         const emailStr = c.email || '';
         const clientStats = matchedInbound.clientStats || [];
-        console.log(`[vpnService] Available Client Stats: ${JSON.stringify(clientStats, null, 2)}`);
         
-        const stat = clientStats.find((s: any) => s.email === emailStr);
-        
-        console.log(`[vpnService] Debugging client: UUID=${config.uuid}, emailStr=${emailStr}, clientStatsCount=${clientStats.length}`);
-        if (!stat) {
-          console.log(`[vpnService] Client stat NOT found for emailStr=${emailStr}. Available emails: ${clientStats.map(s => s.email).join(', ')}`);
-        } else {
-          console.log(`[vpnService] Client stat FOUND: ${JSON.stringify(stat, null, 2)}`);
-        }
+        stat = clientStats.find((s: any) => s.email === emailStr);
         
         const enable = c.enable !== false;
         const expiryTime = c.expiryTime || 0;
@@ -200,11 +197,9 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           currentExpiryDate = new Date(expiryTime).toISOString();
         }
       } else {
-        console.warn(`[vpnService] Client with UUID=${config.uuid} NOT found in matched inbound ${matchedInbound.id}`);
         status = 'Active';
       }
     } else {
-      console.warn(`[vpnService] Inbound NOT found for UUID=${config.uuid}, inboundId=${config.inboundId}`);
       status = 'Active';
     }
 
@@ -240,7 +235,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       downBytes,
       upload: upBytes,
       download: downBytes,
-      liveUsageFound: !!matchedInbound && !!stat, // Added flag
+      liveUsageFound: !!matchedInbound && (typeof stat !== 'undefined' ? !!stat : false), // Added flag
       totalTrafficBytes: trafficLimitNum > 0 ? trafficLimitNum * 1024 * 1024 * 1024 : 0,
       remainingTrafficBytes: typeof remainingGB === 'number' ? remainingGB * 1024 * 1024 * 1024 : 0,
       expiryDate: currentExpiryDate,
@@ -259,6 +254,5 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     };
   });
 
-  console.log(`[vpnService] Final configs to return: ${JSON.stringify(resultConfigs.map(c => ({uuid: c.uuid, packageName: c.packageName, usedGB: c.usedGB})))}`);
   return resultConfigs;
 };

@@ -418,15 +418,6 @@ export const formatClientRemark = (templateFormat: string, customerName: string,
   const format = templateFormat || '{{customerName}}';
   let formatted = format.replace(/\{\{\s*customerName\s*\}\}/g, name);
   
-  if (orderId) {
-    const cleanOrderId = orderId.trim();
-    if (cleanOrderId && !formatted.includes(cleanOrderId)) {
-      formatted = `${formatted}-${cleanOrderId}`;
-    }
-  } else {
-    const randomSuffix = crypto.randomBytes(4).toString('hex').toUpperCase();
-    formatted = `${formatted}-${randomSuffix}`;
-  }
   return formatted;
 };
 
@@ -684,6 +675,24 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const orderDisplayId = (order.order_id || order.id || '').trim();
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
+  // Search if client already exists in 3X-UI
+  const allInbounds = await getInbounds();
+  let existingClient = null;
+  let targetInboundId = inboundId;
+  for (const ib of allInbounds) {
+    let settingsObj: any = {};
+    try {
+      settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+    } catch (e) { continue; }
+    const clients = settingsObj.clients || [];
+    const found = clients.find((c: any) => String(c.email).trim() === remark.trim());
+    if (found) {
+      existingClient = found;
+      targetInboundId = Number(ib.id);
+      break;
+    }
+  }
+
   // Duration & Traffic calculations
   const duration = extra.duration || '1 Month';
   let days = 30;
@@ -704,13 +713,13 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     totalBytes = 100 * 1024 * 1024 * 1024;
   }
 
-  let uuid = crypto.randomUUID();
-  let subId = crypto.randomBytes(12).toString('hex');
+  let uuid = existingClient ? existingClient.id : crypto.randomUUID();
+  let subId = existingClient ? existingClient.subId : crypto.randomBytes(12).toString('hex');
 
   // Fetch inbound info from 3X-UI
   const inbounds = await getInbounds();
-  const inbound = inbounds.find((i: any) => Number(i.id) === inboundId) || {
-    id: inboundId,
+  const inbound = inbounds.find((i: any) => Number(i.id) === targetInboundId) || {
+    id: targetInboundId,
     port: 443,
     protocol: 'vless',
     streamSettings: JSON.stringify({ network: 'tcp', security: 'reality' })
@@ -735,7 +744,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
   try {
-    await add3XUiClient(inboundId, {
+    await add3XUiClient(targetInboundId, {
       uuid,
       email: remark,
       totalBytes,
@@ -788,15 +797,17 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log(`[3X-UI Provisioning DB] Step 4: Upserting vpn_accounts for order ${order.id}...`);
   let vpnAccountId = '';
   let existingAcc: any = null;
-  if (order.id) {
-    const { data: d1, error: e1 } = await dbClient.from('vpn_accounts').select('id').eq('order_id', order.id).maybeSingle();
-    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
+
+  // Use user_id and remark as the unique identifier for a customer's configuration
+  if (validUserId && remark) {
+    const { data: d1, error: e1 } = await dbClient
+      .from('vpn_accounts')
+      .select('id, uuid')
+      .eq('user_id', validUserId)
+      .eq('remark', remark)
+      .maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by user/remark notice:', e1);
     existingAcc = d1;
-  }
-  if (!existingAcc && uuid) {
-    const { data: d2, error: e2 } = await dbClient.from('vpn_accounts').select('id').eq('uuid', uuid).maybeSingle();
-    if (e2) console.warn('[3X-UI Provisioning DB] vpn_accounts select by uuid notice:', e2);
-    existingAcc = d2;
   }
 
   const accPayload: any = {
