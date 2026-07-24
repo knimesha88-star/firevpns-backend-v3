@@ -36,10 +36,10 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     configs.push({
       orderId: data.id || data.orderId,
       packageName: data.plan || data.packageName || data.packageType || 'Unknown',
-      configUrl: data.vpnCredentials?.configLink || data.vpnCredentials?.qrcodeData || data.configUrl || '',
-      uuid: data.vpnCredentials?.password || data.uuid || '',
+      configUrl: data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '',
+      uuid: data.vpn_credentials?.password || data.uuid || '',
       expiryDate: data.expiryDate || data.expiryTime || '',
-      inboundId: data.vpnCredentials?.inboundId || data.inboundId || null,
+      inboundId: data.vpn_credentials?.inboundId || data.inboundId || null,
       trafficLimit: data.trafficLimit || data.traffic || 'Unlimited',
       serverNode: data.server || data.serverNode || 'Default',
       _rawLimit: data.totalBytes || 0,

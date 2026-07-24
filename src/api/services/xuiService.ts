@@ -379,7 +379,7 @@ export const findProvisioningTemplate = async (packageName: string): Promise<any
   if (!packageName) return null;
   const targetName = packageName.trim().toLowerCase();
 
-  const collectionsToCheck = ['provision_templates', 'provisioningTemplates'];
+  const collectionsToCheck = ['provision_templates'];
 
   for (const colName of collectionsToCheck) {
     try {
@@ -727,7 +727,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
   // 4. Calculate duration & traffic
-  const duration = extra.duration || order.duration || '1 Month';
+  const duration = extra.duration || extra.duration || '1 Month';
   let days = 30;
   if (template.duration_profiles && template.duration_profiles[duration]) {
     days = Number(template.duration_profiles[duration]);
@@ -746,7 +746,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   // Traffic plan (Only two plans: 100 GB = 100 * 1024 * 1024 * 1024 bytes, Unlimited = 0 bytes)
   let totalBytes = 0; // Default Unlimited (0)
-  const combinedPlanStr = `${extra.packageType || order.packageType || ''} ${packageName || ''} ${extra.plan || order.plan || ''} ${extra.packageOption || order.packageOption || ''} ${extra.traffic || order.traffic || ''}`.toLowerCase();
+  const combinedPlanStr = `${extra.packageType || extra.packageType || ''} ${packageName || ''} ${extra.plan || extra.plan || ''} ${extra.packageOption || extra.packageOption || ''} ${extra.traffic || extra.traffic || ''}`.toLowerCase();
 
   const is100GB = combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100');
 
@@ -840,7 +840,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   // 8. Save VPN configuration in Supabase vpn_configs table
   let configDocId = '';
-  const customerUid = customerId || order.customerId || order.uid || order.userId || '';
+  const customerUid = customerId || order.customer_id || order.uid || order.userId || '';
 
   if (!customerUid) {
     const errorMsg = 'Customer UID is missing for this order. Cannot save VPN configuration.';
@@ -853,13 +853,13 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       customer_uid: customerUid,
       order_id: order.order_id || order.id,
       package_name: packageName,
-      package_type: order.packageType || 'SIM Unlimited',
-      config_name: order.configurationName || customerName,
+      package_type: extra.packageType || 'SIM Unlimited',
+      config_name: extra.configurationName || customerName,
       uuid: uuid,
       subscription_url: vlessUrl,
       vless_url: vlessUrl,
       server_address: address,
-      server: template.server || order.server || 'Singapore',
+      server: template.server || extra.server || 'Singapore',
       sni: sni,
       inbound_id: inboundId,
       traffic_limit: trafficLimitStr,
@@ -895,12 +895,12 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     await sendOrderApprovedNotification({
       customerEmail: order.email || 'N/A',
       packageName: packageName,
-      packageType: order.packageType || 'SIM Unlimited',
-      server: template.server || order.server || 'Singapore',
+      packageType: extra.packageType || 'SIM Unlimited',
+      server: template.server || extra.server || 'Singapore',
       duration: duration,
       price: order.amount || 0,
       uuid: uuid,
-      orderId: order.orderId || (order as any).id,
+      orderId: order.order_id || (order as any).id,
       status: '🟢 COMPLETED'
     });
   } catch (tgErr) {
@@ -909,7 +909,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   return {
     success: true,
-    orderId: order.orderId || (order as any).id,
+    orderId: order.order_id || (order as any).id,
     uuid,
     vlessUrl,
     remark,
