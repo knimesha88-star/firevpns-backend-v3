@@ -89,9 +89,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     console.log(`[RenewController] Approving renewal request ${requestId} for ${email} with duration of ${durationMonths} months.`);
     
     // Call the service to update client's expiry time in 3X-UI
-    const newExpiryTime = await xuiService.updateClientExpiry(email, durationMonths);
+    const new_expiryTime = await xuiService.updateClientExpiry(email, durationMonths);
     
-    console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${newExpiryTime}. Updating Supabase...`);
+    console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${new_expiryTime}. Updating Supabase...`);
     
     const nowIso = new Date().toISOString();
     const adminEmail = req.user?.email || req.user?.uid || 'admin@system';
@@ -102,13 +102,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       .update({
         status: 'approved',
         approved_at: nowIso,
-        approvedAt: nowIso,
         approved_by: adminEmail,
-        approvedBy: adminEmail,
         processed_at: nowIso,
-        processedAt: nowIso,
-        new_expiry: newExpiryTime,
-        newExpiry: newExpiryTime
+        new_expiry: new_expiryTime,
       })
       .eq('id', requestId)
       .select()
@@ -121,14 +117,14 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     console.log(`[RenewController] Supabase record ${requestId} updated successfully:`, updatedRow);
     
     // Trigger Telegram approved notification asynchronously
-    const approvedAtNow = new Date();
+    const approved_atNow = new Date();
     sendRenewApprovedNotification({
       email: email,
       userEmail: email,
       planName: data.planName || data.plan || 'N/A',
       durationMonths: durationMonths,
-      newExpiry: newExpiryTime,
-      approvedAt: approvedAtNow,
+      new_expiry: new_expiryTime,
+      approved_at: approved_atNow,
     }).catch((telegramErr) => {
       console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
     });

@@ -13,7 +13,7 @@ export const getAllUsers = async (): Promise<any[]> => {
     return profiles.map((p: any) => ({
       id: p.id,
       uid: p.id,
-      fullName: p.full_name,
+      full_name: p.full_name,
       name: p.full_name,
       email: p.email,
       role: p.role,

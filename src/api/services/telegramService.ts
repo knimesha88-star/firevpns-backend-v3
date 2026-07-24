@@ -18,8 +18,8 @@ export interface RenewApprovedNotificationData {
   plan?: string;
   durationMonths?: number | string;
   duration?: number | string;
-  newExpiry?: string | number | Date;
-  approvedAt?: string | number | Date;
+  new_expiry?: string | number | Date;
+  approved_at?: string | number | Date;
 }
 
 const formatDateTime = (val: any): string => {
@@ -114,8 +114,8 @@ export const sendRenewApprovedNotification = async (data: RenewApprovedNotificat
   const email = data.email || data.userEmail || 'N/A';
   const planName = data.planName || data.plan || 'N/A';
   const durationMonths = data.durationMonths || data.duration || 1;
-  const newExpiry = formatDateTime(data.newExpiry);
-  const approvedAt = formatDateTime(data.approvedAt);
+  const new_expiry = formatDateTime(data.new_expiry);
+  const approved_at = formatDateTime(data.approved_at);
 
   const text = `✅ FIREVPNs
 
@@ -131,10 +131,10 @@ ${planName}
 ${durationMonths} Month(s)
 
 📆 New Expiry:
-${newExpiry}
+${new_expiry}
 
 🕒 Approved:
-${approvedAt}
+${approved_at}
 
 ✅ 3X-UI Updated Successfully`;
 

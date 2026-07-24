@@ -358,16 +358,16 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
         let baseTime = currentExpiry > Date.now() ? currentExpiry : Date.now();
         const date = new Date(baseTime);
         date.setMonth(date.getMonth() + durationMonths);
-        const newExpiryTime = date.getTime();
+        const new_expiryTime = date.getTime();
         
         await requestApi<any>(`/panel/api/clients/update/${c.email}`, 'POST', {
           ...c,
           id: String(c.id),
           email: c.email,
-          expiryTime: newExpiryTime
+          expiryTime: new_expiryTime
         });
         
-        return newExpiryTime;
+        return new_expiryTime;
       }
     }
   }
@@ -379,7 +379,7 @@ export const findProvisioningTemplate = async (packageName: string): Promise<any
   if (!packageName) return null;
   const targetName = packageName.trim().toLowerCase();
 
-  const collectionsToCheck = ['provisionTemplates', 'provisioningTemplates'];
+  const collectionsToCheck = ['provision_templates', 'provisioningTemplates'];
 
   for (const colName of collectionsToCheck) {
     try {
@@ -387,7 +387,7 @@ export const findProvisioningTemplate = async (packageName: string): Promise<any
       if (snapshot) {
         for (const item of snapshot) {
           const enabled = item.enabled !== false;
-          const docPackageName = String(item.packageName || item.name || item.id).trim().toLowerCase();
+          const docPackageName = String(item.package_name || item.name || item.id).trim().toLowerCase();
 
           if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
             return { id: item.id, ...item };
@@ -634,8 +634,8 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     }
   }
 
-  const packageName = extra.packageName || extra.plan || extra.package || order.package_name || '';
-  const customerName = extra.configurationName || extra.customerName || extra.name || extra.fullName || (order.email ? order.email.split('@')[0] : 'Customer');
+  const packageName = extra.package_name || extra.plan || extra.package || order.package_name || '';
+  const customerName = extra.configurationName || extra.customerName || extra.name || extra.full_name || (order.email ? order.email.split('@')[0] : 'Customer');
   const customerId = order.customer_id || '';
 
   console.log("==================================================");
@@ -645,22 +645,22 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   console.log("Customer Email:", order.email);
   console.log("Customer Name:", customerName);
   console.log("order.package_name:", order.package_name);
-  console.log("extra.packageName:", extra.packageName);
+  console.log("extra.package_name:", extra.package_name);
   console.log("extra.plan:", extra.plan);
   console.log("extra.category:", extra.category);
   console.log("extra.server:", extra.server);
   console.log("");
-  console.log("Searching collection: provisionTemplates");
+  console.log("Searching collection: provision_templates");
 
   let matchingDocs: any[] = [];
   try {
-    const { data: provTemplates } = await supabase.from('provisionTemplates').select('*');
+    const { data: provTemplates } = await supabase.from('provision_templates').select('*');
     const targetName = packageName.trim().toLowerCase();
 
     if (provTemplates) {
       for (const data of provTemplates) {
         const enabled = data.enabled !== false;
-        const docPackageName = String(data.packageName || data.name || data.id).trim().toLowerCase();
+        const docPackageName = String(data.package_name || data.name || data.id).trim().toLowerCase();
 
         if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
           matchingDocs.push({ id: data.id, ...data });
@@ -673,21 +673,21 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     if (matchingDocs.length > 0) {
       matchingDocs.forEach(t => {
         console.log("Document ID:", t.id);
-        console.log("packageName:", t.packageName || t.name);
+        console.log("packageName:", t.package_name || t.name);
         console.log("enabled:", t.enabled !== false);
         console.log("category:", t.category);
         console.log("server:", t.server);
-        console.log("inboundId:", t.inboundId);
+        console.log("inboundId:", t.inbound_id);
         console.log("address:", t.address);
         console.log("sni:", t.sni);
-        console.log("remarkTemplate:", t.remarkTemplate || t.remarkFormat);
+        console.log("remarkTemplate:", t.remark_template || t.remarkFormat);
       });
     } else {
-      console.log("No matching template found. Fetching ALL documents from provisionTemplates collection:");
+      console.log("No matching template found. Fetching ALL documents from provision_templates collection:");
       if (provTemplates) {
         for (const data of provTemplates) {
           console.log("Document ID:", data.id);
-          console.log("packageName:", data.packageName || data.name);
+          console.log("packageName:", data.package_name || data.name);
           console.log("enabled:", data.enabled !== false);
           console.log("category:", data.category);
           console.log("server:", data.server);
@@ -695,14 +695,14 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       }
     }
   } catch (err) {
-    console.error("Error debugging provisionTemplates collection:", err);
+    console.error("Error debugging provision_templates collection:", err);
   }
 
   if (!packageName) {
     throw new Error('Provisioning template not found.');
   }
 
-  // 2. Query Firestore for template
+  // 2. Query Supabase for template
   const template = await findProvisioningTemplate(packageName);
   if (!template) {
     throw new Error('Provisioning template not found.');
@@ -710,18 +710,18 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
 
   console.log("========== TEMPLATE ==========");
   console.log(template);
-  console.log("Package:", order.packageName);
-  console.log("Inbound:", template.inboundId);
+  console.log("Package:", order.package_name);
+  console.log("Inbound:", template.inbound_id);
   console.log("Address:", template.address);
   console.log("SNI:", template.sni);
-  console.log("Remark Template:", template.remarkTemplate);
+  console.log("Remark Template:", template.remark_template);
   console.log("==============================");
 
   // 3. Extract template values & format unique remark
-  const inboundId = Number(template.inboundId) || 1;
+  const inboundId = Number(template.inbound_id) || 1;
   const address = template.address || '';
   const sni = template.sni || '';
-  const remarkFormat = template.remarkTemplate || template.remarkFormat || '{{customerName}}';
+  const remarkFormat = template.remark_template || template.remarkFormat || '{{customerName}}';
 
   const orderDisplayId = (order.order_id || (order as any).id || '').trim();
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
@@ -729,8 +729,8 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   // 4. Calculate duration & traffic
   const duration = extra.duration || order.duration || '1 Month';
   let days = 30;
-  if (template.durationProfiles && template.durationProfiles[duration]) {
-    days = Number(template.durationProfiles[duration]);
+  if (template.duration_profiles && template.duration_profiles[duration]) {
+    days = Number(template.duration_profiles[duration]);
   } else {
     const numMatch = String(duration).match(/(\d+)/);
     if (numMatch) {
@@ -838,7 +838,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   console.log("");
   console.log(`Subscription URL: ${vlessUrl}`);
 
-  // 8. Save VPN configuration in Firestore under users/{customerUid}/vpnConfigs/{vpnId}
+  // 8. Save VPN configuration in Supabase vpn_configs table
   let configDocId = '';
   const customerUid = customerId || order.customerId || order.uid || order.userId || '';
 
@@ -849,26 +849,24 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   }
 
   try {
-    const { data: insertedConfig, error: insertErr } = await supabase.from('vpnConfigs').insert({
-      customerUid: customerUid,
-      orderId: order.orderId || order.id,
-      packageName: packageName,
-      package: packageName,
-      packageType: order.packageType || 'SIM Unlimited',
-      configName: order.configurationName || customerName,
+    const { data: insertedConfig, error: insertErr } = await supabase.from('vpn_configs').insert({
+      customer_uid: customerUid,
+      order_id: order.order_id || order.id,
+      package_name: packageName,
+      package_type: order.packageType || 'SIM Unlimited',
+      config_name: order.configurationName || customerName,
       uuid: uuid,
-      subscriptionUrl: vlessUrl,
-      vlessUrl: vlessUrl,
-      serverAddress: address,
+      subscription_url: vlessUrl,
+      vless_url: vlessUrl,
+      server_address: address,
       server: template.server || order.server || 'Singapore',
       sni: sni,
-      inboundId: inboundId,
-      trafficLimit: trafficLimitStr,
-      expiryTime: new Date(expiryMs).toISOString(),
-      expiryDate: new Date(expiryMs).toISOString(),
+      inbound_id: inboundId,
+      traffic_limit: trafficLimitStr,
+      expiry_time: new Date(expiryMs).toISOString(),
       enabled: true,
       status: 'Active',
-      createdAt: new Date().toISOString()
+      created_at: new Date().toISOString()
     }).select('id').single();
     configDocId = insertedConfig?.id || '';
   } catch (docErr: any) {
@@ -878,18 +876,18 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
   }
 
   await supabase.from('orders').update({
-    paymentStatus: 'Approved',
-    provisioningStatus: 'Completed',
-    configId: configDocId || undefined,
-    vpnCredentials: {
+    payment_status: 'Approved',
+    provisioning_status: 'Completed',
+    config_id: configDocId || undefined,
+    vpn_credentials: {
       username: remark,
       password: uuid,
-      configLink: vlessUrl,
+      config_link: vlessUrl,
       qrcodeData: vlessUrl,
       subId: subId,
       inboundId: inboundId
     },
-    approvedAt: new Date().toISOString()
+    approved_at: new Date().toISOString()
   }).eq('id', order.id);
 
   // 9. Send Telegram notification

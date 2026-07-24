@@ -15,7 +15,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     const data = doc;
     const docUid = String(data.customerUid || data.customerId || data.uid || data.userId || '').trim();
     const docEmail = String(data.customerEmail || data.email || data.userEmail || '').toLowerCase().trim();
-    const statusVal = String(data.status || data.paymentStatus || data.provisioningStatus || '').toLowerCase();
+    const statusVal = String(data.status || data.payment_status || data.provisioning_status || '').toLowerCase();
 
     const matchesUser = (userUid && docUid === userUid) || (userEmail && docEmail === userEmail);
     const isApproved = statusVal === 'approved' || statusVal === 'completed' || statusVal === 'paid' || statusVal === 'active';
@@ -31,7 +31,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       orderId: data.id || data.orderId,
       customerUid: data.customerUid || data.customerId || data.uid,
       customerEmail: data.customerEmail || data.email,
-      status: data.status || data.paymentStatus
+      status: data.status || data.payment_status
     });
     configs.push({
       orderId: data.id || data.orderId,
