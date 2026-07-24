@@ -8,14 +8,44 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
 
-  const { data: snapshot, error } = await supabase.from('orders').select('*');
+  const configs: any[] = [];
+
+  // 1. Query vpn_accounts table
+  try {
+    const { data: vpnAccs } = await supabase.from('vpn_accounts').select('*');
+    if (vpnAccs && Array.isArray(vpnAccs)) {
+      vpnAccs.forEach(acc => {
+        const docUserId = String(acc.user_id || '').trim();
+        const docEmail = String(acc.email || '').toLowerCase().trim();
+        const matchesUser = (userUid && docUserId === userUid) || (userEmail && docEmail === userEmail);
+        if (matchesUser && acc.vless_url) {
+          configs.push({
+            orderId: acc.order_id || acc.id,
+            packageName: acc.remark || 'FIREVPN Package',
+            configUrl: acc.vless_url,
+            uuid: acc.uuid,
+            expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
+            inboundId: null,
+            trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+            serverNode: acc.server_name || 'Singapore',
+            _rawLimit: acc.total_bytes || 0,
+          });
+        }
+      });
+    }
+  } catch (err) {
+    console.warn('[vpnService] vpn_accounts query notice:', err);
+  }
+
+  // 2. Query orders table
+  const { data: snapshot } = await supabase.from('orders').select('*');
   const allOrders: any[] = snapshot || [];
 
   const matchedDocs = allOrders.filter(doc => {
     const data = doc;
-    const docUid = String(data.customerUid || data.customerId || data.uid || data.userId || '').trim();
-    const docEmail = String(data.customerEmail || data.email || data.userEmail || '').toLowerCase().trim();
-    const statusVal = String(data.status || data.payment_status || data.provisioning_status || '').toLowerCase();
+    const docUid = String(data.customer_id || data.customerUid || data.customerId || data.uid || data.userId || '').trim();
+    const docEmail = String(data.email || data.customerEmail || data.userEmail || '').toLowerCase().trim();
+    const statusVal = String(data.status || data.payment_status || '').toLowerCase();
 
     const matchesUser = (userUid && docUid === userUid) || (userEmail && docEmail === userEmail);
     const isApproved = statusVal === 'approved' || statusVal === 'completed' || statusVal === 'paid' || statusVal === 'active';
@@ -25,25 +55,26 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   console.log("Orders Found:", matchedDocs.length);
 
-  const configs: any[] = [];
   matchedDocs.forEach(data => {
-    console.log({
-      orderId: data.id || data.orderId,
-      customerUid: data.customerUid || data.customerId || data.uid,
-      customerEmail: data.customerEmail || data.email,
-      status: data.status || data.payment_status
-    });
-    configs.push({
-      orderId: data.id || data.orderId,
-      packageName: data.plan || data.packageName || data.packageType || 'Unknown',
-      configUrl: data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '',
-      uuid: data.vpn_credentials?.password || data.uuid || '',
-      expiryDate: data.expiryDate || data.expiryTime || '',
-      inboundId: data.vpn_credentials?.inboundId || data.inboundId || null,
-      trafficLimit: data.trafficLimit || data.traffic || 'Unlimited',
-      serverNode: data.server || data.serverNode || 'Default',
-      _rawLimit: data.totalBytes || 0,
-    });
+    const vlessUrl = data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '';
+    const clientUuid = data.client_uuid || data.vpn_credentials?.password || data.uuid || '';
+
+    if (vlessUrl) {
+      const exists = configs.some(c => c.uuid && clientUuid && c.uuid.toLowerCase() === clientUuid.toLowerCase());
+      if (!exists) {
+        configs.push({
+          orderId: data.id || data.order_id,
+          packageName: data.package_name || data.plan || 'FIREVPN Package',
+          configUrl: vlessUrl,
+          uuid: clientUuid,
+          expiryDate: data.expiry_date || data.expiryDate || '',
+          inboundId: data.inbound_id || null,
+          trafficLimit: data.traffic_limit || 'Unlimited',
+          serverNode: data.server || 'Singapore',
+          _rawLimit: 0,
+        });
+      }
+    }
   });
 
   let inbounds: any[] = [];

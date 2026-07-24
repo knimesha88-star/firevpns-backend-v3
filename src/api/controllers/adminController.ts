@@ -28,10 +28,13 @@ export const approveOrder = async (req: AuthRequest, res: Response): Promise<voi
       res.status(400).json({ error: 'Order ID is required' });
       return;
     }
-    const result = await xuiService.provisionOrderClient(orderId);
+    const authHeader = req.headers.authorization || (req.headers as any)?.Authorization;
+    const token = authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : undefined;
+    const result = await xuiService.provisionOrderClient(orderId, token);
     res.json({ success: true, ...result });
   } catch (error: any) {
     console.error('[AdminController] Order approval provisioning error:', error.message);
     res.status(400).json({ error: error.message || 'Provisioning template not found.' });
   }
 };
+

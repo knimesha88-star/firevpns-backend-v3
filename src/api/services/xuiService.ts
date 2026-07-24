@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { supabase } from '../../lib/supabase.js';
+import { supabase, getSupabaseClient } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
+
 import crypto from 'crypto';
 import https from 'https';
 
@@ -376,27 +377,35 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
 };
 
 export const findProvisioningTemplate = async (packageName: string): Promise<any | null> => {
-  if (!packageName) return null;
-  const targetName = packageName.trim().toLowerCase();
+  const targetName = (packageName || '').trim().toLowerCase();
 
-  const collectionsToCheck = ['provision_templates'];
+  try {
+    const { data: snapshot } = await supabase.from('provision_templates').select('*');
+    if (snapshot && snapshot.length > 0) {
+      const enabledTemplates = snapshot.filter(item => item.enabled !== false);
+      if (enabledTemplates.length === 0) return null;
 
-  for (const colName of collectionsToCheck) {
-    try {
-      const { data: snapshot } = await supabase.from(colName).select('*');
-      if (snapshot) {
-        for (const item of snapshot) {
-          const enabled = item.enabled !== false;
-          const docPackageName = String(item.package_name || item.name || item.id).trim().toLowerCase();
+      if (targetName) {
+        // 1. Exact match on package_name
+        const exact = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || item.id).trim().toLowerCase();
+          return docName === targetName || docName === targetName.replace(/_/g, ' ') || docName.replace(/_/g, ' ') === targetName;
+        });
+        if (exact) return { id: exact.id, ...exact };
 
-          if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
-            return { id: item.id, ...item };
-          }
-        }
+        // 2. Substring / Partial match
+        const partial = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || item.id).trim().toLowerCase();
+          return targetName.includes(docName) || docName.includes(targetName);
+        });
+        if (partial) return { id: partial.id, ...partial };
       }
-    } catch (e) {
-      console.warn(`[3X-UI Service] Error checking ${colName}:`, e);
+
+      // 3. Fallback to first enabled template
+      return { id: enabledTemplates[0].id, ...enabledTemplates[0] };
     }
+  } catch (e) {
+    console.warn(`[3X-UI Service] Error checking provision_templates:`, e);
   }
 
   return null;
@@ -613,15 +622,32 @@ export const add3XUiClient = async (
   }
 };
 
-export const provisionOrderClient = async (orderId: string): Promise<any> => {
-  let { data: order } = await supabase.from('orders').select('*').eq('id', orderId).single();
+export const provisionOrderClient = async (orderId: string, token?: string): Promise<any> => {
+  const dbClient = getSupabaseClient(token);
+
+  let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
 
   if (!order) {
-    const { data: queryOrder } = await supabase.from('orders').select('*').eq('order_id', orderId).single();
+    const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
     if (!queryOrder) {
-      throw new Error('Provisioning template not found.');
+      throw new Error(`Order '${orderId}' not found in database.`);
     }
     order = queryOrder;
+  }
+
+  // Idempotency Check: If order is already completed/active with existing VPN link, return existing details
+  const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active') && order.vless_url;
+  if (isAlreadyCompleted) {
+    console.log(`[3X-UI Provisioning] Order ${order.id} is already completed/active. Returning existing VPN.`);
+    const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
+    return {
+      success: true,
+      message: 'Order already provisioned',
+      uuid: order.client_uuid || existingVpnAcc?.uuid,
+      vlessUrl: order.vless_url || existingVpnAcc?.vless_url,
+      subscriptionUrl: order.vless_url || existingVpnAcc?.vless_url,
+      vpnAccountId: existingVpnAcc?.id
+    };
   }
 
   // Parse JSON-serialized order metadata from payment_method if applicable
@@ -630,104 +656,30 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     try {
       extra = JSON.parse(order.payment_method);
     } catch (e) {
-      console.error('[xuiService] Error parsing payment_method JSON:', e);
+      console.error('[3X-UI Provisioning] Error parsing payment_method JSON:', e);
     }
   }
 
   const packageName = extra.package_name || extra.plan || extra.package || order.package_name || '';
   const customerName = extra.configurationName || extra.customerName || extra.name || extra.full_name || (order.email ? order.email.split('@')[0] : 'Customer');
-  const customerId = order.customer_id || '';
+  const customerId = order.customer_id || extra.customer_id || '';
 
-  console.log("==================================================");
-  console.log("TEMPLATE LOOKUP START");
-  console.log("==================================================");
-  console.log("Order ID:", order.order_id || (order as any).id);
-  console.log("Customer Email:", order.email);
-  console.log("Customer Name:", customerName);
-  console.log("order.package_name:", order.package_name);
-  console.log("extra.package_name:", extra.package_name);
-  console.log("extra.plan:", extra.plan);
-  console.log("extra.category:", extra.category);
-  console.log("extra.server:", extra.server);
-  console.log("");
-  console.log("Searching collection: provision_templates");
-
-  let matchingDocs: any[] = [];
-  try {
-    const { data: provTemplates } = await supabase.from('provision_templates').select('*');
-    const targetName = packageName.trim().toLowerCase();
-
-    if (provTemplates) {
-      for (const data of provTemplates) {
-        const enabled = data.enabled !== false;
-        const docPackageName = String(data.package_name || data.name || data.id).trim().toLowerCase();
-
-        if (enabled && (docPackageName === targetName || docPackageName === targetName.replace(/_/g, ' '))) {
-          matchingDocs.push({ id: data.id, ...data });
-        }
-      }
-    }
-
-    console.log("Number of matching templates:", matchingDocs.length);
-
-    if (matchingDocs.length > 0) {
-      matchingDocs.forEach(t => {
-        console.log("Document ID:", t.id);
-        console.log("packageName:", t.package_name || t.name);
-        console.log("enabled:", t.enabled !== false);
-        console.log("category:", t.category);
-        console.log("server:", t.server);
-        console.log("inboundId:", t.inbound_id);
-        console.log("address:", t.address);
-        console.log("sni:", t.sni);
-        console.log("remarkTemplate:", t.remark_template || t.remarkFormat);
-      });
-    } else {
-      console.log("No matching template found. Fetching ALL documents from provision_templates collection:");
-      if (provTemplates) {
-        for (const data of provTemplates) {
-          console.log("Document ID:", data.id);
-          console.log("packageName:", data.package_name || data.name);
-          console.log("enabled:", data.enabled !== false);
-          console.log("category:", data.category);
-          console.log("server:", data.server);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("Error debugging provision_templates collection:", err);
-  }
-
-  if (!packageName) {
-    throw new Error('Provisioning template not found.');
-  }
-
-  // 2. Query Supabase for template
+  // Step 1: Find the provisioning template
   const template = await findProvisioningTemplate(packageName);
   if (!template) {
-    throw new Error('Provisioning template not found.');
+    throw new Error(`Provisioning template not found for package '${packageName}'.`);
   }
 
-  console.log("========== TEMPLATE ==========");
-  console.log(template);
-  console.log("Package:", order.package_name);
-  console.log("Inbound:", template.inbound_id);
-  console.log("Address:", template.address);
-  console.log("SNI:", template.sni);
-  console.log("Remark Template:", template.remark_template);
-  console.log("==============================");
-
-  // 3. Extract template values & format unique remark
   const inboundId = Number(template.inbound_id) || 1;
   const address = template.address || '';
   const sni = template.sni || '';
   const remarkFormat = template.remark_template || template.remarkFormat || '{{customerName}}';
 
-  const orderDisplayId = (order.order_id || (order as any).id || '').trim();
+  const orderDisplayId = (order.order_id || order.id || '').trim();
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
-  // 4. Calculate duration & traffic
-  const duration = extra.duration || extra.duration || '1 Month';
+  // Duration & Traffic calculations
+  const duration = extra.duration || '1 Month';
   let days = 30;
   if (template.duration_profiles && template.duration_profiles[duration]) {
     days = Number(template.duration_profiles[duration]);
@@ -735,36 +687,21 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     const numMatch = String(duration).match(/(\d+)/);
     if (numMatch) {
       const num = parseInt(numMatch[1], 10);
-      if (String(duration).toLowerCase().includes('month')) {
-        days = num * 30;
-      } else {
-        days = num;
-      }
+      days = String(duration).toLowerCase().includes('month') ? num * 30 : num;
     }
   }
   const expiryMs = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-  // Traffic plan (Only two plans: 100 GB = 100 * 1024 * 1024 * 1024 bytes, Unlimited = 0 bytes)
-  let totalBytes = 0; // Default Unlimited (0)
-  const combinedPlanStr = `${extra.packageType || extra.packageType || ''} ${packageName || ''} ${extra.plan || extra.plan || ''} ${extra.packageOption || extra.packageOption || ''} ${extra.traffic || extra.traffic || ''}`.toLowerCase();
-
-  const is100GB = combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100');
-
-  if (is100GB) {
+  let totalBytes = 0;
+  const combinedPlanStr = `${extra.packageType || ''} ${packageName || ''} ${extra.plan || ''} ${extra.traffic || ''}`.toLowerCase();
+  if (combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100')) {
     totalBytes = 100 * 1024 * 1024 * 1024;
-  } else {
-    totalBytes = 0;
   }
 
-  const trafficLimitStr = totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited';
+  let uuid = crypto.randomUUID();
+  let subId = crypto.randomBytes(12).toString('hex');
 
-  // 1. client.id: Fresh UUID v4 for every request
-  const uuid = crypto.randomUUID();
-
-  // 2. client.subId: Fresh random subId for every request
-  const subId = crypto.randomBytes(12).toString('hex');
-
-  // Fetch inbound info from 3X-UI to determine 4. client.flow and build VLESS link
+  // Fetch inbound info from 3X-UI
   const inbounds = await getInbounds();
   const inbound = inbounds.find((i: any) => Number(i.id) === inboundId) || {
     id: inboundId,
@@ -780,10 +717,7 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     streamObj = inbound.streamSettings;
   }
 
-  const network = streamObj.network || 'tcp';
   const security = streamObj.security || 'none';
-
-  // 4. client.flow: Determined flow for client
   let flow = '';
   if (security === 'reality') {
     const reality = streamObj.realitySettings || streamObj.realitySettings?.settings || {};
@@ -793,104 +727,190 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
     flow = template.flow || '';
   }
 
-  console.log("==================================================");
-  console.log("[3X-UI Provisioning] GENERATED VALUES FOR NEW CLIENT:");
-  console.log(`1. client.id (UUID v4): ${uuid}`);
-  console.log(`2. client.subId: ${subId}`);
-  console.log(`3. client.email (remark): ${remark}`);
-  console.log(`4. client.flow: ${flow}`);
-  console.log("==================================================");
+  // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
+  try {
+    await add3XUiClient(inboundId, {
+      uuid,
+      email: remark,
+      totalBytes,
+      expiryMs,
+      subId,
+      flow
+    });
+    console.log(`[3X-UI Provisioning] Client '${remark}' created successfully on 3X-UI.`);
+  } catch (addErr: any) {
+    const errMsg = String(
+      addErr?.message || 
+      addErr?.response?.data?.msg || 
+      addErr?.response?.data?.message || 
+      addErr?.response?.data || 
+      ''
+    ).toLowerCase();
 
-  const trafficPlan = is100GB ? "100GB" : "Unlimited";
-  const totalGB = totalBytes;
-  const client = {
-    id: uuid,
-    email: remark,
-    totalGB: totalGB,
-    expiryTime: expiryMs,
+    console.warn(`[3X-UI Provisioning] add3XUiClient notice: ${errMsg}`);
+
+    const isDuplicate = 
+      errMsg.includes('already exist') || 
+      errMsg.includes('duplicate') || 
+      errMsg.includes('exists') || 
+      errMsg.includes('email');
+
+    if (isDuplicate) {
+      console.log(`[3X-UI Provisioning] Client '${remark}' already exists on 3X-UI. Reusing existing client...`);
+      const existingClient = await getClientByEmail(remark);
+      if (existingClient) {
+        console.log(`[3X-UI Provisioning] Found existing 3X-UI client: email=${existingClient.email}, uuid=${existingClient.uuid}`);
+        if (existingClient.uuid) uuid = existingClient.uuid;
+        if (existingClient.subId) subId = existingClient.subId;
+      } else {
+        console.warn(`[3X-UI Provisioning] 3X-UI returned duplicate but search returned null. Continuing with generated UUID '${uuid}'.`);
+      }
+    } else {
+      throw addErr;
+    }
+  }
+
+  // Step 3: Generate the VLESS URL and subscription URL
+  const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
+  const subscriptionUrl = vlessUrl;
+
+  const isValidUuid = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val || '');
+  const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
+
+  // Step 4: Upsert vpn_accounts
+  let vpnAccountId = '';
+  let existingAcc: any = null;
+  if (order.id) {
+    const { data } = await dbClient.from('vpn_accounts').select('id').eq('order_id', order.id).maybeSingle();
+    existingAcc = data;
+  }
+  if (!existingAcc && uuid) {
+    const { data } = await dbClient.from('vpn_accounts').select('id').eq('uuid', uuid).maybeSingle();
+    existingAcc = data;
+  }
+
+  const accPayload: any = {
+    user_id: validUserId,
+    order_id: order.id,
+    email: order.email,
+    remark: remark,
+    uuid: uuid,
+    vless_url: vlessUrl,
+    subscription_url: subscriptionUrl,
+    server_name: template.server || extra.server || 'Singapore',
+    expiry_date: new Date(expiryMs).toISOString(),
+    expiry_time: expiryMs,
+    total_bytes: totalBytes,
+    status: 'active',
     enable: true,
-    subId: subId,
-    flow: flow
+    updated_at: new Date().toISOString()
   };
 
-  console.log("Package:", packageName);
-  console.log("Traffic Plan:", trafficPlan);
-  console.log("Calculated totalGB:", totalGB);
-  console.log("Client Payload:", client);
-
-  // 5. Create client on 3X-UI panel
-  await add3XUiClient(inboundId, {
-    uuid,
-    email: remark,
-    totalBytes,
-    expiryMs,
-    subId,
-    flow
-  });
-
-  // 6. Generate VLESS link using template address & SNI, plus inbound settings
-  const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
-
-  console.log("");
-  console.log("Client Created Successfully");
-  console.log("");
-  console.log(`UUID: ${uuid}`);
-  console.log("");
-  console.log(`Subscription URL: ${vlessUrl}`);
-
-  // 8. Save VPN configuration in Supabase vpn_configs table
-  let configDocId = '';
-  const customerUid = customerId || order.customer_id || order.uid || order.userId || '';
-
-  if (!customerUid) {
-    const errorMsg = 'Customer UID is missing for this order. Cannot save VPN configuration.';
-    console.error('[3X-UI Provisioning]', errorMsg);
-    throw new Error(errorMsg);
-  }
-
-  try {
-    const { data: insertedConfig, error: insertErr } = await supabase.from('vpn_configs').insert({
-      customer_uid: customerUid,
-      order_id: order.order_id || order.id,
-      package_name: packageName,
-      package_type: extra.packageType || 'SIM Unlimited',
-      config_name: extra.configurationName || customerName,
-      uuid: uuid,
-      subscription_url: vlessUrl,
-      vless_url: vlessUrl,
-      server_address: address,
-      server: template.server || extra.server || 'Singapore',
-      sni: sni,
-      inbound_id: inboundId,
-      traffic_limit: trafficLimitStr,
-      expiry_time: new Date(expiryMs).toISOString(),
-      enabled: true,
-      status: 'Active',
+  let accErr: any = null;
+  if (existingAcc && existingAcc.id) {
+    vpnAccountId = existingAcc.id;
+    let { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
+    if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
+      delete accPayload.subscription_url;
+      const { error: retryErr } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
+      error = retryErr;
+    }
+    accErr = error;
+  } else {
+    let { data: newAcc, error } = await dbClient.from('vpn_accounts').insert({
+      ...accPayload,
       created_at: new Date().toISOString()
-    }).select('id').single();
-    configDocId = insertedConfig?.id || '';
-  } catch (docErr: any) {
-    const errorDetails = docErr?.message || String(docErr);
-    console.error('[3X-UI Provisioning] Failed to save VPN configuration in Supabase:', docErr);
-    throw new Error(`Failed to save VPN configuration in Supabase: ${errorDetails}`);
+    }).select('id').maybeSingle();
+
+    if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
+      delete accPayload.subscription_url;
+      const { data: newAcc2, error: retryErr } = await dbClient.from('vpn_accounts').insert({
+        ...accPayload,
+        created_at: new Date().toISOString()
+      }).select('id').maybeSingle();
+      newAcc = newAcc2;
+      error = retryErr;
+    }
+    accErr = error;
+    vpnAccountId = newAcc?.id || vpnAccountId;
   }
 
-  await supabase.from('orders').update({
-    payment_status: 'Approved',
-    provisioning_status: 'Completed',
-    config_id: configDocId || undefined,
-    vpn_credentials: {
-      username: remark,
-      password: uuid,
-      config_link: vlessUrl,
-      qrcodeData: vlessUrl,
-      subId: subId,
-      inboundId: inboundId
-    },
-    approved_at: new Date().toISOString()
-  }).eq('id', order.id);
+  if (accErr) {
+    console.error("[3X-UI Provisioning] Error updating table 'vpn_accounts':", accErr);
+    throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
+  }
 
-  // 9. Send Telegram notification
+  // Step 5: Upsert vpn_configs
+  let existingConfig: any = null;
+  if (order.id) {
+    const { data } = await dbClient.from('vpn_configs').select('id').eq('order_id', order.id).maybeSingle();
+    existingConfig = data;
+  }
+
+  const configPayload: any = {
+    customer_uid: validUserId,
+    order_id: order.id,
+    package_name: packageName,
+    package_type: extra.packageType || 'SIM Unlimited',
+    config_name: extra.configurationName || customerName,
+    uuid: uuid,
+    subscription_url: subscriptionUrl,
+    vless_url: vlessUrl,
+    server_address: address,
+    server: template.server || extra.server || 'Singapore',
+    sni: sni,
+    inbound_id: inboundId,
+    traffic_limit: totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+    expiry_time: new Date(expiryMs).toISOString(),
+    enabled: true,
+    status: 'active'
+  };
+
+  let confErr: any = null;
+  if (existingConfig && existingConfig.id) {
+    const { error } = await dbClient.from('vpn_configs').update(configPayload).eq('id', existingConfig.id);
+    confErr = error;
+  } else {
+    const { error } = await dbClient.from('vpn_configs').insert({
+      ...configPayload,
+      created_at: new Date().toISOString()
+    });
+    confErr = error;
+  }
+
+  if (confErr) {
+    console.error("[3X-UI Provisioning] Error updating table 'vpn_configs':", confErr);
+    throw new Error(`Database update failed for table 'vpn_configs': ${confErr.message || JSON.stringify(confErr)}`);
+  }
+
+  // Step 6: Update orders
+  const ordersPayload: any = {
+    payment_status: 'Paid',
+    status: 'completed',
+    provisioning_status: 'completed',
+    client_uuid: uuid,
+    vless_url: vlessUrl,
+    subscription_url: subscriptionUrl,
+    expiry_date: new Date(expiryMs).toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  let { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
+
+  if (orderUpdateErr && (orderUpdateErr.code === 'PGRST204' || orderUpdateErr.message?.includes('column'))) {
+    console.warn("[3X-UI Provisioning] Column missing on 'orders', retrying update without provisioning_status / subscription_url");
+    delete ordersPayload.provisioning_status;
+    delete ordersPayload.subscription_url;
+    const { error: retryErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
+    orderUpdateErr = retryErr;
+  }
+
+  if (orderUpdateErr) {
+    console.error("[3X-UI Provisioning] Error updating table 'orders':", orderUpdateErr);
+    throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
+  }
+
+  // Step 7: Send Telegram notification and return success
   try {
     await sendOrderApprovedNotification({
       customerEmail: order.email || 'N/A',
@@ -900,20 +920,22 @@ export const provisionOrderClient = async (orderId: string): Promise<any> => {
       duration: duration,
       price: order.amount || 0,
       uuid: uuid,
-      orderId: order.order_id || (order as any).id,
+      orderId: order.order_id || order.id,
       status: '🟢 COMPLETED'
     });
   } catch (tgErr) {
-    console.warn('[3X-UI Provisioning] Telegram notification error:', tgErr);
+    console.warn('[3X-UI Provisioning] Telegram notification warning:', tgErr);
   }
 
   return {
     success: true,
-    orderId: order.order_id || (order as any).id,
+    message: 'VPN client provisioned and order completed successfully',
+    orderId: order.order_id || order.id,
     uuid,
     vlessUrl,
-    remark,
-    inboundId
+    subscriptionUrl,
+    vpnAccountId
   };
 };
+
 
