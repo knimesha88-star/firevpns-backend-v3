@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getProfile, updateProfile } from '../controllers/userController.js';
+import { getProfile, updateProfile, getNotifications, readNotification } from '../controllers/userController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 
 const router = Router();
@@ -9,7 +9,11 @@ router.use(authMiddleware);
 router.get('/profile', getProfile);
 router.put('/profile', updateProfile);
 
+router.get('/notifications', getNotifications);
+router.post('/notifications/:id/read', readNotification);
+
 router.get('/downloads', (req, res) => {
+
   res.json({
     windows: { version: '2.1.0', url: '#' },
     mac: { version: '2.0.5', url: '#' },

@@ -3,6 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { supabase } from '../../lib/supabase.js';
 import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
+import { createCustomerNotification } from '../services/notificationService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -116,6 +117,19 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     
     console.log(`[RenewController] Supabase record ${requestId} updated successfully:`, updatedRow);
     
+    // Create customer notification
+    try {
+      await createCustomerNotification({
+        userId: data.user_id || data.userId || null,
+        userEmail: email,
+        title: 'Renewal Approved',
+        message: `Your VPN renewal request (${data.plan_name || data.planName || 'Plan'}) was approved successfully. Subscription extended!`,
+        type: 'renewal_approved'
+      });
+    } catch (nErr) {
+      console.warn('[RenewController] Customer notification creation error:', nErr);
+    }
+
     // Trigger Telegram approved notification asynchronously
     const approved_atNow = new Date();
     sendRenewApprovedNotification({
@@ -136,6 +150,70 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     });
   } catch (error: any) {
     console.error(`[RenewController] Error approving renewal request ${requestId}:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { requestId } = req.params;
+  const reason = req.body?.reason || req.body?.reject_reason || 'Rejected by Admin';
+
+  try {
+    if (!requestId) {
+      res.status(400).json({ error: 'Request ID is required' });
+      return;
+    }
+
+    const { data, error: fetchErr } = await supabase
+      .from('renew_requests')
+      .select('*')
+      .eq('id', requestId)
+      .single();
+
+    if (fetchErr || !data) {
+      res.status(404).json({ error: 'Renewal request not found' });
+      return;
+    }
+
+    const email = data.user_email || data.userEmail || data.email;
+    const nowIso = new Date().toISOString();
+
+    const { data: updatedRow, error: updateErr } = await supabase
+      .from('renew_requests')
+      .update({
+        status: 'rejected',
+        reject_reason: reason,
+        rejected_at: nowIso,
+        processed_at: nowIso
+      })
+      .eq('id', requestId)
+      .select()
+      .single();
+
+    if (updateErr) {
+      throw updateErr;
+    }
+
+    // Create customer notification
+    try {
+      await createCustomerNotification({
+        userId: data.user_id || data.userId || null,
+        userEmail: email,
+        title: 'Renewal Rejected',
+        message: `Your VPN renewal request was rejected: ${reason}`,
+        type: 'renewal_rejected'
+      });
+    } catch (nErr) {
+      console.warn('[RenewController] Customer notification creation error on reject:', nErr);
+    }
+
+    res.json({
+      success: true,
+      message: 'Renewal request rejected successfully.',
+      data: updatedRow
+    });
+  } catch (error: any) {
+    console.error(`[RenewController] Error rejecting renewal request ${requestId}:`, error.message);
     res.status(500).json({ error: error.message });
   }
 };

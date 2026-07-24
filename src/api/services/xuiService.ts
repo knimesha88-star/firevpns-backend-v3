@@ -1,8 +1,10 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { supabase, getSupabaseClient } from '../../lib/supabase.js';
+import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
+import { createCustomerNotification } from './notificationService.js';
 
 import crypto from 'crypto';
+
 import https from 'https';
 
 export interface XuiConfig {
@@ -623,17 +625,20 @@ export const add3XUiClient = async (
 };
 
 export const provisionOrderClient = async (orderId: string, token?: string): Promise<any> => {
-  const dbClient = getSupabaseClient(token);
+  const dbClient = supabaseAdmin;
 
   let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
 
   if (!order) {
     const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
     if (!queryOrder) {
+      console.error(`[3X-UI Provisioning] Order '${orderId}' not found in database. Fetch error:`, fetchErr);
       throw new Error(`Order '${orderId}' not found in database.`);
     }
     order = queryOrder;
   }
+
+  console.log(`[3X-UI Provisioning] Starting approval transaction for Order ID: ${order.id} (${order.order_id || 'N/A'}) - Customer: ${order.email}`);
 
   // Idempotency Check: If order is already completed/active with existing VPN link, return existing details
   const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active') && order.vless_url;
@@ -667,6 +672,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   // Step 1: Find the provisioning template
   const template = await findProvisioningTemplate(packageName);
   if (!template) {
+    console.error(`[3X-UI Provisioning] Provisioning template not found for package '${packageName}'.`);
     throw new Error(`Provisioning template not found for package '${packageName}'.`);
   }
 
@@ -737,7 +743,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       subId,
       flow
     });
-    console.log(`[3X-UI Provisioning] Client '${remark}' created successfully on 3X-UI.`);
+    console.log(`[3X-UI Provisioning] Client '${remark}' created successfully on 3X-UI server.`);
   } catch (addErr: any) {
     const errMsg = String(
       addErr?.message || 
@@ -747,7 +753,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       ''
     ).toLowerCase();
 
-    console.warn(`[3X-UI Provisioning] add3XUiClient notice: ${errMsg}`);
+    console.warn(`[3X-UI Provisioning] add3XUiClient warning/notice: ${errMsg}`);
 
     const isDuplicate = 
       errMsg.includes('already exist') || 
@@ -766,6 +772,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
         console.warn(`[3X-UI Provisioning] 3X-UI returned duplicate but search returned null. Continuing with generated UUID '${uuid}'.`);
       }
     } else {
+      console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
       throw addErr;
     }
   }
@@ -778,15 +785,18 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
 
   // Step 4: Upsert vpn_accounts
+  console.log(`[3X-UI Provisioning DB] Step 4: Upserting vpn_accounts for order ${order.id}...`);
   let vpnAccountId = '';
   let existingAcc: any = null;
   if (order.id) {
-    const { data } = await dbClient.from('vpn_accounts').select('id').eq('order_id', order.id).maybeSingle();
-    existingAcc = data;
+    const { data: d1, error: e1 } = await dbClient.from('vpn_accounts').select('id').eq('order_id', order.id).maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
+    existingAcc = d1;
   }
   if (!existingAcc && uuid) {
-    const { data } = await dbClient.from('vpn_accounts').select('id').eq('uuid', uuid).maybeSingle();
-    existingAcc = data;
+    const { data: d2, error: e2 } = await dbClient.from('vpn_accounts').select('id').eq('uuid', uuid).maybeSingle();
+    if (e2) console.warn('[3X-UI Provisioning DB] vpn_accounts select by uuid notice:', e2);
+    existingAcc = d2;
   }
 
   const accPayload: any = {
@@ -811,6 +821,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     vpnAccountId = existingAcc.id;
     let { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
     if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
+      console.warn('[3X-UI Provisioning DB] Retrying vpn_accounts update without subscription_url');
       delete accPayload.subscription_url;
       const { error: retryErr } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
       error = retryErr;
@@ -823,6 +834,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     }).select('id').maybeSingle();
 
     if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
+      console.warn('[3X-UI Provisioning DB] Retrying vpn_accounts insert without subscription_url');
       delete accPayload.subscription_url;
       const { data: newAcc2, error: retryErr } = await dbClient.from('vpn_accounts').insert({
         ...accPayload,
@@ -836,15 +848,19 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   if (accErr) {
-    console.error("[3X-UI Provisioning] Error updating table 'vpn_accounts':", accErr);
+    console.error("[3X-UI Provisioning DB] Error updating table 'vpn_accounts':", accErr);
     throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
+  } else {
+    console.log(`[3X-UI Provisioning DB] vpn_accounts updated successfully for order ${order.id}.`);
   }
 
   // Step 5: Upsert vpn_configs
+  console.log(`[3X-UI Provisioning DB] Step 5: Upserting vpn_configs for order ${order.id}...`);
   let existingConfig: any = null;
   if (order.id) {
-    const { data } = await dbClient.from('vpn_configs').select('id').eq('order_id', order.id).maybeSingle();
-    existingConfig = data;
+    const { data: cData, error: cErr } = await dbClient.from('vpn_configs').select('id').eq('order_id', order.id).maybeSingle();
+    if (cErr) console.warn('[3X-UI Provisioning DB] vpn_configs select by order_id notice:', cErr);
+    existingConfig = cData;
   }
 
   const configPayload: any = {
@@ -871,7 +887,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     const { error } = await dbClient.from('vpn_configs').update(configPayload).eq('id', existingConfig.id);
     confErr = error;
   } else {
-    const { error } = await dbClient.from('vpn_configs').insert({
+    const { error } = await dbClient.from('vpn_configs').upsert({
       ...configPayload,
       created_at: new Date().toISOString()
     });
@@ -879,11 +895,14 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   if (confErr) {
-    console.error("[3X-UI Provisioning] Error updating table 'vpn_configs':", confErr);
+    console.error("[3X-UI Provisioning DB] Error updating table 'vpn_configs':", confErr);
     throw new Error(`Database update failed for table 'vpn_configs': ${confErr.message || JSON.stringify(confErr)}`);
+  } else {
+    console.log(`[3X-UI Provisioning DB] vpn_configs updated successfully for order ${order.id}.`);
   }
 
-  // Step 6: Update orders
+  // Step 6: Update orders (payment_status='Paid', status='completed', provisioning_status='completed')
+  console.log(`[3X-UI Provisioning DB] Step 6: Updating orders table for order ${order.id}...`);
   const ordersPayload: any = {
     payment_status: 'Paid',
     status: 'completed',
@@ -898,7 +917,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
 
   if (orderUpdateErr && (orderUpdateErr.code === 'PGRST204' || orderUpdateErr.message?.includes('column'))) {
-    console.warn("[3X-UI Provisioning] Column missing on 'orders', retrying update without provisioning_status / subscription_url");
+    console.warn("[3X-UI Provisioning DB] Column missing on 'orders', retrying update without provisioning_status / subscription_url");
     delete ordersPayload.provisioning_status;
     delete ordersPayload.subscription_url;
     const { error: retryErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
@@ -906,11 +925,29 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   if (orderUpdateErr) {
-    console.error("[3X-UI Provisioning] Error updating table 'orders':", orderUpdateErr);
+    console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
+  } else {
+    console.log(`[3X-UI Provisioning DB] orders table updated successfully for order ${order.id} (status='completed', payment_status='Paid').`);
   }
 
-  // Step 7: Send Telegram notification and return success
+  // Step 7: Create customer notification in notifications table
+  console.log(`[3X-UI Provisioning DB] Step 7: Creating notification for user ${order.email}...`);
+  try {
+    const notif = await createCustomerNotification({
+      userId: validUserId,
+      userEmail: order.email,
+      title: 'VPN Activated',
+      message: 'Your VPN has been created successfully and is ready to use.',
+      type: 'activation',
+      orderId: order.id
+    });
+    console.log(`[3X-UI Provisioning DB] Customer notification result:`, notif ? 'Created' : 'Logged warning');
+  } catch (notifErr) {
+    console.warn('[3X-UI Provisioning DB] Customer notification warning:', notifErr);
+  }
+
+  // Step 8: Send Telegram notification and return success
   try {
     await sendOrderApprovedNotification({
       customerEmail: order.email || 'N/A',
@@ -924,7 +961,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       status: '🟢 COMPLETED'
     });
   } catch (tgErr) {
-    console.warn('[3X-UI Provisioning] Telegram notification warning:', tgErr);
+    console.warn('[3X-UI Provisioning DB] Telegram notification warning:', tgErr);
   }
 
   return {
