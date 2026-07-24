@@ -45,22 +45,12 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       return;
     }
     
-    // Read the renewRequests/renew_requests record from Supabase
-    let { data, error: fetchErr } = await supabase
+    // Read the renew_requests record from Supabase
+    const { data, error: fetchErr } = await supabase
       .from('renew_requests')
       .select('*')
       .eq('id', requestId)
       .single();
-    
-    if (fetchErr || !data) {
-      const fallback = await supabase
-        .from('renewRequests')
-        .select('*')
-        .eq('id', requestId)
-        .single();
-      data = fallback.data;
-      fetchErr = fallback.error;
-    }
     
     if (fetchErr || !data) {
       res.status(404).json({ error: 'Renewal request not found' });
@@ -104,27 +94,31 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     console.log(`[RenewController] 3X-UI update successful. New expiry time is: ${newExpiryTime}. Updating Supabase...`);
     
     const nowIso = new Date().toISOString();
-    // Update Supabase document upon success with lowercase 'approved'
-    const { error: updateErr } = await supabase.from('renew_requests').update({
-      status: 'approved',
-      approvedAt: nowIso,
-      approved_at: nowIso,
-      processedAt: nowIso,
-      processed_at: nowIso,
-      newExpiry: newExpiryTime,
-      new_expiry: newExpiryTime
-    }).eq('id', requestId);
+    const adminEmail = req.user?.email || req.user?.uid || 'admin@system';
+
+    // Update Supabase renew_requests table and return the updated row
+    const { data: updatedRow, error: updateErr } = await supabase
+      .from('renew_requests')
+      .update({
+        status: 'approved',
+        approved_at: nowIso,
+        approvedAt: nowIso,
+        approved_by: adminEmail,
+        approvedBy: adminEmail,
+        processed_at: nowIso,
+        processedAt: nowIso,
+        new_expiry: newExpiryTime,
+        newExpiry: newExpiryTime
+      })
+      .eq('id', requestId)
+      .select()
+      .single();
 
     if (updateErr) {
-      await supabase.from('renewRequests').update({
-        status: 'approved',
-        approvedAt: nowIso,
-        processedAt: nowIso,
-        newExpiry: newExpiryTime
-      }).eq('id', requestId);
+      throw updateErr;
     }
     
-    console.log(`[RenewController] Supabase record ${requestId} updated successfully.`);
+    console.log(`[RenewController] Supabase record ${requestId} updated successfully:`, updatedRow);
     
     // Trigger Telegram approved notification asynchronously
     const approvedAtNow = new Date();
@@ -142,11 +136,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     res.json({
       success: true,
       message: 'Renewal request approved and 3X-UI client updated successfully.',
-      data: {
-        requestId,
-        newExpiry: newExpiryTime,
-        status: 'approved'
-      }
+      data: updatedRow
     });
   } catch (error: any) {
     console.error(`[RenewController] Error approving renewal request ${requestId}:`, error.message);
