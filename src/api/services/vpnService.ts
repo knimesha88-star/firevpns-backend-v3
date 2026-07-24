@@ -80,11 +80,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   let inbounds: any[] = [];
   try {
     inbounds = await getInbounds();
+    console.log(`[vpnService] Number of inbounds returned: ${inbounds.length}`);
   } catch (error) {
     console.error('[vpnService] Failed to fetch inbounds from 3X-UI:', error);
   }
 
   const resultConfigs = configs.map(config => {
+    console.log(`[vpnService] Processing config for user: ${email}, UUID: ${config.uuid}, Server (InboundID): ${config.inboundId}`);
+    
     let usedGB = 0;
     let upBytes = 0;
     let downBytes = 0;
@@ -122,13 +125,21 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           }
         } catch (e) {}
         const clients = settingsObj.clients || [];
+        // Count scanned clients
+        console.log(`[vpnService] Scanning inbound ${ib.id} (${ib.remark}) with ${clients.length} clients`);
+        
         const foundClient = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
         if (foundClient) {
-          console.log(`[vpnService] Matched inbound by UUID search. Inbound: ${ib.id}, Remark: ${ib.remark}, Client ID: ${foundClient.id}, Client Email: ${foundClient.email}`);
+          console.log(`[vpnService] UUID ${config.uuid} FOUND in inbound ${ib.id}`);
           matchedInbound = ib;
           break;
         }
       }
+      if (!matchedInbound) {
+        console.log(`[vpnService] UUID ${config.uuid} NOT FOUND in any inbound`);
+      }
+    } else if (config.uuid) {
+        console.log(`[vpnService] UUID ${config.uuid} searching ${matchedInbound ? 'skipped (already matched)' : 'skipped (no inbounds)'}`);
     }
 
     if (matchedInbound) {
@@ -143,9 +154,21 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase() || (client.email && config.email && String(client.email).toLowerCase() === String(config.email).toLowerCase()));
       
       if (c) {
+        console.log(`[vpnService] Matched Client (Raw): ${JSON.stringify(c, null, 2)}`);
+        console.log(`[vpnService] Inbound (Raw): ${JSON.stringify(matchedInbound, null, 2)}`);
+        
         const emailStr = c.email || '';
         const clientStats = matchedInbound.clientStats || [];
+        console.log(`[vpnService] Available Client Stats: ${JSON.stringify(clientStats, null, 2)}`);
+        
         const stat = clientStats.find((s: any) => s.email === emailStr);
+        
+        console.log(`[vpnService] Debugging client: UUID=${config.uuid}, emailStr=${emailStr}, clientStatsCount=${clientStats.length}`);
+        if (!stat) {
+          console.log(`[vpnService] Client stat NOT found for emailStr=${emailStr}. Available emails: ${clientStats.map(s => s.email).join(', ')}`);
+        } else {
+          console.log(`[vpnService] Client stat FOUND: ${JSON.stringify(stat, null, 2)}`);
+        }
         
         const enable = c.enable !== false;
         const expiryTime = c.expiryTime || 0;
@@ -177,9 +200,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           currentExpiryDate = new Date(expiryTime).toISOString();
         }
       } else {
+        console.warn(`[vpnService] Client with UUID=${config.uuid} NOT found in matched inbound ${matchedInbound.id}`);
         status = 'Active';
       }
     } else {
+      console.warn(`[vpnService] Inbound NOT found for UUID=${config.uuid}, inboundId=${config.inboundId}`);
       status = 'Active';
     }
 
@@ -215,6 +240,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       downBytes,
       upload: upBytes,
       download: downBytes,
+      liveUsageFound: !!matchedInbound && !!stat, // Added flag
       totalTrafficBytes: trafficLimitNum > 0 ? trafficLimitNum * 1024 * 1024 * 1024 : 0,
       remainingTrafficBytes: typeof remainingGB === 'number' ? remainingGB * 1024 * 1024 * 1024 : 0,
       expiryDate: currentExpiryDate,
@@ -233,5 +259,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     };
   });
 
+  console.log(`[vpnService] Final configs to return: ${JSON.stringify(resultConfigs.map(c => ({uuid: c.uuid, packageName: c.packageName, usedGB: c.usedGB})))}`);
   return resultConfigs;
 };
