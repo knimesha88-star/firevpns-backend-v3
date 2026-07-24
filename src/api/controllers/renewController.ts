@@ -153,27 +153,90 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     
     // 4. Update vpn_accounts
     try {
-      await supabase
-        .from('vpn_accounts')
-        .update({
-          expiry_date: new_expiryIso,
-          expiry_time: new_expiryMs,
-          updated_at: nowIso
-        })
-        .or(`email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+      let updatedSpecific = false;
+      const parsedNotes = data.notes ? (typeof data.notes === 'string' ? JSON.parse(data.notes) : data.notes) : null;
+      const specAccountId = data.vpn_account_id || parsedNotes?.vpn_account_id;
+      const specUuid = data.uuid || parsedNotes?.uuid;
+
+      if (specAccountId) {
+        const { error: vErr } = await supabase
+          .from('vpn_accounts')
+          .update({
+            expiry_date: new_expiryIso,
+            expiry_time: new_expiryMs,
+            updated_at: nowIso
+          })
+          .eq('id', specAccountId);
+        if (!vErr) {
+          updatedSpecific = true;
+          console.log(`[RenewController] Successfully renewed vpn_account by ID: ${specAccountId}`);
+        } else {
+          console.warn(`[RenewController] Failed to renew vpn_account by ID: ${specAccountId}`, vErr);
+        }
+      } else if (specUuid) {
+        const { error: vErr } = await supabase
+          .from('vpn_accounts')
+          .update({
+            expiry_date: new_expiryIso,
+            expiry_time: new_expiryMs,
+            updated_at: nowIso
+          })
+          .eq('uuid', specUuid);
+        if (!vErr) {
+          updatedSpecific = true;
+          console.log(`[RenewController] Successfully renewed vpn_account by UUID: ${specUuid}`);
+        } else {
+          console.warn(`[RenewController] Failed to renew vpn_account by UUID: ${specUuid}`, vErr);
+        }
+      }
+
+      if (!updatedSpecific) {
+        console.log(`[RenewController] Fallback: Renewing all vpn_accounts for user email: ${email}`);
+        await supabase
+          .from('vpn_accounts')
+          .update({
+            expiry_date: new_expiryIso,
+            expiry_time: new_expiryMs,
+            updated_at: nowIso
+          })
+          .or(`email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+      }
     } catch (vErr) {
       console.warn('[RenewController] vpn_accounts update warning:', vErr);
     }
 
     // 5. Update vpn_configs
     try {
-      await supabase
-        .from('vpn_configs')
-        .update({
-          expiry_date: new_expiryIso,
-          updated_at: nowIso
-        })
-        .or(`user_email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+      let updatedSpecificConfig = false;
+      const parsedNotes = data.notes ? (typeof data.notes === 'string' ? JSON.parse(data.notes) : data.notes) : null;
+      const specUuid = data.uuid || parsedNotes?.uuid;
+
+      if (specUuid) {
+        const { error: cErr } = await supabase
+          .from('vpn_configs')
+          .update({
+            expiry_date: new_expiryIso,
+            updated_at: nowIso
+          })
+          .eq('uuid', specUuid);
+        if (!cErr) {
+          updatedSpecificConfig = true;
+          console.log(`[RenewController] Successfully renewed vpn_configs by UUID: ${specUuid}`);
+        } else {
+          console.warn(`[RenewController] Failed to renew vpn_configs by UUID: ${specUuid}`, cErr);
+        }
+      }
+
+      if (!updatedSpecificConfig) {
+        console.log(`[RenewController] Fallback: Renewing all vpn_configs for user email: ${email}`);
+        await supabase
+          .from('vpn_configs')
+          .update({
+            expiry_date: new_expiryIso,
+            updated_at: nowIso
+          })
+          .or(`user_email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+      }
     } catch (cErr) {
       console.warn('[RenewController] vpn_configs update warning:', cErr);
     }

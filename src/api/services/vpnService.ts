@@ -106,10 +106,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
     if (!isNaN(inboundIdNum) && inboundIdNum > 0 && inbounds.length > 0) {
       matchedInbound = inbounds.find(i => Number(i.id) === inboundIdNum);
+      if (matchedInbound) {
+        console.log(`[vpnService] Matched inbound by ID: ${inboundIdNum}, Remark: ${matchedInbound.remark}`);
+      }
     }
 
     // If no inbound matched by ID, try searching all inbounds for client matching uuid
     if (!matchedInbound && inbounds.length > 0 && config.uuid) {
+      console.log(`[vpnService] Searching inbounds for UUID: ${config.uuid}`);
       for (const ib of inbounds) {
         let settingsObj: any = {};
         try {
@@ -120,6 +124,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         const clients = settingsObj.clients || [];
         const foundClient = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
         if (foundClient) {
+          console.log(`[vpnService] Matched inbound by UUID search. Inbound: ${ib.id}, Remark: ${ib.remark}, Client ID: ${foundClient.id}, Client Email: ${foundClient.email}`);
           matchedInbound = ib;
           break;
         }

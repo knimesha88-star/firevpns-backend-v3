@@ -36,6 +36,7 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
     }
 
     if (activeConfig) {
+      console.log(`[clientService] Found active config: UUID: ${activeConfig.uuid}, ServerNode: ${activeConfig.serverNode}, Upload: ${activeConfig.upload}, Download: ${activeConfig.download}`);
       return {
         email,
         uuid: activeConfig.uuid,
@@ -61,11 +62,17 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
         uri: activeConfig.configUrl,
         status: activeConfig.status
       };
+    } else {
+      console.warn(`[clientService] Active config not found for email: ${email}, targetUuid: ${targetUuid}, uid: ${uid}`);
     }
   }
 
   // Fallback to legacy lookup
-  return await getClientByEmail(email);
+  const legacyClient = await getClientByEmail(email);
+  if (!legacyClient) {
+    throw new Error(`VPN client not found for user: ${email}`);
+  }
+  return legacyClient;
 };
 
 export const getSubscriptionUri = async (email: string): Promise<string | null> => {
