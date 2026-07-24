@@ -33,27 +33,18 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         const matchesUser = (userUid && docUserId === userUid) || (userEmail && docEmail === userEmail);
         
         if (matchesUser && acc.vless_url) {
-          const key = acc.remark || 'FIREVPN Package';
-          if (!latestAccs[key]) {
-            console.log(`[VPN Lookup] Row ${acc.id} (remark=${acc.remark}) selected as active VPN for key: ${key}`);
-            latestAccs[key] = acc;
-          }
+          configs.push({
+            orderId: acc.order_id || acc.id,
+            packageName: acc.remark || 'FIREVPN Package',
+            configUrl: acc.vless_url,
+            uuid: acc.uuid,
+            expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
+            inboundId: null,
+            trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+            serverNode: acc.server_name || 'Singapore',
+            _rawLimit: acc.total_bytes || 0,
+          });
         }
-      });
-      
-      Object.values(latestAccs).forEach(acc => {
-        console.log(`[VPN Lookup] Sending UUID ${acc.uuid} to 3X-UI for config: ${acc.remark}`);
-        configs.push({
-          orderId: acc.order_id || acc.id,
-          packageName: acc.remark || 'FIREVPN Package',
-          configUrl: acc.vless_url,
-          uuid: acc.uuid,
-          expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
-          inboundId: null,
-          trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
-          serverNode: acc.server_name || 'Singapore',
-          _rawLimit: acc.total_bytes || 0,
-        });
       });
     }
   } catch (err) {
@@ -159,13 +150,15 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       } catch (e) {}
 
       const clients = settingsObj.clients || [];
-      const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase() || (client.email && config.email && String(client.email).toLowerCase() === String(config.email).toLowerCase()));
+      const c = clients.find((client: any) => String(client.id || '').toLowerCase() === String(config.uuid).toLowerCase());
       
       if (c) {
-        const emailStr = c.email || '';
         const clientStats = matchedInbound.clientStats || [];
         
-        stat = clientStats.find((s: any) => s.email === emailStr);
+        // Match stat by UUID, not email.
+        if (config.uuid) {
+          stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(config.uuid).toLowerCase());
+        }
         
         const enable = c.enable !== false;
         const expiryTime = c.expiryTime || 0;
