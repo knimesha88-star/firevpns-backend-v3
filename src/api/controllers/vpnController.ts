@@ -66,7 +66,8 @@ export const getClaimedTrials = async (req: AuthRequest, res: Response): Promise
           const pkgName = String(data.package_name || pmJson.packageName || pmJson.package_name || pmJson.plan || '').trim().toLowerCase();
           const tplId = String(data.template_id || pmJson.template_id || pmJson.templateId || '').trim().toLowerCase();
           const status = String(data.status || '').toLowerCase();
-          const isPending = status === 'pending' || String(data.payment_status || '').toLowerCase() === 'pending trial approval';
+          const payStatus = String(data.payment_status || '').toLowerCase();
+          const isPending = status === 'pending' || payStatus === 'pending trial approval' || payStatus === 'pending verification' || payStatus === 'pending';
 
           if (pkgName) claimedPackages.push(pkgName);
           if (tplId) claimedTemplates.push(tplId);
@@ -149,7 +150,8 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
 
     if (existingTrial) {
       const status = String(existingTrial.status || '').toLowerCase();
-      if (status === 'pending' || String(existingTrial.payment_status || '').toLowerCase() === 'pending trial approval') {
+      const payStatus = String(existingTrial.payment_status || '').toLowerCase();
+      if (status === 'pending' || payStatus === 'pending trial approval' || payStatus === 'pending verification' || payStatus === 'pending') {
         res.status(400).json({
           success: false,
           error: 'Request Pending: You already have a pending trial request for this package. Please wait for administrator approval.'
@@ -212,31 +214,45 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       requestedAt: new Date().toISOString()
     });
 
-    const orderPayload = {
+    const orderPayload: any = {
       order_id: orderId,
       customer_id: uid,
       email: email,
       package_name: matchedTemplate.package_name,
-      template_id: matchedTemplate.id,
       amount: 0,
       payment_method: notesJson,
-      payment_status: 'Pending Trial Approval',
+      payment_status: 'Pending',
       status: 'pending',
       created_at: new Date().toISOString()
     };
 
     console.log('[vpnController] Creating pending trial request payload:', orderPayload);
 
-    const { data: createdOrder, error: insertErr } = await supabase
+    let createdOrder: any = null;
+    let { data: resData, error: insertErr } = await supabase
       .from('orders')
       .insert(orderPayload)
       .select()
       .maybeSingle();
 
+    if (insertErr && (insertErr.message?.includes('payment_status') || insertErr.code === '23514')) {
+      console.warn('[vpnController] Insert with payment_status Pending failed, retrying with Pending Verification:', insertErr);
+      const { data: resData2, error: retryErr } = await supabase
+        .from('orders')
+        .insert({ ...orderPayload, payment_status: 'Pending Verification' })
+        .select()
+        .maybeSingle();
+      if (!retryErr) {
+        insertErr = null;
+        resData = resData2;
+      }
+    }
+
     if (insertErr) {
       console.error('[vpnController] Trial request creation error:', insertErr);
       throw insertErr;
     }
+    createdOrder = resData;
 
     // 4. Immediately send Telegram notification to Administrator
     try {
