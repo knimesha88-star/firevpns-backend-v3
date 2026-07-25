@@ -84,12 +84,10 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
   console.log(`[NotificationService] [ENTER] checkAndCreateExpiryNotifications for userId: ${userId}, userEmail: ${userEmail}`);
   try {
     let query = supabaseAdmin.from('vpn_configs').select('*');
-    if (userId && userEmail) {
-      query = query.or(`customer_uid.eq.${userId},user_email.eq.${userEmail}`);
-    } else if (userId) {
+    if (userId) {
       query = query.eq('customer_uid', userId);
-    } else if (userEmail) {
-      query = query.eq('user_email', userEmail);
+    } else {
+      return;
     }
 
     const { data: configs, error: configErr } = await query;
@@ -182,7 +180,7 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
       if (!alreadyExists) {
         await createCustomerNotification({
           userId: targetUserId,
-          userEmail: userEmail || cfg.user_email || '',
+          userEmail: userEmail || '',
           title: targetTitle,
           message: targetMessage,
           type: targetType,

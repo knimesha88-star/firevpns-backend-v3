@@ -175,7 +175,7 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
     throw new Error('API token is missing');
   }
 
-  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, '/panel/api/inbounds/list');
+  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, '/api/inbounds');
   const client = createAxiosInstance(baseUrl);
 
   
@@ -202,7 +202,7 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   console.log('[xuiService] [FUNCTION ENTERED] getInbounds');
   try {
-    const inboundsData = await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
+    const inboundsData = await requestApi<XuiInbound[]>('/api/inbounds');
     const response = { data: { obj: inboundsData } };
 
 
@@ -734,15 +734,17 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('[Purchase Flow] Loaded template:', JSON.stringify(template, null, 2));
 
   // Requirement 2: Ensure inbound_id comes from template
-  if (!template.inbound_id) {
+  if (!template.inbound_id && !template.inboundId) {
     const errorMsg = `Provisioning template '${template.id}' for package '${packageName}' is missing 'inbound_id'.`;
     console.error(`[Purchase Flow] Error: ${errorMsg}`);
     throw new Error(errorMsg);
   }
 
-  const inboundId = Number(template.inbound_id);
+  const inboundId = Number(template.inbound_id || template.inboundId);
   console.log(`[Purchase Flow] DEBUG: Selected Template ID: ${template.id}`);
   console.log(`[Purchase Flow] DEBUG: Template inbound_id: ${template.inbound_id}`);
+  console.log(`[Purchase Flow] DEBUG: Template inboundId: ${template.inboundId}`);
+  console.log(`[Purchase Flow] DEBUG: Full Template: ${JSON.stringify(template, null, 2)}`);
   console.log(`[Purchase Flow] DEBUG: Final inboundId: ${inboundId}`);
   
   // Note: 3X-UI inbound used will be logged when calling the 3X-UI API, which typically logs inboundId.
@@ -999,6 +1001,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
   if (!skipAttachment) {
+    console.log(`[3X-UI Provisioning] Calling add3XUiClient with inboundId: ${inboundId}, Package: ${template.package_name}, Template ID: ${template.id}`);
     try {
       await add3XUiClient(inboundId, {
         uuid,
@@ -1356,7 +1359,7 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
             orderId,
             uuid: cfg.uuid,
             customerUid: cfg.customer_uid,
-            email: cfg.user_email || cfg.email || '',
+            email: '',
             packageName: cfg.package_name || cfg.config_name || 'FIREVPN Package',
             inboundId: cfg.inbound_id || null,
             expiryMs: expMs,

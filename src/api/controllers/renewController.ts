@@ -240,14 +240,14 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       }
 
       if (!updatedSpecificConfig) {
-        console.log(`[RenewController] Fallback: Renewing all vpn_configs for user email: ${email}`);
+        console.log(`[RenewController] Fallback: Renewing all vpn_configs for user: ${data.user_id || 'N/A'}`);
         await supabase
           .from('vpn_configs')
           .update({
             expiry_date: new_expiryIso,
             updated_at: nowIso
           })
-          .or(`user_email.eq.${email},user_id.eq.${data.user_id || 'N/A'}`);
+          .eq('customer_uid', data.user_id || 'N/A');
       }
     } catch (cErr) {
       console.warn('[RenewController] vpn_configs update warning:', cErr);
