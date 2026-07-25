@@ -140,6 +140,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     let enable = true;
     let inboundId = config.inboundId;
     console.log(`[Provisioning Audit] Database inbound_id after reload: ${config.inboundId}`);
+    console.log(`[Provisioning Audit] UUID to match: ${config.uuid}`);
     let clientEmail = userEmail;
     let matchedInbound: any = null;
     let stat: any = null;
@@ -161,6 +162,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           if (String(c.id || '').toLowerCase() === String(config.uuid).toLowerCase()) {
             matchedInbound = ib;
             foundClient = c;
+            console.log(`[Provisioning Audit] Matched Inbound ID: ${ib.id}, Raw Client JSON: ${JSON.stringify(c)}`);
             break;
           }
         }
@@ -185,11 +187,21 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       if (config.uuid) {
         stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(config.uuid).toLowerCase()) ||
                clientStats.find((s: any) => String(s.email || '').toLowerCase() === String(clientEmail).toLowerCase());
+        console.log(`[Provisioning Audit] Raw Client Stats JSON: ${JSON.stringify(stat)}`);
       }
 
+      const extractTraffic = (obj: any, type: 'up' | 'down') => {
+        const val = obj[type] || obj[`${type}load`] || 0;
+        return val;
+      };
+
       if (stat) {
-        up = stat.up || 0;
-        down = stat.down || 0;
+        const statUp = extractTraffic(stat, 'up');
+        const statDown = extractTraffic(stat, 'down');
+        
+        if (statUp > 0 || up === 0) up = statUp;
+        if (statDown > 0 || down === 0) down = statDown;
+        
         if (stat.total !== undefined && stat.total > 0) {
           total = stat.total;
         }
@@ -201,11 +213,12 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         }
         lastOnline = stat.lastOnline || stat.online || stat.time || 0;
       } else {
-        up = foundClient.up || 0;
-        down = foundClient.down || 0;
+        up = extractTraffic(foundClient, 'up');
+        down = extractTraffic(foundClient, 'down');
         lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
+      console.log(`[Provisioning Audit] No live stats found for UUID: ${config.uuid}. Using DB values.`);
     }
 
     const totalUsed = up + down;

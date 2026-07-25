@@ -189,6 +189,11 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
+  console.log(`[xuiService] [DEBUG] Preparing ${method} request`);
+  console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
+  console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
+  console.log(`[xuiService] [DEBUG] Method: ${method}`);
+  console.log(`[xuiService] [DEBUG] Payload: ${data ? JSON.stringify(data) : 'None'}`);
   console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | Payload:`, data ? JSON.stringify(data) : 'None');
   
   try {
@@ -684,6 +689,12 @@ export const add3XUiClient = async (
     try {
       const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
       const client = createAxiosInstance(baseUrl);
+      
+      console.log(`[xuiService] [DEBUG] Preparing POST request`);
+      console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
+      console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
+      console.log(`[xuiService] [DEBUG] Method: POST`);
+      console.log(`[xuiService] [DEBUG] Payload: ${JSON.stringify(payload)}`);
       console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(payload));
 
       const response = await client.request({
