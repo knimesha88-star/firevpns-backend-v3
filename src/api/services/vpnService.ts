@@ -40,7 +40,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
             configUrl: acc.vless_url,
             uuid: acc.uuid,
             expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
-            inboundId: null,
+            inboundId: acc.inbound_id || null,
             trafficLimit: isTrialAcc ? '1GB' : (acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
             serverNode: acc.server_name || 'Singapore',
             _rawLimit: isTrialAcc ? 1 * 1024 * 1024 * 1024 : (acc.total_bytes || 0),
@@ -115,6 +115,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     let lastOnline = 0;
     let enable = true;
     let inboundId = config.inboundId;
+    console.log(`[Provisioning Audit] Database inbound_id after reload: ${config.inboundId}`);
     let clientEmail = userEmail;
     let matchedInbound: any = null;
     let stat: any = null;
@@ -144,7 +145,9 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     }
 
     if (matchedInbound && foundClient) {
-      inboundId = matchedInbound.id;
+      if (!inboundId) {
+        inboundId = matchedInbound.id;
+      }
       clientEmail = foundClient.email || userEmail;
       enable = foundClient.enable !== false;
       expiryTime = foundClient.expiryTime || 0;
@@ -220,6 +223,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       } catch(e) {}
     }
 
+    console.log(`[Provisioning Audit] API response inboundId: ${inboundId}`);
     return {
       orderId: config.orderId,
       packageName: config.packageName,

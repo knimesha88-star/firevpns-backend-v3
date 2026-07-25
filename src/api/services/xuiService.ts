@@ -115,6 +115,22 @@ const getApiEndpointUrl = (panelUrl: string, endpoint: string) => {
   };
 };
 
+const logAxiosError = (error: any) => {
+  console.error("=== 3X-UI ERROR ===");
+  console.error(`Message: ${error.message}`);
+  console.error(`Code: ${error.code}`);
+  console.error(`Full request URL: ${error.config?.url ? (error.config.baseURL && !error.config.url.startsWith('http') ? error.config.baseURL + error.config.url : error.config.url) : 'N/A'}`);
+  console.error(`HTTP method: ${error.config?.method?.toUpperCase() || 'UNKNOWN'}`);
+  console.error(`Endpoint path: ${error.config?.url || 'N/A'}`);
+  if (error.response) {
+    console.error(`HTTP status: ${error.response?.status} ${error.response?.statusText || ''}`);
+    console.error(`Response body:`, error.response?.data);
+  } else {
+    console.error("No HTTP response received from 3X-UI");
+  }
+  console.error(`Stack trace: ${error.stack}`);
+};
+
 const createAxiosInstance = (baseUrl: string) => {
   return axios.create({
     baseURL: baseUrl,
@@ -137,7 +153,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
-  console.log(`[xuiService] [3X-UI API REQUEST] Sending ${method} to ${fullUrl} | Payload:`, data ? JSON.stringify(data) : 'None');
+  console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | Payload:`, data ? JSON.stringify(data) : 'None');
   
   try {
     const response = await client.request({
@@ -149,6 +165,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
       }
     });
 
+    console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
 
     if (response.status !== 200) {
       throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
@@ -158,13 +175,10 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
       throw new Error(`3X-UI API Error: ${response.data.msg}`);
     }
 
-    console.log(`[xuiService] [3X-UI API RESPONSE] Success response for ${endpoint}`);
+    console.log(`[xuiService] [3X-UI API SUCCESS] Success response for ${endpoint}`);
     return response.data.obj;
   } catch (error: any) {
-    console.error("=== 3X-UI ERROR ===");
-    console.error(`Status: ${error.response?.status}`);
-    console.error(`Data:`, error.response?.data);
-    console.error(`Message: ${error.message}`);
+    logAxiosError(error);
     throw error;
   }
 };
@@ -175,54 +189,74 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
     throw new Error('API token is missing');
   }
 
-  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, '/api/inbounds');
-  const client = createAxiosInstance(baseUrl);
+  const endpoints = ['/panel/api/inbounds/list', '/panel/api/inbounds', '/api/inbounds'];
+  let lastError: any = null;
 
-  
-  const response = await client.request({
-    url: fullPath,
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${token}`
+  for (const ep of endpoints) {
+    try {
+      const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, ep);
+      const client = createAxiosInstance(baseUrl);
+      console.log(`[xuiService] [TEST API CONNECTION] Full request URL: ${fullUrl} | HTTP method: GET | Endpoint path: ${fullPath}`);
+      const response = await client.request({
+        url: fullPath,
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+      console.log(`[xuiService] [TEST API CONNECTION RESPONSE] Full request URL: ${fullUrl} | HTTP method: GET | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
+
+      if (response.status === 200 && (!response.data || response.data.success !== false)) {
+        return true;
+      }
+      lastError = new Error(`Connection test failed: status ${response.status}`);
+    } catch (e: any) {
+      lastError = e;
+      logAxiosError(e);
     }
-  });
-
-
-  if (response.status !== 200) {
-    throw new Error(`Connection test failed: ${response.status} ${response.statusText}`);
   }
 
-  if (response.data && response.data.success === false) {
-    throw new Error(`Connection test failed: ${response.data.msg}`);
-  }
-
-  return true;
+  throw lastError || new Error('Connection test failed on all endpoints');
 };
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   console.log('[xuiService] [FUNCTION ENTERED] getInbounds');
+  const endpoints = ['/panel/api/inbounds/list', '/panel/api/inbounds', '/api/inbounds'];
+  let inboundsData: any = null;
+
+  for (const ep of endpoints) {
+    try {
+      inboundsData = await requestApi<XuiInbound[]>(ep);
+      if (Array.isArray(inboundsData)) {
+        break;
+      }
+    } catch (error: any) {
+      console.warn(`[XUI Service] Failed to retrieve inbounds from ${ep}:`, error.message);
+    }
+  }
+
+  if (!Array.isArray(inboundsData)) {
+    console.error('[XUI Service] Failed to retrieve inbounds from all endpoints');
+    return [];
+  }
+
   try {
-    const inboundsData = await requestApi<XuiInbound[]>('/api/inbounds');
-    const response = { data: { obj: inboundsData } };
-
-
-    response.data.obj.forEach((inbound: any) => {
-
+    inboundsData.forEach((inbound: any) => {
         const settings =
             typeof inbound.settings === "string"
                 ? JSON.parse(inbound.settings)
                 : inbound.settings;
 
-
-        settings.clients.forEach((c: any) => {
-        });
+        if (settings && settings.clients) {
+            settings.clients.forEach((c: any) => {
+            });
+        }
     });
-
-    return inboundsData;
-  } catch (error: any) {
-    console.error('[XUI Service] Failed to retrieve inbounds:', error.message);
-    return [];
+  } catch (e) {
+    // Ignore parsing issues in audit loop
   }
+
+  return inboundsData;
 };
 
 export const getClientByEmail = async (email: string): Promise<any | null> => {
@@ -359,12 +393,33 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
         date.setMonth(date.getMonth() + durationMonths);
         const new_expiryTime = date.getTime();
         
-        await requestApi<any>(`/panel/api/clients/update/${c.email}`, 'POST', {
-          ...c,
-          id: String(c.id),
-          email: c.email,
-          expiryTime: new_expiryTime
-        });
+        const updateEndpoints = [
+          `/panel/api/inbounds/updateClient/${c.id}`,
+          `/panel/api/inbounds/updateClient/${c.email}`,
+          `/panel/api/clients/update/${c.email}`
+        ];
+
+        let updated = false;
+        let lastErr: any = null;
+
+        for (const ep of updateEndpoints) {
+          try {
+            await requestApi<any>(ep, 'POST', {
+              ...c,
+              id: String(c.id),
+              email: c.email,
+              expiryTime: new_expiryTime
+            });
+            updated = true;
+            break;
+          } catch (e: any) {
+            lastErr = e;
+          }
+        }
+
+        if (!updated && lastErr) {
+          throw lastErr;
+        }
         
         return new_expiryTime;
       }
@@ -600,13 +655,10 @@ export const add3XUiClient = async (
     throw new Error('API token is missing in 3X-UI settings');
   }
 
-  const endpoint = '/panel/api/clients/add';
-  const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-  const client = createAxiosInstance(baseUrl);
+  const endpoints = ['/panel/api/inbounds/addClient', '/panel/api/clients/add'];
+  let lastErr: any = null;
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
-
-
   const payload = {
     client: {
       id: clientData.uuid,
@@ -623,34 +675,34 @@ export const add3XUiClient = async (
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
-  try {
-    const response = await client.request({
-      url: fullPath,
-      method: 'POST',
-      data: payload,
-      headers: {
-        Authorization: `Bearer ${token}`
+  for (const endpoint of endpoints) {
+    try {
+      const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
+      const client = createAxiosInstance(baseUrl);
+      console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(payload));
+
+      const response = await client.request({
+        url: fullPath,
+        method: 'POST',
+        data: payload,
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
+
+      if ((response.status === 200 || response.status === 201) && (!response.data || response.data.success !== false)) {
+        return response.data;
       }
-    });
-
-
-    if (response.status !== 200 && response.status !== 201) {
-      throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
+      lastErr = new Error(`3X-UI API Error: HTTP status ${response.status}, msg: ${response.data?.msg || 'unknown'}`);
+    } catch (error: any) {
+      lastErr = error;
+      logAxiosError(error);
     }
-
-    if (!response.data || response.data.success === false) {
-      const errorMsg = response.data?.msg || 'API returned success=false';
-      throw new Error(`3X-UI API Error: ${errorMsg}`);
-    }
-
-    return response.data;
-  } catch (error: any) {
-    console.error("=== 3X-UI ERROR ===");
-    console.error(error.response?.status);
-    console.error(error.response?.data);
-    console.error(error.message);
-    throw error;
   }
+
+  throw lastErr || new Error('Failed to add client to 3X-UI across all endpoints');
 };
 
 const activeProvisionings = new Set<string>();
@@ -741,6 +793,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   const inboundId = Number(template.inbound_id || template.inboundId);
+  console.log(`[Provisioning Audit] Template inbound_id: ${inboundId}`);
   console.log(`[Purchase Flow] DEBUG: Selected Template ID: ${template.id}`);
   console.log(`[Purchase Flow] DEBUG: Template inbound_id: ${template.inbound_id}`);
   console.log(`[Purchase Flow] DEBUG: Template inboundId: ${template.inboundId}`);
@@ -975,8 +1028,10 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     try {
       const config = await getXuiConfig();
       const token = config.apiToken || config.password;
-      const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, `/panel/api/clients/update/${uuid}`);
-      const clientAxios = createAxiosInstance(baseUrl);
+      const updateEndpoints = [
+        `/panel/api/inbounds/updateClient/${uuid}`,
+        `/panel/api/clients/update/${uuid}`
+      ];
 
       const updatePayload = {
         client: {
@@ -992,8 +1047,30 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
         inboundIds: [inboundId]
       };
 
-      console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI:', JSON.stringify(updatePayload, null, 2));
-      await clientAxios.post(fullPath, updatePayload, { headers: { Authorization: `Bearer ${token}` } });
+      console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI payload:', JSON.stringify(updatePayload, null, 2));
+
+      let updated = false;
+      for (const endpoint of updateEndpoints) {
+        try {
+          const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
+          const clientAxios = createAxiosInstance(baseUrl);
+          console.log(`[3X-UI Provisioning] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(updatePayload));
+
+          const res = await clientAxios.post(fullPath, updatePayload, { headers: { Authorization: `Bearer ${token}` } });
+          console.log(`[3X-UI Provisioning] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${res.status} ${res.statusText} | Response body:`, JSON.stringify(res.data));
+
+          if ((res.status === 200 || res.status === 201) && (!res.data || res.data.success !== false)) {
+            updated = true;
+            break;
+          }
+        } catch (epErr: any) {
+          logAxiosError(epErr);
+        }
+      }
+
+      if (!updated) {
+        console.warn('[3X-UI Provisioning] Update of existing client settings failed across all endpoints.');
+      }
     } catch (updErr: any) {
       console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', updErr?.message || updErr);
     }
@@ -1066,6 +1143,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     expiry_date: new Date(expiryMs).toISOString(),
     expiry_time: expiryMs,
     total_bytes: totalBytes,
+    inbound_id: inboundId,
     status: 'active',
     enable: true,
     is_trial: isTrialOrder,
@@ -1092,6 +1170,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (accErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_accounts':", accErr);
     throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
+  }
+
+  const { data: savedAcc } = await dbClient.from('vpn_accounts').select('inbound_id').eq('order_id', order.id).maybeSingle();
+  console.log(`[Provisioning Audit] Database inbound_id after save (vpn_accounts): ${savedAcc?.inbound_id}`);
+  if (savedAcc?.inbound_id !== inboundId) {
+    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedAcc?.inbound_id} in vpn_accounts!`);
   }
 
   // Step 5: Upsert vpn_configs
@@ -1143,6 +1227,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     throw new Error(`Database update failed for table 'vpn_configs': ${confErr.message || JSON.stringify(confErr)}`);
   }
 
+  const { data: savedConfig } = await dbClient.from('vpn_configs').select('inbound_id').eq('order_id', order.id).maybeSingle();
+  console.log(`[Provisioning Audit] Database inbound_id after save (vpn_configs): ${savedConfig?.inbound_id}`);
+  if (savedConfig?.inbound_id !== inboundId) {
+    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedConfig?.inbound_id} in vpn_configs!`);
+  }
+
   // Step 6: Update orders (payment_status='Paid', status='completed')
   const ordersPayload: any = {
     payment_status: 'Paid',
@@ -1151,6 +1241,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     client_uuid: uuid,
     vless_url: vlessUrl,
     subscription_url: subscriptionUrl,
+    inbound_id: inboundId,
     expiry_date: new Date(expiryMs).toISOString(),
     is_trial: isTrialOrder,
     activated_at: new Date().toISOString(),
@@ -1163,6 +1254,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (orderUpdateErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
+  }
+
+  const { data: savedOrder } = await dbClient.from('orders').select('inbound_id').eq('id', order.id).maybeSingle();
+  console.log(`[Provisioning Audit] Database inbound_id after save (orders): ${savedOrder?.inbound_id}`);
+  if (savedOrder?.inbound_id !== inboundId) {
+    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedOrder?.inbound_id} in orders!`);
   }
 
   // Step 7: Create customer notification in notifications table
