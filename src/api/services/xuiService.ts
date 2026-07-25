@@ -76,6 +76,8 @@ const getXuiConfig = async (): Promise<XuiConfig> => {
   
   return {
     panelUrl: data.panelUrl || '',
+    username: data.username || 'admin',
+    password: data.password || data.apiToken || '',
     apiToken: data.apiToken || '',
     panelName: data.panelName || ''
   } as XuiConfig;
@@ -140,15 +142,49 @@ const createAxiosInstance = (baseUrl: string) => {
   });
 };
 
+const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, string>> => {
+  const username = config.username || 'admin';
+  const password = config.password || config.apiToken;
+  
+  if (!password) {
+    throw new Error('API token or password is missing in 3X-UI settings');
+  }
+
+  const { baseUrl } = parseUrl(config.panelUrl);
+  const client = createAxiosInstance(baseUrl);
+
+  const loginEndpoints = ['/login', '/panel/login'];
+  let cookieHeader = '';
+
+  for (const loginEp of loginEndpoints) {
+    try {
+      const res = await client.post(loginEp, {
+        username,
+        password
+      });
+      const setCookie = res.headers['set-cookie'];
+      if (setCookie && Array.isArray(setCookie)) {
+        cookieHeader = setCookie.map(c => c.split(';')[0]).join('; ');
+        console.log(`[xuiService] Successfully authenticated via ${loginEp} session login`);
+        break;
+      }
+    } catch (e: any) {
+      // Continue to next login endpoint or fallback
+    }
+  }
+
+  const headers: Record<string, string> = {};
+  if (cookieHeader) {
+    headers['Cookie'] = cookieHeader;
+  }
+  headers['Authorization'] = `Bearer ${password}`;
+  return headers;
+};
+
 const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
   console.log(`[xuiService] [FUNCTION ENTERED] requestApi - Endpoint: ${endpoint}, Method: ${method}`);
   const config = await getXuiConfig();
-  
-  // The frontend stores the token in the password field, or fallback to apiToken if provided
-  const token = config.apiToken || config.password;
-  if (!token) {
-    throw new Error('API token is missing in 3X-UI settings');
-  }
+  const headers = await getXuiAuthHeaders(config);
 
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
@@ -160,9 +196,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
       url: fullPath,
       method,
       data,
-      headers: {
-        Authorization: `Bearer ${token}`
-      }
+      headers
     });
 
     console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
@@ -184,12 +218,9 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
 };
 
 export const testApiConnection = async (config: XuiConfig): Promise<boolean> => {
-  const token = config.apiToken || config.password;
-  if (!token) {
-    throw new Error('API token is missing');
-  }
+  const headers = await getXuiAuthHeaders(config);
 
-  const endpoints = ['/panel/api/inbounds/list', '/panel/api/inbounds', '/api/inbounds'];
+  const endpoints = ['/panel/api/inbounds/list', '/panel/api/inbounds', '/api/inbounds/list', '/api/inbounds'];
   let lastError: any = null;
 
   for (const ep of endpoints) {
@@ -200,9 +231,7 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
       const response = await client.request({
         url: fullPath,
         method: 'GET',
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
+        headers
       });
       console.log(`[xuiService] [TEST API CONNECTION RESPONSE] Full request URL: ${fullUrl} | HTTP method: GET | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
 
@@ -786,14 +815,21 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('[Purchase Flow] Loaded template:', JSON.stringify(template, null, 2));
 
   // Requirement 2: Ensure inbound_id comes from template
-  if (!template.inbound_id && !template.inboundId) {
+  const rawInboundId = template.inbound_id !== undefined && template.inbound_id !== null ? template.inbound_id : template.inboundId;
+  if (rawInboundId === undefined || rawInboundId === null || rawInboundId === '') {
     const errorMsg = `Provisioning template '${template.id}' for package '${packageName}' is missing 'inbound_id'.`;
     console.error(`[Purchase Flow] Error: ${errorMsg}`);
     throw new Error(errorMsg);
   }
 
-  const inboundId = Number(template.inbound_id || template.inboundId);
-  console.log(`[Provisioning Audit] Template inbound_id: ${inboundId}`);
+  const inboundId = Number(rawInboundId);
+  if (isNaN(inboundId) || inboundId <= 0) {
+    const errorMsg = `Provisioning template '${template.id}' for package '${packageName}' has invalid inbound_id '${rawInboundId}'.`;
+    console.error(`[Purchase Flow] Error: ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  console.log(`[Provisioning Audit] Template inbound_id validated: ${inboundId}`);
   console.log(`[Purchase Flow] DEBUG: Selected Template ID: ${template.id}`);
   console.log(`[Purchase Flow] DEBUG: Template inbound_id: ${template.inbound_id}`);
   console.log(`[Purchase Flow] DEBUG: Template inboundId: ${template.inboundId}`);
@@ -1143,7 +1179,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     expiry_date: new Date(expiryMs).toISOString(),
     expiry_time: expiryMs,
     total_bytes: totalBytes,
-    inbound_id: inboundId,
     status: 'active',
     enable: true,
     is_trial: isTrialOrder,
@@ -1170,12 +1205,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (accErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_accounts':", accErr);
     throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
-  }
-
-  const { data: savedAcc } = await dbClient.from('vpn_accounts').select('inbound_id').eq('order_id', order.id).maybeSingle();
-  console.log(`[Provisioning Audit] Database inbound_id after save (vpn_accounts): ${savedAcc?.inbound_id}`);
-  if (savedAcc?.inbound_id !== inboundId) {
-    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedAcc?.inbound_id} in vpn_accounts!`);
   }
 
   // Step 5: Upsert vpn_configs
@@ -1229,8 +1258,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   const { data: savedConfig } = await dbClient.from('vpn_configs').select('inbound_id').eq('order_id', order.id).maybeSingle();
   console.log(`[Provisioning Audit] Database inbound_id after save (vpn_configs): ${savedConfig?.inbound_id}`);
-  if (savedConfig?.inbound_id !== inboundId) {
-    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedConfig?.inbound_id} in vpn_configs!`);
+  if (!savedConfig || Number(savedConfig.inbound_id) !== Number(inboundId)) {
+    console.error(`[Provisioning Audit] ERROR: inbound_id in vpn_configs after save is ${savedConfig?.inbound_id}, expected ${inboundId}`);
+    throw new Error(`Failed to persist inbound_id in vpn_configs: expected ${inboundId}, got ${savedConfig?.inbound_id}`);
   }
 
   // Step 6: Update orders (payment_status='Paid', status='completed')
@@ -1258,8 +1288,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   const { data: savedOrder } = await dbClient.from('orders').select('inbound_id').eq('id', order.id).maybeSingle();
   console.log(`[Provisioning Audit] Database inbound_id after save (orders): ${savedOrder?.inbound_id}`);
-  if (savedOrder?.inbound_id !== inboundId) {
-    console.warn(`[Provisioning Audit] WARNING: inbound_id changed from ${inboundId} to ${savedOrder?.inbound_id} in orders!`);
+  if (!savedOrder || Number(savedOrder.inbound_id) !== Number(inboundId)) {
+    console.error(`[Provisioning Audit] ERROR: inbound_id in orders after save is ${savedOrder?.inbound_id}, expected ${inboundId}`);
+    throw new Error(`Failed to persist inbound_id in orders: expected ${inboundId}, got ${savedOrder?.inbound_id}`);
   }
 
   // Step 7: Create customer notification in notifications table

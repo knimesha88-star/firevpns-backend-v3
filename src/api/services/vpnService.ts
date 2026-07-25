@@ -12,6 +12,19 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
 
+  // Query vpn_configs to obtain inbound_id correctly
+  const { data: vpnConfigsData } = await supabase.from('vpn_configs').select('*');
+  const inboundMap = new Map<string, number>();
+  if (vpnConfigsData && Array.isArray(vpnConfigsData)) {
+    vpnConfigsData.forEach(cfg => {
+      const ibId = Number(cfg.inbound_id);
+      if (!isNaN(ibId) && ibId > 0) {
+        if (cfg.order_id) inboundMap.set(String(cfg.order_id), ibId);
+        if (cfg.uuid) inboundMap.set(String(cfg.uuid).toLowerCase(), ibId);
+      }
+    });
+  }
+
   const configs: any[] = [];
 
   // 1. Query vpn_accounts table
@@ -34,13 +47,17 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         
         if (matchesUser && isActive && acc.vless_url) {
           const isTrialAcc = !!(acc.is_trial || String(acc.order_id || '').startsWith('TRIAL-'));
+          const orderId = acc.order_id || acc.id;
+          const configUuid = acc.uuid;
+          const inboundId = inboundMap.get(String(orderId)) || (configUuid ? inboundMap.get(String(configUuid).toLowerCase()) : null) || null;
+
           configs.push({
-            orderId: acc.order_id || acc.id,
+            orderId,
             packageName: acc.remark || 'FIREVPN Package',
             configUrl: acc.vless_url,
             uuid: acc.uuid,
             expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
-            inboundId: acc.inbound_id || null,
+            inboundId,
             trafficLimit: isTrialAcc ? '1GB' : (acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
             serverNode: acc.server_name || 'Singapore',
             _rawLimit: isTrialAcc ? 1 * 1024 * 1024 * 1024 : (acc.total_bytes || 0),
@@ -83,14 +100,16 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
         const isTrialOrd = !!(pmJson.is_trial || pmJson.isTrial || pmJson.paymentMethod === 'Free Trial' || String(data.order_id || data.id || '').startsWith('TRIAL-'));
         const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
+        const orderId = data.id || data.order_id;
+        const inboundId = inboundMap.get(String(orderId)) || (clientUuid ? inboundMap.get(String(clientUuid).toLowerCase()) : null) || data.inbound_id || null;
 
         configs.push({
-          orderId: data.id || data.order_id,
+          orderId,
           packageName: data.package_name || data.plan || 'FIREVPN Package',
           configUrl: vlessUrl,
           uuid: clientUuid,
           expiryDate: data.expiry_date || data.expiryDate || '',
-          inboundId: data.inbound_id || null,
+          inboundId,
           trafficLimit: isTrialOrd ? '1GB' : (data.traffic_limit || 'Unlimited'),
           serverNode: data.server || 'Singapore',
           _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : 0,
