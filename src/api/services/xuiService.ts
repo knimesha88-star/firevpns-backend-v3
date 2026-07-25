@@ -1041,30 +1041,13 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let accErr: any = null;
   if (existingAcc && existingAcc.id) {
     vpnAccountId = existingAcc.id;
-    let { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
-    if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
-      console.warn('[3X-UI Provisioning DB] Retrying vpn_accounts update without subscription_url');
-      delete accPayload.subscription_url;
-      const { error: retryErr } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
-      error = retryErr;
-    }
+    const { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
     accErr = error;
   } else {
-    let { data: newAcc, error } = await dbClient.from('vpn_accounts').insert({
+    const { data: newAcc, error } = await dbClient.from('vpn_accounts').insert({
       ...accPayload,
       created_at: new Date().toISOString()
     }).select('id').maybeSingle();
-
-    if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
-      console.warn('[3X-UI Provisioning DB] Retrying vpn_accounts insert without subscription_url');
-      delete accPayload.subscription_url;
-      const { data: newAcc2, error: retryErr } = await dbClient.from('vpn_accounts').insert({
-        ...accPayload,
-        created_at: new Date().toISOString()
-      }).select('id').maybeSingle();
-      newAcc = newAcc2;
-      error = retryErr;
-    }
     accErr = error;
     vpnAccountId = newAcc?.id || vpnAccountId;
   }
@@ -1072,7 +1055,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (accErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_accounts':", accErr);
     throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
-  } else {
   }
 
   // Step 5: Upsert vpn_configs
@@ -1122,10 +1104,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (confErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_configs':", confErr);
     throw new Error(`Database update failed for table 'vpn_configs': ${confErr.message || JSON.stringify(confErr)}`);
-  } else {
   }
 
-  // Step 6: Update orders (payment_status='Paid', status='completed', provisioning_status='completed')
+  // Step 6: Update orders (payment_status='Paid', status='completed')
   const ordersPayload: any = {
     payment_status: 'Paid',
     status: 'completed',
@@ -1140,20 +1121,11 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     updated_at: new Date().toISOString()
   };
 
-  let { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
-
-  if (orderUpdateErr && (orderUpdateErr.code === 'PGRST204' || orderUpdateErr.message?.includes('column'))) {
-    console.warn("[3X-UI Provisioning DB] Column missing on 'orders', retrying update without provisioning_status / subscription_url");
-    delete ordersPayload.provisioning_status;
-    delete ordersPayload.subscription_url;
-    const { error: retryErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
-    orderUpdateErr = retryErr;
-  }
+  const { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
 
   if (orderUpdateErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
-  } else {
   }
 
   // Step 7: Create customer notification in notifications table
