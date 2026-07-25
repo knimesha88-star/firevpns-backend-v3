@@ -665,7 +665,7 @@ export const add3XUiClient = async (
     throw new Error('API token is missing in 3X-UI settings');
   }
 
-  const endpoints = ['/panel/api/inbounds/addClient', '/panel/api/clients/add'];
+  const endpoint = '/panel/api/inbounds/addClient';
   let lastErr: any = null;
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
@@ -685,40 +685,38 @@ export const add3XUiClient = async (
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
-  for (const endpoint of endpoints) {
-    try {
-      const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-      const client = createAxiosInstance(baseUrl);
-      
-      console.log(`[xuiService] [DEBUG] Preparing POST request`);
-      console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
-      console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
-      console.log(`[xuiService] [DEBUG] Method: POST`);
-      console.log(`[xuiService] [DEBUG] Payload: ${JSON.stringify(payload)}`);
-      console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(payload));
+  try {
+    const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
+    const client = createAxiosInstance(baseUrl);
+    
+    console.log(`[xuiService] [DEBUG] Preparing POST request`);
+    console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
+    console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
+    console.log(`[xuiService] [DEBUG] Method: POST`);
+    console.log(`[xuiService] [DEBUG] Payload: ${JSON.stringify(payload)}`);
+    console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(payload));
 
-      const response = await client.request({
-        url: fullPath,
-        method: 'POST',
-        data: payload,
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      });
-
-      console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
-
-      if ((response.status === 200 || response.status === 201) && (!response.data || response.data.success !== false)) {
-        return response.data;
+    const response = await client.request({
+      url: fullPath,
+      method: 'POST',
+      data: payload,
+      headers: {
+        Authorization: `Bearer ${token}`
       }
-      lastErr = new Error(`3X-UI API Error: HTTP status ${response.status}, msg: ${response.data?.msg || 'unknown'}`);
-    } catch (error: any) {
-      lastErr = error;
-      logAxiosError(error);
+    });
+
+    console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
+
+    if ((response.status === 200 || response.status === 201) && (!response.data || response.data.success !== false)) {
+      return response.data;
     }
+    lastErr = new Error(`3X-UI API Error: HTTP status ${response.status}, msg: ${response.data?.msg || 'unknown'}`);
+  } catch (error: any) {
+    lastErr = error;
+    logAxiosError(error);
   }
 
-  throw lastErr || new Error('Failed to add client to 3X-UI across all endpoints');
+  throw lastErr || new Error('Failed to add client to 3X-UI');
 };
 
 const activeProvisionings = new Set<string>();
