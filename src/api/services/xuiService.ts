@@ -366,38 +366,90 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
   throw new Error(`Client with email ${email} not found in 3X-UI inbounds`);
 };
 
-export const findProvisioningTemplate = async (packageName: string): Promise<any | null> => {
-  const targetName = (packageName || '').trim().toLowerCase();
+export const findProvisioningTemplate = async (
+  query: string | { templateId?: string; packageName?: string }
+): Promise<any | null> => {
+  let templateId = '';
+  let packageName = '';
+
+  if (typeof query === 'string') {
+    packageName = query;
+  } else if (query && typeof query === 'object') {
+    templateId = query.templateId || '';
+    packageName = query.packageName || '';
+  }
+
+  console.log(`[Provisioning Template Lookup] Searching for template - ID: '${templateId}', Package Name: '${packageName}'`);
 
   try {
-    const { data: snapshot } = await supabase.from('provision_templates').select('*');
+    const { data: snapshot, error: fetchErr } = await supabase.from('provision_templates').select('*');
+    if (fetchErr) {
+      console.error('[Provisioning Template Lookup] Error fetching provision_templates:', fetchErr);
+    }
+
     if (snapshot && snapshot.length > 0) {
       const enabledTemplates = snapshot.filter(item => item.enabled !== false);
-      if (enabledTemplates.length === 0) return null;
-
-      if (targetName) {
-        // 1. Exact match on package_name
-        const exact = enabledTemplates.find(item => {
-          const docName = String(item.package_name || item.name || item.id).trim().toLowerCase();
-          return docName === targetName || docName === targetName.replace(/_/g, ' ') || docName.replace(/_/g, ' ') === targetName;
-        });
-        if (exact) return { id: exact.id, ...exact };
-
-        // 2. Substring / Partial match
-        const partial = enabledTemplates.find(item => {
-          const docName = String(item.package_name || item.name || item.id).trim().toLowerCase();
-          return targetName.includes(docName) || docName.includes(targetName);
-        });
-        if (partial) return { id: partial.id, ...partial };
+      if (enabledTemplates.length === 0) {
+        console.warn('[Provisioning Template Lookup] No enabled templates found in provision_templates.');
+        return null;
       }
 
-      // 3. Fallback to first enabled template
-      return { id: enabledTemplates[0].id, ...enabledTemplates[0] };
+      // 1. Exact match by template ID
+      if (templateId) {
+        const idMatch = enabledTemplates.find(item => String(item.id).trim() === templateId.trim());
+        if (idMatch) {
+          console.log(`[Provisioning Template Lookup] Found exact match by template ID '${templateId}': '${idMatch.package_name || idMatch.name}'`);
+          return { id: idMatch.id, ...idMatch };
+        }
+      }
+
+      const targetStr = (packageName || '').trim();
+      if (targetStr) {
+        const targetLower = targetStr.toLowerCase();
+        const targetNormalized = targetLower.replace(/[^a-z0-9]/g, '');
+
+        // 2. Exact match on package_name or name or id
+        const exact = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+          return docName === targetLower || docName.replace(/_/g, ' ') === targetLower.replace(/_/g, ' ');
+        });
+        if (exact) {
+          console.log(`[Provisioning Template Lookup] Found exact match by package name '${packageName}': '${exact.package_name || exact.name}' (ID: ${exact.id})`);
+          return { id: exact.id, ...exact };
+        }
+
+        // 3. Normalized match (handles typos or formatting differences)
+        const alphaMatch = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+          const docNormalized = docName.replace(/[^a-z0-9]/g, '');
+          if (docNormalized === targetNormalized) return true;
+          if (docNormalized.length > 5 && targetNormalized.length > 5) {
+            return docNormalized.includes(targetNormalized) || targetNormalized.includes(docNormalized);
+          }
+          return false;
+        });
+        if (alphaMatch) {
+          console.log(`[Provisioning Template Lookup] Found normalized/fuzzy match for '${packageName}': '${alphaMatch.package_name || alphaMatch.name}' (ID: ${alphaMatch.id})`);
+          return { id: alphaMatch.id, ...alphaMatch };
+        }
+
+        // 4. Substring / Partial match
+        const partial = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+          return targetLower.includes(docName) || docName.includes(targetLower);
+        });
+        if (partial) {
+          console.log(`[Provisioning Template Lookup] Found substring match for '${packageName}': '${partial.package_name || partial.name}' (ID: ${partial.id})`);
+          return { id: partial.id, ...partial };
+        }
+      }
     }
   } catch (e) {
     console.warn(`[3X-UI Service] Error checking provision_templates:`, e);
   }
 
+  // Requirement 7: Return proper error / null if not found. Do NOT silently fall back to the first template!
+  console.error(`[Provisioning Template Lookup] Error: Template not found for ID: '${templateId}', Package Name: '${packageName}'. Returning null.`);
   return null;
 };
 
@@ -630,16 +682,33 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     }
   }
 
-  const packageName = extra.package_name || extra.plan || extra.package || order.package_name || '';
+  const templateId = extra.template_id || extra.templateId || order.template_id || order.templateId || '';
+  const packageName = extra.package_name || extra.packageName || extra.plan || extra.package || order.package_name || '';
   const customerName = extra.configurationName || extra.customerName || extra.name || extra.full_name || (order.email ? order.email.split('@')[0] : 'Customer');
   const customerId = order.customer_id || extra.customer_id || '';
 
-  // Step 1: Find the provisioning template
-  const template = await findProvisioningTemplate(packageName);
+  console.log('=== [PURCHASE FLOW LOGGING START] ===');
+  console.log('[Purchase Flow] Purchase request payload:', {
+    order_id: order.id || order.order_id,
+    customer_id: order.customer_id,
+    email: order.email,
+    package_name: order.package_name,
+    amount: order.amount,
+    payment_method_raw: order.payment_method,
+    parsed_extra: extra
+  });
+  console.log('[Purchase Flow] Backend received template ID:', templateId || '(none provided)', '| Package Name:', packageName);
+
+  // Step 1: Find the provisioning template (returns null if not found; NO fallback to template[0])
+  const template = await findProvisioningTemplate({ templateId, packageName });
   if (!template) {
-    console.error(`[3X-UI Provisioning] Provisioning template not found for package '${packageName}'.`);
-    throw new Error(`Provisioning template not found for package '${packageName}'.`);
+    console.error(`[Purchase Flow] Error: Provisioning template not found for package '${packageName}' (Template ID: '${templateId}').`);
+    throw new Error(`Provisioning template not found for package '${packageName || templateId}'.`);
   }
+
+  console.log('[Purchase Flow] Selected template ID:', template.id);
+  console.log('[Purchase Flow] Selected template name:', template.package_name || template.name);
+  console.log('[Purchase Flow] Loaded template:', JSON.stringify(template, null, 2));
 
   const inboundId = Number(template.inbound_id) || 1;
   const address = template.address || '';
@@ -667,7 +736,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     }
   }
 
-  // Duration & Traffic calculations
+  // Duration & Traffic calculations based on loaded template profiles
   const duration = extra.duration || '1 Month';
   let days = 30;
   if (template.duration_profiles && template.duration_profiles[duration]) {
@@ -679,12 +748,29 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       days = String(duration).toLowerCase().includes('month') ? num * 30 : num;
     }
   }
-  const expiryMs = Date.now() + (days * 24 * 60 * 60 * 1000);
+  let expiryMs = Date.now() + (days * 24 * 60 * 60 * 1000);
 
   let totalBytes = 0;
-  const combinedPlanStr = `${extra.packageType || ''} ${packageName || ''} ${extra.plan || ''} ${extra.traffic || ''}`.toLowerCase();
-  if (combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100')) {
-    totalBytes = 100 * 1024 * 1024 * 1024;
+  const packageTypeKey = extra.packageType || extra.type || '';
+  if (template.traffic_profiles && template.traffic_profiles[packageTypeKey] !== undefined) {
+    const gbVal = Number(template.traffic_profiles[packageTypeKey]);
+    totalBytes = gbVal > 0 ? gbVal * 1024 * 1024 * 1024 : 0;
+  } else if (template.traffic_profiles && template.traffic_profiles['100GB'] !== undefined && String(packageTypeKey).includes('100')) {
+    const gbVal = Number(template.traffic_profiles['100GB']);
+    totalBytes = gbVal > 0 ? gbVal * 1024 * 1024 * 1024 : 0;
+  } else {
+    const combinedPlanStr = `${extra.packageType || ''} ${packageName || ''} ${extra.plan || ''} ${extra.traffic || ''}`.toLowerCase();
+    if (combinedPlanStr.includes('100gb') || combinedPlanStr.includes('100 gb') || combinedPlanStr.includes('100')) {
+      totalBytes = 100 * 1024 * 1024 * 1024;
+    }
+  }
+
+  // Trial Override: Apply 1 Day (24h) and 1 GB Limit strictly for Free Trials
+  const isTrialOrder = !!(extra.is_trial || extra.isTrial || extra.paymentMethod === 'Free Trial' || extra.duration === '1 Day' || String(order.order_id || '').startsWith('TRIAL-'));
+  if (isTrialOrder) {
+    days = 1;
+    totalBytes = 1 * 1024 * 1024 * 1024; // 1 GB
+    expiryMs = Date.now() + (1 * 24 * 60 * 60 * 1000);
   }
 
   let uuid = existingClient ? existingClient.id : crypto.randomUUID();
@@ -706,7 +792,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     streamObj = inbound.streamSettings;
   }
 
-  const security = streamObj.security || 'none';
+  const security = streamObj.security || template.security || 'none';
   let flow = '';
   if (security === 'reality') {
     const reality = streamObj.realitySettings || streamObj.realitySettings?.settings || {};
@@ -715,6 +801,34 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   } else {
     flow = template.flow || '';
   }
+
+  console.log('[Purchase Flow] Inbound ID:', targetInboundId);
+  console.log('[Purchase Flow] Protocol:', inbound.protocol);
+  console.log('[Purchase Flow] Configuration used:', {
+    address,
+    sni,
+    remarkFormat,
+    remark,
+    flow,
+    security,
+    totalBytes,
+    expiryMs,
+    durationDays: days,
+    trafficLimitGB: totalBytes > 0 ? totalBytes / (1024 * 1024 * 1024) : 'Unlimited'
+  });
+
+  console.log('[Purchase Flow] Final payload sent to 3X-UI:', {
+    inboundId: targetInboundId,
+    clientData: {
+      uuid,
+      email: remark,
+      totalBytes,
+      expiryMs,
+      subId,
+      flow
+    }
+  });
+  console.log('=== [PURCHASE FLOW LOGGING END] ===');
 
   // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
   try {

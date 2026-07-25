@@ -20,8 +20,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     const { data: vpnAccs } = await query.order('created_at', { ascending: false });
 
     if (vpnAccs && Array.isArray(vpnAccs)) {
-      vpnAccs.forEach((acc, index) => {
-      });
       vpnAccs.forEach(acc => {
         const docUserId = String(acc.user_id || '').trim();
         const docEmail = String(acc.email || '').toLowerCase().trim();
@@ -29,6 +27,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         const isActive = !acc.status || acc.status === 'active' || acc.status === 'enabled';
         
         if (matchesUser && isActive && acc.vless_url) {
+          const isTrialAcc = !!(acc.is_trial || String(acc.order_id || '').startsWith('TRIAL-'));
           configs.push({
             orderId: acc.order_id || acc.id,
             packageName: acc.remark || 'FIREVPN Package',
@@ -36,9 +35,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
             uuid: acc.uuid,
             expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
             inboundId: null,
-            trafficLimit: acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+            trafficLimit: isTrialAcc ? '1GB' : (acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
             serverNode: acc.server_name || 'Singapore',
-            _rawLimit: acc.total_bytes || 0,
+            _rawLimit: isTrialAcc ? 1 * 1024 * 1024 * 1024 : (acc.total_bytes || 0),
+            isTrial: isTrialAcc,
+            templateId: acc.template_id || null,
           });
         }
       });
@@ -62,7 +63,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     return matchesUser && isApproved;
   });
 
-
   matchedDocs.forEach(data => {
     const vlessUrl = data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '';
     const clientUuid = data.client_uuid || data.vpn_credentials?.password || data.uuid || '';
@@ -70,6 +70,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     if (vlessUrl) {
       const exists = configs.some(c => c.uuid && clientUuid && c.uuid.toLowerCase() === clientUuid.toLowerCase());
       if (!exists) {
+        let pmJson: any = {};
+        try {
+          pmJson = typeof data.payment_method === 'string' ? JSON.parse(data.payment_method) : (data.payment_method || {});
+        } catch(e) {}
+
+        const isTrialOrd = !!(pmJson.is_trial || pmJson.isTrial || pmJson.paymentMethod === 'Free Trial' || String(data.order_id || data.id || '').startsWith('TRIAL-'));
+        const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
+
         configs.push({
           orderId: data.id || data.order_id,
           packageName: data.package_name || data.plan || 'FIREVPN Package',
@@ -77,9 +85,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           uuid: clientUuid,
           expiryDate: data.expiry_date || data.expiryDate || '',
           inboundId: data.inbound_id || null,
-          trafficLimit: data.traffic_limit || 'Unlimited',
+          trafficLimit: isTrialOrd ? '1GB' : (data.traffic_limit || 'Unlimited'),
           serverNode: data.server || 'Singapore',
-          _rawLimit: 0,
+          _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : 0,
+          isTrial: isTrialOrd,
+          templateId: tplId,
         });
       }
     }
@@ -232,7 +242,9 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       security,
       serverAddress,
       subscriptionName: config.packageName,
-      name: config.packageName
+      name: config.packageName,
+      isTrial: !!config.isTrial,
+      templateId: config.templateId || null,
     };
   });
 

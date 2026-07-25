@@ -445,6 +445,100 @@ VPN has been generated successfully.`;
   }
 };
 
+export interface TrialRequestNotificationData {
+  customerName?: string;
+  email?: string;
+  packageName?: string;
+  templateName?: string;
+  trialLimits?: string;
+  requestTime?: string;
+  requestId?: string;
+}
+
+export const sendTrialRequestNotification = async (data: TrialRequestNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram trial request notification.');
+    return;
+  }
+
+  const customerName = data.customerName || 'N/A';
+  const email = data.email || 'N/A';
+  const packageName = data.packageName || 'N/A';
+  const templateName = data.templateName || 'N/A';
+  const trialLimits = data.trialLimits || '1 GB / 1 Day';
+  const requestId = data.requestId || 'N/A';
+
+  let currentDateTime = data.requestTime;
+  if (!currentDateTime) {
+    try {
+      currentDateTime = new Date().toLocaleString('en-US', {
+        timeZone: 'Asia/Colombo',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
+    } catch (e) {
+      currentDateTime = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    }
+  }
+
+  const text = `🎁 NEW FREE TRIAL REQUEST
+
+━━━━━━━━━━━━━━━━━━━━
+
+👤 Customer Name
+${customerName}
+
+✉️ Customer Email
+${email}
+
+📦 Package Name
+${packageName}
+
+📑 Template Name
+${templateName}
+
+⚡ Trial Limits
+${trialLimits}
+
+🕒 Request Time
+${currentDateTime}
+
+🆔 Request ID
+${requestId}
+
+━━━━━━━━━━━━━━━━━━━━
+
+Status:
+🟡 Pending Admin Approval`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram trial request notification:', err?.message || err);
+  }
+};
+
 export interface OrderRejectedNotificationData {
   customerEmail?: string;
   email?: string;
