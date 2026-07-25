@@ -7,6 +7,10 @@ import crypto from 'crypto';
 
 import https from 'https';
 
+// Requirement 8: Define the grace period as a constant or environment variable
+export const TRIAL_GRACE_PERIOD_MINUTES = Number(process.env.TRIAL_GRACE_PERIOD_MINUTES) || 5;
+export const TRIAL_GRACE_PERIOD_MS = TRIAL_GRACE_PERIOD_MINUTES * 60 * 1000;
+
 export interface XuiConfig {
   panelUrl: string;
   username?: string;
@@ -1130,16 +1134,49 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Step 7: Create customer notification in notifications table
   try {
-    const notif = await createCustomerNotification({
-      userId: validUserId,
-      userEmail: order.email,
-      title: 'VPN Activated',
-      message: 'Your VPN has been created successfully and is ready to use.',
-      type: 'success',
-      orderId: order.id
-    });
-  } catch (notifErr) {
-    console.warn('[3X-UI Provisioning DB] Customer notification warning:', notifErr);
+    if (isTrialOrder) {
+      console.log('[3X-UI Provisioning DB] Triggering Trial Approved and VPN Created notifications');
+      await createCustomerNotification({
+        userId: validUserId,
+        userEmail: order.email,
+        title: 'Trial Approved',
+        message: `Your free trial request for "${packageName}" has been approved!`,
+        type: 'trial_approved',
+        orderId: order.id,
+        vpnName: packageName
+      });
+      await createCustomerNotification({
+        userId: validUserId,
+        userEmail: order.email,
+        title: 'VPN Created',
+        message: `Your trial VPN configuration "${packageName}" has been created successfully and is ready to use.`,
+        type: 'vpn_created',
+        orderId: order.id,
+        vpnName: packageName
+      });
+    } else {
+      console.log('[3X-UI Provisioning DB] Triggering Payment Approved and VPN Created notifications');
+      await createCustomerNotification({
+        userId: validUserId,
+        userEmail: order.email,
+        title: 'Payment Approved',
+        message: `Your payment for "${packageName}" has been verified and approved!`,
+        type: 'payment_approved',
+        orderId: order.id,
+        vpnName: packageName
+      });
+      await createCustomerNotification({
+        userId: validUserId,
+        userEmail: order.email,
+        title: 'VPN Created',
+        message: `Your VPN configuration "${packageName}" has been created successfully and is ready to use.`,
+        type: 'vpn_created',
+        orderId: order.id,
+        vpnName: packageName
+      });
+    }
+  } catch (notifErr: any) {
+    console.error('[3X-UI Provisioning DB] CRITICAL: Customer notification creation failed:', notifErr.message || notifErr);
   }
 
   // Step 8: Send Telegram notification and return success
@@ -1341,9 +1378,14 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       let isExpiredByTime = false;
       let isExpiredByData = false;
 
-      // Requirement 2: Trial expires when expires_at <= NOW()
-      if (trial.expiryMs && trial.expiryMs <= now) {
-        isExpiredByTime = true;
+      // Requirement 1, 3 & 4: Trial expires only when current_time >= expires_at + grace_period
+      if (trial.expiryMs) {
+        if (now >= trial.expiryMs + TRIAL_GRACE_PERIOD_MS) {
+          isExpiredByTime = true;
+          console.log(`[Trial Expiry Scheduler] Grace period completed: Order ID = ${trial.orderId}, UUID = ${trial.uuid}. Expiry = ${new Date(trial.expiryMs).toISOString()}, Grace Period End = ${new Date(trial.expiryMs + TRIAL_GRACE_PERIOD_MS).toISOString()}`);
+        } else if (now >= trial.expiryMs) {
+          console.log(`[Trial Expiry Scheduler] Trial entered grace period: Order ID = ${trial.orderId}, UUID = ${trial.uuid}. Expiry = ${new Date(trial.expiryMs).toISOString()}, Grace Period End = ${new Date(trial.expiryMs + TRIAL_GRACE_PERIOD_MS).toISOString()}`);
+        }
       }
 
       // Requirement 2: Or when user reaches the 1 GB data limit (1,073,741,824 bytes)
@@ -1366,37 +1408,97 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       }
 
       if (isExpiredByTime || isExpiredByData) {
-        // Requirement 3: Disable or remove VPN client from 3X-UI
+        console.log(`[Trial Expiry Scheduler] Trial found for expiration: Order ID = ${trial.orderId}, UUID = ${trial.uuid}, Email = ${trial.email}, Reason = ${isExpiredByTime ? 'Time Expired (Grace Period Completed)' : 'Data Limit (1GB) Reached'}, Expiry = ${trial.expiryMs ? new Date(trial.expiryMs).toISOString() : 'N/A'}`);
+
+        // Requirement 3 & 6: Disable or remove VPN client from 3X-UI. Do not mark database as expired if this fails.
+        let removedSuccessfully = true;
         if (trial.uuid) {
-          await disable3XUiClient(trial.inboundId, trial.uuid, trial.email);
+          try {
+            removedSuccessfully = await disable3XUiClient(trial.inboundId, trial.uuid, trial.email);
+            if (removedSuccessfully) {
+              console.log(`[Trial Expiry Scheduler] Trial successfully removed from 3X-UI: UUID = ${trial.uuid}, Email = ${trial.email}`);
+            } else {
+              console.error(`[Trial Expiry Scheduler] Error removing client ${trial.uuid} from 3X-UI: disable3XUiClient returned false.`);
+            }
+          } catch (err: any) {
+            removedSuccessfully = false;
+            console.error(`[Trial Expiry Scheduler] Error removing client ${trial.uuid} from 3X-UI:`, err.message || err);
+          }
         }
 
-        // Requirement 3 & 4: Mark trial as Expired in database (keep record for history)
+        if (!removedSuccessfully) {
+          console.warn(`[Trial Expiry Scheduler] 3X-UI panel is temporarily unavailable or client deletion failed for UUID: ${trial.uuid}. Skipping DB updates and retrying on next run.`);
+          continue;
+        }
+
+        // Requirement 3: Mark trial as Expired in database and record exact expiration time in updated_at (keep record for history)
+        const expirationTimeIso = new Date().toISOString();
+
         if (trial.type === 'config' || trial.id) {
-          await dbClient
+          const { error: cfgErr } = await dbClient
             .from('vpn_configs')
-            .update({ status: 'expired', enabled: false })
+            .update({ 
+              status: 'expired', 
+              enabled: false,
+              updated_at: expirationTimeIso
+            })
             .eq('id', trial.id);
+
+          if (cfgErr) {
+            console.error(`[Trial Expiry Scheduler] Database error updating vpn_configs for ID ${trial.id}:`, cfgErr);
+          } else {
+            console.log(`[Trial Expiry Scheduler] Database updated (vpn_configs) to status 'expired' and updated_at recorded for ID ${trial.id}`);
+          }
         }
 
         if (trial.orderId) {
-          await dbClient
+          const { error: accErr } = await dbClient
             .from('vpn_accounts')
-            .update({ status: 'expired', enable: false })
+            .update({ 
+              status: 'expired', 
+              enable: false,
+              updated_at: expirationTimeIso
+            })
             .eq('order_id', trial.orderId);
 
-          await dbClient
+          if (accErr) {
+            console.error(`[Trial Expiry Scheduler] Database error updating vpn_accounts for order ID ${trial.orderId}:`, accErr);
+          } else {
+            console.log(`[Trial Expiry Scheduler] Database updated (vpn_accounts) to status 'expired' and updated_at recorded for order ID ${trial.orderId}`);
+          }
+
+          const { error: ordErr } = await dbClient
             .from('orders')
-            .update({ status: 'expired', payment_status: 'Expired', updated_at: new Date().toISOString() })
+            .update({ 
+              status: 'expired', 
+              payment_status: 'Expired', 
+              updated_at: expirationTimeIso
+            })
             .eq('id', trial.orderId);
 
-          await dbClient
+          if (ordErr) {
+            console.error(`[Trial Expiry Scheduler] Database error updating orders (by ID) for ID ${trial.orderId}:`, ordErr);
+          } else {
+            console.log(`[Trial Expiry Scheduler] Database updated (orders table ID) to status 'expired' for ID ${trial.orderId}`);
+          }
+
+          const { error: ordErr2 } = await dbClient
             .from('orders')
-            .update({ status: 'expired', payment_status: 'Expired', updated_at: new Date().toISOString() })
+            .update({ 
+              status: 'expired', 
+              payment_status: 'Expired', 
+              updated_at: expirationTimeIso
+            })
             .eq('order_id', trial.orderId);
+
+          if (ordErr2) {
+            console.error(`[Trial Expiry Scheduler] Database error updating orders (by order_id) for ID ${trial.orderId}:`, ordErr2);
+          } else {
+            console.log(`[Trial Expiry Scheduler] Database updated (orders table order_id) to status 'expired' for ID ${trial.orderId}`);
+          }
         }
 
-        // Requirement 5: Show customer a dashboard notification
+        // Requirement 3 & 4: Create customer notification (idempotency check ensures never duplicated)
         const targetUserId = trial.customerUid;
         const targetEmail = trial.email;
 
@@ -1406,32 +1508,48 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
             .select('id')
             .eq('type', 'trial_expired');
 
-          if (trial.orderId) {
-            notifQuery = notifQuery.eq('order_id', trial.orderId);
+          if (targetUserId) {
+            notifQuery = notifQuery.eq('user_id', targetUserId);
           } else if (targetEmail) {
             notifQuery = notifQuery.eq('user_email', targetEmail);
           }
 
-          const { data: existingNotifs } = await notifQuery.maybeSingle();
+          if (trial.orderId) {
+            notifQuery = notifQuery.eq('order_id', trial.orderId);
+          }
+
+          const { data: existingNotifs, error: notifFetchErr } = await notifQuery.maybeSingle();
+
+          if (notifFetchErr) {
+            console.error(`[Trial Expiry Scheduler] Database error searching existing notifications:`, notifFetchErr);
+          }
 
           if (!existingNotifs) {
-            await createCustomerNotification({
-              userId: targetUserId || null,
-              userEmail: targetEmail,
-              title: 'Free Trial Expired',
-              message: 'Your free trial has ended. Upgrade to continue using FIREVPNs.',
-              type: 'trial_expired',
-              orderId: trial.orderId,
-              vpnName: trial.packageName
-            });
+            try {
+              await createCustomerNotification({
+                userId: targetUserId || null,
+                userEmail: targetEmail,
+                title: '⌛ Free Trial Expired',
+                message: 'Your 1 GB / 1 Day trial has ended. Purchase a VPN package to continue using FIREVPNs.',
+                type: 'trial_expired',
+                orderId: trial.orderId,
+                vpnName: trial.packageName
+              });
+              console.log(`[Trial Expiry Scheduler] Notification created successfully for user: ${targetUserId || targetEmail}`);
+            } catch (notifCreateErr: any) {
+              console.error(`[Trial Expiry Scheduler] Error creating customer notification:`, notifCreateErr.message || notifCreateErr);
+            }
+          } else {
+            console.log(`[Trial Expiry Scheduler] Idempotency: Skip duplicate notification for trial ID/Order: ${trial.orderId}`);
           }
         }
 
+        console.log(`[Trial Expiry Scheduler] Trial expired successfully: Order ID = ${trial.orderId}, UUID = ${trial.uuid}`);
         expiredCount++;
       }
     }
   } catch (err) {
-    console.warn('[Cleanup Expired Trials] Error during trial cleanup execution:', err);
+    console.error('[Cleanup Expired Trials] Error during trial cleanup execution:', err);
   }
 
   return { count: expiredCount };

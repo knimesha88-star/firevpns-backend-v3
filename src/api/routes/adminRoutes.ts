@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getStats, getUsers, approveOrder, rejectOrder, verifyPayment } from '../controllers/adminController.js';
+import { getStats, getUsers, approveOrder, rejectOrder, verifyPayment, publishAnnouncementNotification } from '../controllers/adminController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { adminMiddleware } from '../middleware/adminMiddleware.js';
 
@@ -16,6 +16,7 @@ router.post('/verify-payment', verifyPayment);
 router.post('/orders/:orderId/verify-payment', verifyPayment);
 router.post('/reject-order', rejectOrder);
 router.post('/orders/:orderId/reject', rejectOrder);
+router.post('/announcements/notify', publishAnnouncementNotification);
 
 export default router;
 

@@ -14,60 +14,74 @@ export interface CreateNotificationParams {
 export const createCustomerNotification = async (params: CreateNotificationParams): Promise<any> => {
   const { userId, userEmail, title, message, type = 'info', orderId, vpnName, vpnUuid } = params;
 
+  console.log(`[NotificationService] [ENTER] createCustomerNotification called with:`, {
+    userId,
+    userEmail,
+    title,
+    type,
+    orderId,
+    vpnName,
+    vpnUuid
+  });
+
+  let resolvedUserId = userId;
+  if (!resolvedUserId && userEmail) {
+    try {
+      console.log(`[NotificationService] Attempting to resolve user ID for email: ${userEmail}`);
+      const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
+      if (profile?.id) {
+        resolvedUserId = profile.id;
+        console.log(`[NotificationService] Resolved user ID from profiles: ${resolvedUserId}`);
+      } else {
+        const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
+        if (orderUser?.customer_id) {
+          resolvedUserId = orderUser.customer_id;
+          console.log(`[NotificationService] Resolved user ID from orders: ${resolvedUserId}`);
+        }
+      }
+    } catch (e: any) {
+      console.warn('[NotificationService] Error resolving userId from email:', e.message || e);
+    }
+  }
+
   let finalMessage = message;
   if (vpnName && !message.includes(vpnName)) {
     finalMessage = `${message} (VPN: ${vpnName})`;
   }
 
+  // NOTE: Based on database audit, only id, user_id, title, message, type, is_read, and created_at columns exist in public.notifications.
+  // We MUST exclude missing columns like user_email, email, read, order_id, updated_at to prevent PostgreSQL errors.
   const payload: any = {
-    user_id: userId || null,
-    user_email: userEmail,
-    email: userEmail,
+    user_id: resolvedUserId || null,
     title,
     message: finalMessage,
     type,
-    read: false,
     is_read: false,
-    order_id: orderId || null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
+    created_at: new Date().toISOString()
   };
 
+  console.log('[NotificationService] Inserting notification payload:', JSON.stringify(payload, null, 2));
+
   try {
-    let { data, error } = await supabaseAdmin.from('notifications').insert(payload).select().maybeSingle();
+    const { data, error } = await supabaseAdmin.from('notifications').insert(payload).select().maybeSingle();
 
     if (error) {
-      console.error(`[NotificationService] Database error inserting notification for ${userEmail}:`, error.message || error);
-      
-      if (error.code === 'PGRST204' || error.message?.includes('column')) {
-        const fallbackPayload = {
-          user_id: userId || null,
-          user_email: userEmail,
-          email: userEmail,
-          title,
-          message: finalMessage,
-          created_at: new Date().toISOString()
-        };
-        const { data: retryData, error: retryErr } = await supabaseAdmin.from('notifications').insert(fallbackPayload).select().maybeSingle();
-        if (retryErr) {
-          console.error(`[NotificationService] Fallback notification insert failed for ${userEmail}:`, retryErr.message || retryErr);
-          return null;
-        }
-        return retryData;
-      }
-      return null;
+      console.error(`[NotificationService] Database error inserting notification for ${userEmail || resolvedUserId}:`, error.message || error);
+      throw error;
     }
 
+    console.log(`[NotificationService] Successfully inserted notification! Result:`, data);
     return data;
   } catch (err: any) {
-    console.error(`[NotificationService] Exception during notification insert for ${userEmail}:`, err.message || err);
-    return null;
+    console.error(`[NotificationService] Exception during notification insert for ${userEmail || resolvedUserId}:`, err.message || err);
+    throw err;
   }
 };
 
 export const checkAndCreateExpiryNotifications = async (userId?: string, userEmail?: string): Promise<void> => {
   if (!userId && !userEmail) return;
 
+  console.log(`[NotificationService] [ENTER] checkAndCreateExpiryNotifications for userId: ${userId}, userEmail: ${userEmail}`);
   try {
     let query = supabaseAdmin.from('vpn_configs').select('*');
     if (userId && userEmail) {
@@ -78,13 +92,41 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
       query = query.eq('user_email', userEmail);
     }
 
-    const { data: configs } = await query;
+    const { data: configs, error: configErr } = await query;
+    if (configErr) {
+      console.warn('[NotificationService] Error querying vpn_configs:', configErr.message || configErr);
+      return;
+    }
     if (!configs || configs.length === 0) return;
 
-    const { data: existingNotifs } = await supabaseAdmin
+    let targetUserId = userId;
+    if (!targetUserId && userEmail) {
+      try {
+        const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
+        if (profile?.id) {
+          targetUserId = profile.id;
+        } else {
+          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
+          if (orderUser?.customer_id) {
+            targetUserId = orderUser.customer_id;
+          }
+        }
+      } catch (e: any) {
+        console.warn('[NotificationService] Error resolving user ID during checkAndCreateExpiryNotifications:', e.message || e);
+      }
+    }
+
+    if (!targetUserId) return;
+
+    const { data: existingNotifs, error: notifErr } = await supabaseAdmin
       .from('notifications')
       .select('*')
-      .or(`user_id.eq.${userId || 'N/A'},user_email.eq.${userEmail || 'N/A'}`);
+      .eq('user_id', targetUserId);
+
+    if (notifErr) {
+      console.warn('[NotificationService] Error querying existing notifications:', notifErr.message || notifErr);
+      return;
+    }
 
     const existingNotifList = existingNotifs || [];
     const now = Date.now();
@@ -139,8 +181,8 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
 
       if (!alreadyExists) {
         await createCustomerNotification({
-          userId: userId || cfg.customer_uid || null,
-          userEmail: userEmail || cfg.user_email,
+          userId: targetUserId,
+          userEmail: userEmail || cfg.user_email || '',
           title: targetTitle,
           message: targetMessage,
           type: targetType,
@@ -150,42 +192,73 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
         });
       }
     }
-  } catch (err) {
-    console.warn('[NotificationService] Error syncing expiry notifications:', err);
+  } catch (err: any) {
+    console.warn('[NotificationService] Error syncing expiry notifications:', err.message || err);
   }
 };
 
 export const getUserNotifications = async (userId?: string, userEmail?: string): Promise<any[]> => {
+  console.log(`[NotificationService] [ENTER] getUserNotifications for userId: ${userId}, userEmail: ${userEmail}`);
   try {
     await checkAndCreateExpiryNotifications(userId, userEmail);
 
     const { data: allNotifs, error } = await supabaseAdmin.from('notifications').select('*').order('created_at', { ascending: false });
-    if (error || !allNotifs) return [];
+    if (error || !allNotifs) {
+      if (error) {
+        console.error('[NotificationService] Error querying notifications table:', error.message || error);
+      }
+      return [];
+    }
 
     const uId = userId ? String(userId).trim() : '';
-    const uEmail = userEmail ? String(userEmail).toLowerCase().trim() : '';
+    let resolvedEmailUserId = '';
+    if (!uId && userEmail) {
+      try {
+        const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
+        if (profile?.id) {
+          resolvedEmailUserId = profile.id;
+        } else {
+          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
+          if (orderUser?.customer_id) {
+            resolvedEmailUserId = orderUser.customer_id;
+          }
+        }
+      } catch (e: any) {
+        console.warn('[NotificationService] Error resolving user ID during getUserNotifications:', e.message || e);
+      }
+    }
 
-    return allNotifs.filter((item: any) => {
+    const targetUserId = uId || resolvedEmailUserId;
+    console.log(`[NotificationService] Filtering all notifications for user ID: ${targetUserId}`);
+
+    const filtered = allNotifs.filter((item: any) => {
       const itemUserId = String(item.user_id || '').trim();
-      const itemEmail = String(item.user_email || item.email || '').toLowerCase().trim();
-      return (uId && itemUserId === uId) || (uEmail && itemEmail === uEmail);
+      return targetUserId && itemUserId === targetUserId;
     });
-  } catch (err) {
-    console.warn('[NotificationService] Error fetching notifications:', err);
+
+    console.log(`[NotificationService] Found ${filtered.length} notifications for user ID: ${targetUserId}`);
+    return filtered;
+  } catch (err: any) {
+    console.warn('[NotificationService] Error in getUserNotifications:', err.message || err);
     return [];
   }
 };
 
 export const markNotificationAsRead = async (notificationId: string): Promise<boolean> => {
+  console.log(`[NotificationService] [ENTER] markNotificationAsRead for ID: ${notificationId}`);
   try {
     const { error } = await supabaseAdmin.from('notifications').update({
-      read: true,
-      is_read: true,
-      updated_at: new Date().toISOString()
+      is_read: true
     }).eq('id', notificationId);
-    return !error;
-  } catch (err) {
-    console.warn('[NotificationService] Error marking notification as read:', err);
+
+    if (error) {
+      console.error(`[NotificationService] Database error marking notification ${notificationId} as read:`, error.message || error);
+      return false;
+    }
+    console.log(`[NotificationService] Successfully marked notification ${notificationId} as read`);
+    return true;
+  } catch (err: any) {
+    console.warn('[NotificationService] Exception marking notification as read:', err.message || err);
     return false;
   }
 };

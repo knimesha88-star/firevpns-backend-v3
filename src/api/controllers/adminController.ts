@@ -112,16 +112,35 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
 
     // 3. Create customer notification
     try {
-      await createCustomerNotification({
-        userId: order.customer_id || null,
-        userEmail: order.email,
-        title: 'Order Rejected',
-        message: reason,
-        type: 'error',
-        orderId: order.id
-      });
-    } catch (notifErr) {
-      console.warn('[AdminController] Customer notification creation warning:', notifErr);
+      const isTrial = !!(
+        order.is_trial || 
+        String(order.order_id || '').startsWith('TRIAL-') ||
+        String(order.package_name || '').toLowerCase().includes('trial')
+      );
+
+      if (isTrial) {
+        console.log('[AdminController] Sending Trial Rejected notification');
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Trial Rejected',
+          message: `Your free trial request was rejected: ${reason}`,
+          type: 'trial_rejected',
+          orderId: order.id
+        });
+      } else {
+        console.log('[AdminController] Sending Payment Rejected notification');
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Payment Rejected',
+          message: `Your payment/order was rejected: ${reason}`,
+          type: 'payment_rejected',
+          orderId: order.id
+        });
+      }
+    } catch (notifErr: any) {
+      console.error('[AdminController] CRITICAL: Customer notification creation failed during rejection:', notifErr.message || notifErr);
     }
 
     // 4. Send Telegram notification
@@ -138,6 +157,49 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
   } catch (error: any) {
     console.error('[AdminController] Order rejection error:', error.message);
     res.status(500).json({ error: error.message || 'Failed to reject order.' });
+  }
+};
+
+export const publishAnnouncementNotification = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { title, message, type } = req.body;
+    if (!title || !message) {
+      res.status(400).json({ error: 'Title and message are required' });
+      return;
+    }
+
+    console.log(`[AdminController] Publishing announcement: "${title}" (Type: ${type || 'announcement'})`);
+
+    // 1. Fetch all profiles
+    const { data: profiles, error: fetchErr } = await supabaseAdmin.from('profiles').select('id');
+    if (fetchErr) {
+      console.error('[AdminController] Error fetching profiles for announcement:', fetchErr);
+      res.status(500).json({ error: 'Failed to fetch profiles' });
+      return;
+    }
+
+    if (!profiles || profiles.length === 0) {
+      res.json({ success: true, count: 0 });
+      return;
+    }
+
+    // 2. Insert notifications for each user
+    const insertPromises = profiles.map((p) => {
+      return createCustomerNotification({
+        userId: p.id,
+        userEmail: '',
+        title,
+        message,
+        type: type || 'announcement'
+      });
+    });
+
+    await Promise.all(insertPromises);
+
+    res.json({ success: true, count: profiles.length });
+  } catch (error: any) {
+    console.error('[AdminController] Announcement notification error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to send announcement notifications.' });
   }
 };
 

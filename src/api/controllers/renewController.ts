@@ -22,6 +22,20 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       status: 'Pending'
     };
 
+    // Create customer notification
+    try {
+      console.log('[RenewController] Creating Payment Submitted notification for renewal request');
+      await createCustomerNotification({
+        userId: req.user?.uid || data.userId || null,
+        userEmail: customerEmail,
+        title: 'Payment Submitted',
+        message: `Your payment of LKR ${notificationData.amount} for "${notificationData.planName || 'VPN Package'}" has been submitted for verification.`,
+        type: 'payment_submitted'
+      });
+    } catch (notifErr: any) {
+      console.error('[RenewController] CRITICAL: Error creating Payment Submitted notification in createRenewRequest:', notifErr.message || notifErr);
+    }
+
     // Send Telegram Notification safely without crashing or rejecting request
     sendRenewNotification(notificationData).catch((err) => {
       console.error('[RenewController] Telegram notification error:', err?.message || err);
@@ -241,15 +255,16 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     
     // 6. Create customer notification
     try {
+      console.log('[RenewController] Creating VPN Renewed notification');
       await createCustomerNotification({
         userId: data.user_id || data.userId || null,
         userEmail: email,
-        title: 'Renewal Approved',
-        message: `Your VPN renewal request (${data.plan_name || data.planName || 'Plan'}) was approved successfully. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
-        type: 'success'
+        title: 'VPN Renewed',
+        message: `Your VPN renewal request for "${data.plan_name || data.planName || 'Plan'}" was approved successfully. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
+        type: 'vpn_renewed'
       });
-    } catch (nErr) {
-      console.warn('[RenewController] Customer notification creation error:', nErr);
+    } catch (nErr: any) {
+      console.error('[RenewController] CRITICAL: Customer notification creation error:', nErr.message || nErr);
     }
 
     // 7. Trigger Telegram approved notification
@@ -325,15 +340,16 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
 
     // Create customer notification
     try {
+      console.log('[RenewController] Creating Payment Rejected notification for renewal rejection');
       await createCustomerNotification({
         userId: data.user_id || data.userId || null,
         userEmail: email,
-        title: 'Renewal Rejected',
-        message: `Your VPN renewal request was rejected: ${reason}`,
-        type: 'error'
+        title: 'Payment Rejected',
+        message: `Your VPN renewal payment/request for "${data.plan_name || data.planName || 'Plan'}" was rejected: ${reason}`,
+        type: 'payment_rejected'
       });
-    } catch (nErr) {
-      console.warn('[RenewController] Customer notification creation error on reject:', nErr);
+    } catch (nErr: any) {
+      console.error('[RenewController] CRITICAL: Customer notification creation error on reject:', nErr.message || nErr);
     }
 
     res.json({
@@ -363,6 +379,21 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       paymentDate: data.paymentDate || 'N/A',
       notes: data.notes || '',
     };
+
+    // Create customer notification
+    try {
+      console.log('[RenewController] Creating Payment Submitted notification for order');
+      await createCustomerNotification({
+        userId: req.user?.uid || data.userId || null,
+        userEmail: notificationData.email,
+        title: 'Payment Submitted',
+        message: `Your payment of LKR ${notificationData.amount} for "${notificationData.plan}" has been submitted for verification.`,
+        type: 'payment_submitted',
+        orderId: notificationData.orderId
+      });
+    } catch (notifErr: any) {
+      console.error('[RenewController] CRITICAL: Error creating Payment Submitted notification in createOrderNotification:', notifErr.message || notifErr);
+    }
 
     sendNewOrderNotification(notificationData).catch((err) => {
       console.error('[RenewController] Telegram new order notification error:', err?.message || err);
