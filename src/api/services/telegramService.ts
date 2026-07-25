@@ -455,13 +455,14 @@ export interface TrialRequestNotificationData {
   requestId?: string;
 }
 
-export const sendTrialRequestNotification = async (data: TrialRequestNotificationData): Promise<void> => {
+export const sendTrialRequestNotification = async (data: TrialRequestNotificationData): Promise<any> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!botToken || !chatId) {
-    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram trial request notification.');
-    return;
+    const errorMsg = 'TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from backend environment variables.';
+    console.warn(`[TelegramService] ${errorMsg}`);
+    throw new Error(errorMsg);
   }
 
   const customerName = data.customerName || 'N/A';
@@ -490,6 +491,7 @@ export const sendTrialRequestNotification = async (data: TrialRequestNotificatio
   }
 
   const text = `🎁 NEW FREE TRIAL REQUEST
+Key-Location: backend/src/api/services/telegramService.ts:492
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -519,23 +521,36 @@ ${requestId}
 Status:
 🟡 Pending Admin Approval`;
 
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const payload = {
+    chat_id: chatId,
+    text: text,
+  };
+
+  console.log('[TelegramService] Requesting Telegram URL:', url);
+  console.log('[TelegramService] Telegram payload:', JSON.stringify(payload, null, 2));
+
   try {
-    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-      }),
+      body: JSON.stringify(payload),
     });
 
+    const resBody = await response.text();
+    console.log('[TelegramService] Response status:', response.status);
+    console.log('[TelegramService] Response body:', resBody);
+
     if (!response.ok) {
-      const errText = await response.text();
-      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+      const errText = `Telegram API Error (Status ${response.status}): ${resBody}`;
+      console.error(`[TelegramService] ${errText}`);
+      throw new Error(errText);
     }
+
+    return { status: response.status, body: resBody };
   } catch (err: any) {
-    console.error('[TelegramService] Failed to send Telegram trial request notification:', err?.message || err);
+    console.error('[TelegramService] Exception occurred in sendTrialRequestNotification:', err);
+    throw err;
   }
 };
 

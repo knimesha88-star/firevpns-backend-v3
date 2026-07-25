@@ -121,6 +121,7 @@ const createAxiosInstance = (baseUrl: string) => {
 };
 
 const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
+  console.log(`[xuiService] [FUNCTION ENTERED] requestApi - Endpoint: ${endpoint}, Method: ${method}`);
   const config = await getXuiConfig();
   
   // The frontend stores the token in the password field, or fallback to apiToken if provided
@@ -132,6 +133,7 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
+  console.log(`[xuiService] [3X-UI API REQUEST] Sending ${method} to ${fullUrl} | Payload:`, data ? JSON.stringify(data) : 'None');
   
   try {
     const response = await client.request({
@@ -152,12 +154,13 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
       throw new Error(`3X-UI API Error: ${response.data.msg}`);
     }
 
+    console.log(`[xuiService] [3X-UI API RESPONSE] Success response for ${endpoint}`);
     return response.data.obj;
   } catch (error: any) {
     console.error("=== 3X-UI ERROR ===");
-    console.error(error.response?.status);
-    console.error(error.response?.data);
-    console.error(error.message);
+    console.error(`Status: ${error.response?.status}`);
+    console.error(`Data:`, error.response?.data);
+    console.error(`Message: ${error.message}`);
     throw error;
   }
 };
@@ -193,6 +196,7 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
 };
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
+  console.log('[xuiService] [FUNCTION ENTERED] getInbounds');
   try {
     const inboundsData = await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
     const response = { data: { obj: inboundsData } };
@@ -585,6 +589,7 @@ export const add3XUiClient = async (
     flow?: string;
   }
 ): Promise<any> => {
+  console.log(`[xuiService] [FUNCTION ENTERED] add3XUiClient - inboundId: ${inboundId}, email: ${clientData.email}, uuid: ${clientData.uuid}`);
   const config = await getXuiConfig();
   const token = config.apiToken || config.password;
   if (!token) {
@@ -643,8 +648,21 @@ export const add3XUiClient = async (
   }
 };
 
+const activeProvisionings = new Set<string>();
+
 export const provisionOrderClient = async (orderId: string, token?: string): Promise<any> => {
-  const dbClient = supabaseAdmin;
+  console.log(`[xuiService] [FUNCTION ENTERED] provisionOrderClient - orderId: ${orderId}`);
+  if (activeProvisionings.has(orderId)) {
+    console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] provisionOrderClient is already running for orderId: ${orderId}`);
+    return {
+      success: true,
+      message: 'Client already exists on this inbound. Skipping duplicate assignment.'
+    };
+  }
+  activeProvisionings.add(orderId);
+
+  try {
+    const dbClient = supabaseAdmin;
 
   let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
 
@@ -710,7 +728,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('[Purchase Flow] Selected template name:', template.package_name || template.name);
   console.log('[Purchase Flow] Loaded template:', JSON.stringify(template, null, 2));
 
-  const inboundId = Number(template.inbound_id) || 1;
+  let inboundId = Number(template.inbound_id) || 1;
   const address = template.address || '';
   const sni = template.sni || '';
   const remarkFormat = template.remark_template || template.remarkFormat || '{{customerName}}';
@@ -718,20 +736,82 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const orderDisplayId = (order.order_id || order.id || '').trim();
   const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
-  // Search if client already exists in 3X-UI
+  const isValidUuid = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val || '');
+  const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
+
+  const isTrialOrder = !!(extra.is_trial || extra.isTrial || extra.paymentMethod === 'Free Trial' || extra.duration === '1 Day' || String(order.order_id || '').startsWith('TRIAL-'));
+
+  // 1. Check if the customer already has an existing trial configuration in database
+  let existingTrialConfig: any = null;
+  if (validUserId) {
+    const { data: trials, error: trialsErr } = await dbClient
+      .from('vpn_configs')
+      .select('*')
+      .eq('customer_uid', validUserId)
+      .eq('is_trial', true)
+      .maybeSingle();
+    if (trialsErr) {
+      console.warn('[3X-UI Provisioning DB] Failed to lookup existing trial configs:', trialsErr);
+    }
+    existingTrialConfig = trials;
+  }
+
+  // Check if an existing VPN account exists for this order/user
+  let existingAcc: any = null;
+  if (order.id) {
+    const { data: d1, error: e1 } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('order_id', order.id)
+      .maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
+    existingAcc = d1;
+  }
+
+  // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
+  if (!existingAcc && isTrialOrder && validUserId) {
+    const { data: d1, error: e1 } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('user_id', validUserId)
+      .eq('is_trial', true)
+      .maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by trial/user notice:', e1);
+    existingAcc = d1;
+  }
+
+  if (!existingAcc && validUserId && remark) {
+    const { data: d1, error: e1 } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('user_id', validUserId)
+      .eq('remark', remark)
+      .maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by user/remark notice:', e1);
+    existingAcc = d1;
+  }
+
+  // Fetch all inbounds to search for an existing client in 3X-UI panel
   const allInbounds = await getInbounds();
   let existingClient = null;
   let targetInboundId = inboundId;
+
+  // Search by remark (email) or by known UUIDs from database
   for (const ib of allInbounds) {
     let settingsObj: any = {};
     try {
       settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
     } catch (e) { continue; }
     const clients = settingsObj.clients || [];
-    const found = clients.find((c: any) => String(c.email).trim() === remark.trim());
+    const found = clients.find((c: any) => 
+      String(c.email).trim().toLowerCase() === remark.trim().toLowerCase() ||
+      (existingTrialConfig && String(c.id).trim().toLowerCase() === String(existingTrialConfig.uuid).trim().toLowerCase()) ||
+      (existingAcc && String(c.id).trim().toLowerCase() === String(existingAcc.uuid).trim().toLowerCase())
+    );
     if (found) {
       existingClient = found;
       targetInboundId = Number(ib.id);
+      inboundId = targetInboundId; // Reassign inboundId to maintain existing inbound mapping
       break;
     }
   }
@@ -766,20 +846,19 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   // Trial Override: Apply 1 Day (24h) and 1 GB Limit strictly for Free Trials
-  const isTrialOrder = !!(extra.is_trial || extra.isTrial || extra.paymentMethod === 'Free Trial' || extra.duration === '1 Day' || String(order.order_id || '').startsWith('TRIAL-'));
   if (isTrialOrder) {
     days = 1;
     totalBytes = 1 * 1024 * 1024 * 1024; // 1 GB
     expiryMs = Date.now() + (1 * 24 * 60 * 60 * 1000);
   }
 
-  let uuid = existingClient ? existingClient.id : crypto.randomUUID();
+  // Determine UUID and subId, prioritizing existing records to prevent duplicates
+  let uuid = existingClient ? existingClient.id : (existingTrialConfig ? existingTrialConfig.uuid : (existingAcc ? existingAcc.uuid : crypto.randomUUID()));
   let subId = existingClient ? existingClient.subId : crypto.randomBytes(12).toString('hex');
 
-  // Fetch inbound info from 3X-UI
-  const inbounds = await getInbounds();
-  const inbound = inbounds.find((i: any) => Number(i.id) === targetInboundId) || {
-    id: targetInboundId,
+  // Find target inbound details from our cached list
+  const inbound = allInbounds.find((i: any) => Number(i.id) === inboundId) || {
+    id: inboundId,
     port: 443,
     protocol: 'vless',
     streamSettings: JSON.stringify({ network: 'tcp', security: 'reality' })
@@ -802,7 +881,35 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     flow = template.flow || '';
   }
 
-  console.log('[Purchase Flow] Inbound ID:', targetInboundId);
+  // Check whether the client is already assigned to the target inbound
+  let alreadyAssignedToTarget = false;
+  const targetInbound = allInbounds.find((ib: any) => Number(ib.id) === inboundId);
+  if (targetInbound) {
+    let targetSettings: any = {};
+    try {
+      targetSettings = typeof targetInbound.settings === 'string' ? JSON.parse(targetInbound.settings) : targetInbound.settings;
+    } catch (e) {}
+    const clients = targetSettings.clients || [];
+    const found = clients.find((c: any) => 
+      String(c.email).trim().toLowerCase() === remark.trim().toLowerCase() ||
+      String(c.id).trim().toLowerCase() === uuid.trim().toLowerCase()
+    );
+    if (found) {
+      alreadyAssignedToTarget = true;
+    }
+  }
+
+  // Requirement 7: Add logging
+  console.log('=== [CLIENT-INBOUND DETAILED LOOKUP LOGGING] ===');
+  console.log(`- Client UUID: ${uuid}`);
+  console.log(`- Email: ${remark}`);
+  console.log(`- Inbound ID: ${inboundId}`);
+  console.log(`- Template ID: ${template.id}`);
+  console.log(`- Existing client lookup result: ${existingClient ? JSON.stringify(existingClient) : 'None'}`);
+  console.log(`- Existing inbound assignment lookup result: ${alreadyAssignedToTarget ? 'Already assigned' : 'Not assigned'}`);
+  console.log('================================================');
+
+  console.log('[Purchase Flow] Inbound ID:', inboundId);
   console.log('[Purchase Flow] Protocol:', inbound.protocol);
   console.log('[Purchase Flow] Configuration used:', {
     address,
@@ -817,50 +924,80 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     trafficLimitGB: totalBytes > 0 ? totalBytes / (1024 * 1024 * 1024) : 'Unlimited'
   });
 
-  console.log('[Purchase Flow] Final payload sent to 3X-UI:', {
-    inboundId: targetInboundId,
-    clientData: {
-      uuid,
-      email: remark,
-      totalBytes,
-      expiryMs,
-      subId,
-      flow
-    }
-  });
   console.log('=== [PURCHASE FLOW LOGGING END] ===');
 
+  let skipAttachment = false;
+  let skipMsg = '';
+
+  // Requirement 4 & 6 & 8: Check if client is already assigned to the inbound
+  if (alreadyAssignedToTarget) {
+    skipAttachment = true;
+    skipMsg = "Client already exists on this inbound. Skipping duplicate assignment.";
+    console.log(`[3X-UI Provisioning] ${skipMsg}`);
+
+    // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
+    try {
+      const config = await getXuiConfig();
+      const token = config.apiToken || config.password;
+      const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, `/panel/api/clients/update/${uuid}`);
+      const clientAxios = createAxiosInstance(baseUrl);
+
+      const updatePayload = {
+        client: {
+          id: uuid,
+          email: remark,
+          flow: flow,
+          limitIp: 0,
+          totalGB: totalBytes,
+          expiryTime: expiryMs,
+          enable: true,
+          subId: subId
+        },
+        inboundIds: [inboundId]
+      };
+
+      console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI:', JSON.stringify(updatePayload, null, 2));
+      await clientAxios.post(fullPath, updatePayload, { headers: { Authorization: `Bearer ${token}` } });
+    } catch (updErr: any) {
+      console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', updErr?.message || updErr);
+    }
+  }
+
   // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
-  try {
-    await add3XUiClient(targetInboundId, {
-      uuid,
-      email: remark,
-      totalBytes,
-      expiryMs,
-      subId,
-      flow
-    });
-  } catch (addErr: any) {
-    const errMsg = String(
-      addErr?.message || 
-      addErr?.response?.data?.msg || 
-      addErr?.response?.data?.message || 
-      addErr?.response?.data || 
-      ''
-    ).toLowerCase();
+  if (!skipAttachment) {
+    try {
+      await add3XUiClient(inboundId, {
+        uuid,
+        email: remark,
+        totalBytes,
+        expiryMs,
+        subId,
+        flow
+      });
+    } catch (addErr: any) {
+      const errMsg = String(
+        addErr?.message || 
+        addErr?.response?.data?.msg || 
+        addErr?.response?.data?.message || 
+        addErr?.response?.data || 
+        ''
+      ).toLowerCase();
 
-    console.warn(`[3X-UI Provisioning] add3XUiClient warning/notice: ${errMsg}`);
+      console.warn(`[3X-UI Provisioning] add3XUiClient warning/notice: ${errMsg}`);
 
-    const isDuplicate = 
-      errMsg.includes('already exist') || 
-      errMsg.includes('duplicate') || 
-      errMsg.includes('exists') || 
-      errMsg.includes('email');
+      const isDuplicate = 
+        errMsg.includes('already exist') || 
+        errMsg.includes('duplicate') || 
+        errMsg.includes('exists') || 
+        errMsg.includes('email');
 
-    if (isDuplicate) {
-    } else {
-      console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
-      throw addErr;
+      if (isDuplicate) {
+        skipMsg = "Client already exists on this inbound. Skipping duplicate assignment.";
+        console.log(`[3X-UI Provisioning] ${skipMsg}`);
+      } else {
+        console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
+        throw addErr;
+      }
     }
   }
 
@@ -877,32 +1014,8 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
   const subscriptionUrl = vlessUrl;
 
-  const isValidUuid = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val || '');
-  const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
-
   // Step 4: Upsert vpn_accounts
   let vpnAccountId = '';
-  let existingAcc: any = null;
-
-  // Use order_id as the unique identifier for a customer's VPN account record per order
-  if (order.id) {
-    const { data: d1, error: e1 } = await dbClient
-      .from('vpn_accounts')
-      .select('id, uuid')
-      .eq('order_id', order.id)
-      .maybeSingle();
-    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
-    existingAcc = d1;
-  } else if (validUserId && remark) {
-    const { data: d1, error: e1 } = await dbClient
-      .from('vpn_accounts')
-      .select('id, uuid')
-      .eq('user_id', validUserId)
-      .eq('remark', remark)
-      .maybeSingle();
-    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by user/remark notice:', e1);
-    existingAcc = d1;
-  }
 
   const accPayload: any = {
     user_id: validUserId,
@@ -1076,13 +1189,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   return {
     success: true,
-    message: 'VPN client provisioned and order completed successfully',
+    message: skipMsg || 'VPN client provisioned and order completed successfully',
     orderId: order.order_id || order.id,
     uuid,
     vlessUrl,
     subscriptionUrl,
     vpnAccountId
   };
+  } finally {
+    activeProvisionings.delete(orderId);
+  }
 };
 
 export const disable3XUiClient = async (inboundId: number | null, uuid: string, email?: string): Promise<boolean> => {

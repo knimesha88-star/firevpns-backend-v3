@@ -25,6 +25,7 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
 };
 
 export const approveOrder = async (req: AuthRequest, res: Response): Promise<void> => {
+  console.log(`[AdminController] Entering approveOrder with orderId: ${req.params.orderId || req.body.orderId}`);
   try {
     const orderId = req.params.orderId || req.body.orderId;
     if (!orderId) {
@@ -33,6 +34,8 @@ export const approveOrder = async (req: AuthRequest, res: Response): Promise<voi
     }
     const authHeader = req.headers.authorization || (req.headers as any)?.Authorization;
     const token = authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : undefined;
+    
+    console.log(`[AdminController] Calling xuiService.provisionOrderClient for orderId: ${orderId}`);
     const result = await xuiService.provisionOrderClient(orderId, token);
     res.json({ success: true, ...result });
   } catch (error: any) {

@@ -100,25 +100,60 @@ export const getClaimedTrials = async (req: AuthRequest, res: Response): Promise
 };
 
 export const claimTrial = async (req: AuthRequest, res: Response): Promise<void> => {
+  const reqPayload = req.body;
+  const file = 'backend/src/api/controllers/vpnController.ts';
+  let line = 102;
+  console.log('[vpnController] Incoming claimTrial request payload:', JSON.stringify(reqPayload, null, 2));
+
   try {
+    line = 106;
     const uid = req.user?.uid;
     const email = req.user?.email;
 
     if (!uid || !email) {
-      res.status(401).json({ success: false, error: 'Please log in with a verified email to request your free trial.' });
+      const errText = 'Please log in with a verified email to request your free trial.';
+      console.warn(`[vpnController] ${errText} at ${file}:${line}`);
+      res.status(401).json({
+        success: false,
+        error: errText,
+        file,
+        line
+      });
       return;
     }
 
+    line = 112;
     const { packageName, templateId, configurationName, customerName } = req.body;
     if (!packageName && !templateId) {
-      res.status(400).json({ success: false, error: 'Package Name or Template ID is required.' });
+      const errText = 'Package Name or Template ID is required.';
+      console.warn(`[vpnController] ${errText} at ${file}:${line}`);
+      res.status(400).json({
+        success: false,
+        error: errText,
+        file,
+        line
+      });
       return;
     }
 
+    line = 119;
     // 1. Check if user already submitted a trial request for this package/template
-    const { data: userOrders } = await supabase.from('orders').select('*');
-    const allOrders: any[] = userOrders || [];
+    console.log('[vpnController] Fetching user orders to validate duplicate trial claims');
+    const { data: userOrders, error: fetchOrdersErr } = await supabase.from('orders').select('*');
+    if (fetchOrdersErr) {
+      console.error('[vpnController] Database error while fetching orders:', fetchOrdersErr);
+      res.status(500).json({
+        success: false,
+        error: `Database Fetch Error: ${fetchOrdersErr.message || 'Failed to fetch orders'}`,
+        databaseError: fetchOrdersErr,
+        file,
+        line
+      });
+      return;
+    }
 
+    line = 122;
+    const allOrders: any[] = userOrders || [];
     const existingTrial = allOrders.find((data) => {
       const docUid = String(data.customer_id || data.customerUid || data.customerId || '').trim();
       const docEmail = String(data.email || data.customerEmail || '').toLowerCase().trim();
@@ -149,29 +184,52 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       return (reqPName && pName === reqPName) || (reqTId && tId === reqTId) || (reqPName && tId === reqPName);
     });
 
+    line = 152;
     if (existingTrial) {
       const status = String(existingTrial.status || '').toLowerCase();
       const payStatus = String(existingTrial.payment_status || '').toLowerCase();
       if (status === 'pending' || payStatus === 'pending trial approval' || payStatus === 'pending verification' || payStatus === 'pending') {
+        const errText = 'Request Pending: You already have a pending trial request for this package. Please wait for administrator approval.';
+        console.warn(`[vpnController] ${errText} at ${file}:${line}`);
         res.status(400).json({
           success: false,
-          error: 'Request Pending: You already have a pending trial request for this package. Please wait for administrator approval.'
+          error: errText,
+          file,
+          line
         });
         return;
       }
       if (status !== 'rejected') {
+        const errText = 'Trial Already Used: You have already claimed or been approved for a free trial for this package.';
+        console.warn(`[vpnController] ${errText} at ${file}:${line}`);
         res.status(400).json({
           success: false,
-          error: 'Trial Already Used: You have already claimed or been approved for a free trial for this package.'
+          error: errText,
+          file,
+          line
         });
         return;
       }
     }
 
+    line = 172;
     // 2. Fetch templates to match the selected package
-    const { data: tpls } = await supabase.from('provision_templates').select('*');
-    const templates: any[] = tpls || [];
+    console.log('[vpnController] Fetching provision templates');
+    const { data: tpls, error: fetchTemplatesErr } = await supabase.from('provision_templates').select('*');
+    if (fetchTemplatesErr) {
+      console.error('[vpnController] Database error while fetching templates:', fetchTemplatesErr);
+      res.status(500).json({
+        success: false,
+        error: `Database Fetch Error (Templates): ${fetchTemplatesErr.message}`,
+        databaseError: fetchTemplatesErr,
+        file,
+        line
+      });
+      return;
+    }
 
+    line = 175;
+    const templates: any[] = tpls || [];
     const matchedTemplate = templates.find((t: any) => {
       const tId = String(t.id || '').trim().toLowerCase();
       const tName = String(t.package_name || t.name || '').trim().toLowerCase();
@@ -187,10 +245,18 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     });
 
     if (!matchedTemplate) {
-      res.status(400).json({ success: false, error: 'No matching VPN template found for this package.' });
+      const errText = 'No matching VPN template found for this package.';
+      console.warn(`[vpnController] ${errText} at ${file}:${line}`);
+      res.status(400).json({
+        success: false,
+        error: errText,
+        file,
+        line
+      });
       return;
     }
 
+    line = 195;
     // 3. Create the pending trial request (Order status = 'pending')
     const orderId = `TRIAL-${Math.floor(100000 + Math.random() * 900000)}`;
     const trimmedConfigName = (configurationName || `Trial-${matchedTemplate.package_name}`).trim();
@@ -227,9 +293,9 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       created_at: new Date().toISOString()
     };
 
-    console.log('[vpnController] Creating pending trial request payload:', orderPayload);
+    console.log('[vpnController] Creating pending trial request payload in database:', JSON.stringify(orderPayload, null, 2));
 
-    let createdOrder: any = null;
+    line = 233;
     let { data: resData, error: insertErr } = await supabase
       .from('orders')
       .insert(orderPayload)
@@ -246,16 +312,25 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       if (!retryErr) {
         insertErr = null;
         resData = resData2;
+      } else {
+        insertErr = retryErr;
       }
     }
 
     if (insertErr) {
-      console.error('[vpnController] Trial request creation error:', insertErr);
-      throw insertErr;
+      console.error('[vpnController] Database Trial insert error:', insertErr);
+      res.status(500).json({
+        success: false,
+        error: `Database Insert Error: ${insertErr.message || 'Constraint violation'}`,
+        databaseError: insertErr,
+        file,
+        line
+      });
+      return;
     }
-    createdOrder = resData;
 
-    // 4. Immediately send Telegram notification to Administrator & create customer notification in DB
+    line = 260;
+    // 4. Create customer notification in DB
     try {
       await createCustomerNotification({
         userId: uid,
@@ -266,12 +341,15 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
         orderId: orderId,
         vpnName: matchedTemplate.package_name
       });
-    } catch (notifErr) {
-      console.error('[vpnController] Customer notification creation error for trial request:', notifErr);
+    } catch (notifErr: any) {
+      console.error('[vpnController] Customer notification creation error:', notifErr);
     }
 
+    line = 274;
+    // 5. Send Telegram notification to Administrator
+    let telegramRes: any = null;
     try {
-      await sendTrialRequestNotification({
+      telegramRes = await sendTrialRequestNotification({
         customerName: finalCustomerName,
         email: email,
         packageName: matchedTemplate.package_name,
@@ -280,19 +358,37 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
         requestTime: new Date().toLocaleString('en-US', { timeZone: 'Asia/Colombo' }),
         requestId: orderId
       });
-    } catch (tgErr) {
-      console.error('[vpnController] Telegram notification error for trial request:', tgErr);
+    } catch (tgErr: any) {
+      console.error('[vpnController] Telegram notification error:', tgErr);
+      res.status(502).json({
+        success: false,
+        error: `Telegram Notification Error: ${tgErr.message || 'Failed to send admin alert'}`,
+        telegramError: tgErr.message || tgErr,
+        file,
+        line
+      });
+      return;
     }
 
+    // Success response
+    console.log('[vpnController] Free Trial submission completed successfully. Request ID:', orderId);
     res.json({
       success: true,
       orderId: orderId,
       status: 'pending',
+      telegramResponse: telegramRes,
       message: 'Your 1 GB • 1 Day Free Trial request has been submitted successfully and is pending administrator approval!'
     });
+
   } catch (error: any) {
-    console.error('[vpnController] Error requesting free trial:', error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to submit free trial request.' });
+    console.error(`[vpnController] Unhandled claimTrial Exception at ${file}:${line}:`, error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'An unhandled exception occurred.',
+      stack: error.stack,
+      file,
+      line
+    });
   }
 };
 
