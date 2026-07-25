@@ -91,8 +91,6 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     let oldExpiryMs: number | null = null;
     if (data.old_expiry) {
       oldExpiryMs = new Date(data.old_expiry).getTime();
-    } else if (data.old_expiry_date) {
-      oldExpiryMs = new Date(data.old_expiry_date).getTime();
     }
 
     if (!oldExpiryMs || isNaN(oldExpiryMs)) {
@@ -137,7 +135,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       .update({
         status: 'approved',
         old_expiry: oldExpiryIso,
-        old_expiry_date: oldExpiryIso,
+        new_expiry: new_expiryIso,
         approved_at: nowIso,
         approved_by: adminEmail,
         updated_at: nowIso,
@@ -248,7 +246,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
         userEmail: email,
         title: 'Renewal Approved',
         message: `Your VPN renewal request (${data.plan_name || data.planName || 'Plan'}) was approved successfully. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
-        type: 'renewal_approved'
+        type: 'success'
       });
     } catch (nErr) {
       console.warn('[RenewController] Customer notification creation error:', nErr);
@@ -332,7 +330,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
         userEmail: email,
         title: 'Renewal Rejected',
         message: `Your VPN renewal request was rejected: ${reason}`,
-        type: 'renewal_rejected'
+        type: 'error'
       });
     } catch (nErr) {
       console.warn('[RenewController] Customer notification creation error on reject:', nErr);

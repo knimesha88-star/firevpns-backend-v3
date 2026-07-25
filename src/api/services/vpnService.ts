@@ -26,13 +26,13 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       vpnAccs.forEach((acc, index) => {
         console.log(`[VPN Lookup] Row ${index + 1}: id=${acc.id}, email=${acc.email}, uuid=${acc.uuid}, remark=${acc.remark}, server_id=${acc.server_id}, created_at=${acc.created_at}, status=${acc.status}`);
       });
-      const latestAccs: Record<string, any> = {};
       vpnAccs.forEach(acc => {
         const docUserId = String(acc.user_id || '').trim();
         const docEmail = String(acc.email || '').toLowerCase().trim();
         const matchesUser = (userUid && docUserId === userUid) || (userEmail && docEmail === userEmail);
+        const isActive = !acc.status || acc.status === 'active' || acc.status === 'enabled';
         
-        if (matchesUser && acc.vless_url) {
+        if (matchesUser && isActive && acc.vless_url) {
           configs.push({
             orderId: acc.order_id || acc.id,
             packageName: acc.remark || 'FIREVPN Package',

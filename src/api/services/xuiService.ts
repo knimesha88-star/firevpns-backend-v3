@@ -800,8 +800,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let vpnAccountId = '';
   let existingAcc: any = null;
 
-  // Use user_id and remark as the unique identifier for a customer's configuration
-  if (validUserId && remark) {
+  // Use order_id as the unique identifier for a customer's VPN account record per order
+  if (order.id) {
+    const { data: d1, error: e1 } = await dbClient
+      .from('vpn_accounts')
+      .select('id, uuid')
+      .eq('order_id', order.id)
+      .maybeSingle();
+    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
+    existingAcc = d1;
+  } else if (validUserId && remark) {
     const { data: d1, error: e1 } = await dbClient
       .from('vpn_accounts')
       .select('id, uuid')
@@ -952,7 +960,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       userEmail: order.email,
       title: 'VPN Activated',
       message: 'Your VPN has been created successfully and is ready to use.',
-      type: 'activation',
+      type: 'success',
       orderId: order.id
     });
     console.log(`[3X-UI Provisioning DB] Customer notification result:`, notif ? 'Created' : 'Logged warning');

@@ -15,6 +15,7 @@ export const createCustomerNotification = async (params: CreateNotificationParam
   const payload: any = {
     user_id: userId || null,
     user_email: userEmail,
+    email: userEmail,
     title,
     message,
     type,
@@ -25,29 +26,40 @@ export const createCustomerNotification = async (params: CreateNotificationParam
     updated_at: new Date().toISOString()
   };
 
+  console.log(`[NotificationService] Attempting to insert notification for email: ${userEmail}, userId: ${userId || 'N/A'}, title: "${title}", type: "${type}"`);
+
   try {
     let { data, error } = await supabaseAdmin.from('notifications').insert(payload).select().maybeSingle();
 
-    if (error && (error.code === 'PGRST204' || error.message?.includes('column'))) {
-      // Retry without optional columns if schema has fewer columns
-      delete payload.is_read;
-      delete payload.order_id;
-      delete payload.type;
-      delete payload.updated_at;
-      const { data: retryData, error: retryErr } = await supabaseAdmin.from('notifications').insert(payload).select().maybeSingle();
-      data = retryData;
-      error = retryErr;
-    }
-
     if (error) {
-      console.warn('[NotificationService] Notice inserting notification into DB:', error.message || error);
+      console.error(`[NotificationService] Exact database error when inserting notification for ${userEmail}:`, error.message || error, JSON.stringify(error));
+      
+      if (error.code === 'PGRST204' || error.message?.includes('column')) {
+        // Retry with minimal payload if schema has fewer columns
+        const fallbackPayload = {
+          user_id: userId || null,
+          user_email: userEmail,
+          email: userEmail,
+          title,
+          message,
+          created_at: new Date().toISOString()
+        };
+        console.log(`[NotificationService] Retrying notification insert with fallback payload for ${userEmail}...`);
+        const { data: retryData, error: retryErr } = await supabaseAdmin.from('notifications').insert(fallbackPayload).select().maybeSingle();
+        if (retryErr) {
+          console.error(`[NotificationService] Fallback notification insert failed for ${userEmail}:`, retryErr.message || retryErr, JSON.stringify(retryErr));
+          return null;
+        }
+        console.log(`[NotificationService] Fallback notification inserted successfully for ${userEmail}`);
+        return retryData;
+      }
       return null;
     }
 
-    console.log('[NotificationService] Customer notification created successfully:', title, 'for', userEmail);
+    console.log(`[NotificationService] Customer notification created successfully for ${userEmail} (ID: ${data?.id || 'unknown'})`);
     return data;
   } catch (err: any) {
-    console.warn('[NotificationService] Exception creating notification:', err.message || err);
+    console.error(`[NotificationService] Exception during notification insert for ${userEmail}:`, err.message || err, JSON.stringify(err));
     return null;
   }
 };

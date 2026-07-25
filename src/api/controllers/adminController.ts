@@ -114,7 +114,7 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
         userEmail: order.email,
         title: 'Order Rejected',
         message: reason,
-        type: 'rejection',
+        type: 'error',
         orderId: order.id
       });
     } catch (notifErr) {
