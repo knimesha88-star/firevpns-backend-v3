@@ -1,7 +1,13 @@
 import { supabase } from '../../lib/supabase.js';
-import { getInbounds } from './xuiService.js';
+import { getInbounds, cleanupExpiredTrials } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
+  // Requirement 8: Automatic cleanup of expired trials on config retrieval
+  try {
+    await cleanupExpiredTrials();
+  } catch (err) {
+    console.warn('[vpnService] cleanupExpiredTrials notice:', err);
+  }
 
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
@@ -248,5 +254,29 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     };
   });
 
-  return resultConfigs;
+  // Requirement 3: Remove expired/over-limit trials from customer's Purchased VPN Configurations list
+  const activeConfigs = resultConfigs.filter(cfg => {
+    const isExpiredStatus = cfg.status === 'Expired' || cfg.status === 'Disabled';
+
+    if (cfg.isTrial) {
+      const isOverDataLimit = cfg.usedGB >= 1 || (cfg.upBytes + cfg.downBytes >= 1073741824);
+      let expTimeMs: number | null = null;
+      if (cfg.expiryDate) {
+        expTimeMs = new Date(cfg.expiryDate).getTime();
+      }
+      const isTimeExpired = expTimeMs ? expTimeMs <= Date.now() : false;
+
+      if (isExpiredStatus || isOverDataLimit || isTimeExpired) {
+        return false;
+      }
+    }
+
+    if (isExpiredStatus) {
+      return false;
+    }
+
+    return true;
+  });
+
+  return activeConfigs;
 };

@@ -3,6 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as vpnService from '../services/vpnService.js';
 import { supabase } from '../../lib/supabase.js';
 import { sendTrialRequestNotification } from '../services/telegramService.js';
+import { createCustomerNotification } from '../services/notificationService.js';
 
 export const getMyConfigs = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -158,7 +159,7 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
         });
         return;
       }
-      if (status === 'approved' || status === 'completed' || status === 'active') {
+      if (status !== 'rejected') {
         res.status(400).json({
           success: false,
           error: 'Trial Already Used: You have already claimed or been approved for a free trial for this package.'
@@ -254,7 +255,21 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     }
     createdOrder = resData;
 
-    // 4. Immediately send Telegram notification to Administrator
+    // 4. Immediately send Telegram notification to Administrator & create customer notification in DB
+    try {
+      await createCustomerNotification({
+        userId: uid,
+        userEmail: email,
+        title: 'Free Trial Submitted',
+        message: `Your 1-Day Free Trial request for ${matchedTemplate.package_name || 'VPN Package'} has been submitted and is pending administrator approval.`,
+        type: 'trial_submitted',
+        orderId: orderId,
+        vpnName: matchedTemplate.package_name
+      });
+    } catch (notifErr) {
+      console.error('[vpnController] Customer notification creation error for trial request:', notifErr);
+    }
+
     try {
       await sendTrialRequestNotification({
         customerName: finalCustomerName,

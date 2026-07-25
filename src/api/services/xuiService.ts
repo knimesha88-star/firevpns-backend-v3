@@ -918,6 +918,10 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     total_bytes: totalBytes,
     status: 'active',
     enable: true,
+    is_trial: isTrialOrder,
+    activated_at: new Date().toISOString(),
+    expires_at: new Date(expiryMs).toISOString(),
+    data_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
     updated_at: new Date().toISOString()
   };
 
@@ -979,10 +983,15 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     server: template.server || extra.server || 'Singapore',
     sni: sni,
     inbound_id: inboundId,
-    traffic_limit: totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+    traffic_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
     expiry_time: new Date(expiryMs).toISOString(),
+    expiry_date: new Date(expiryMs).toISOString(),
     enabled: true,
-    status: 'active'
+    status: 'active',
+    is_trial: isTrialOrder,
+    activated_at: new Date().toISOString(),
+    expires_at: new Date(expiryMs).toISOString(),
+    data_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited')
   };
 
   let confErr: any = null;
@@ -1012,6 +1021,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     vless_url: vlessUrl,
     subscription_url: subscriptionUrl,
     expiry_date: new Date(expiryMs).toISOString(),
+    is_trial: isTrialOrder,
+    activated_at: new Date().toISOString(),
+    expires_at: new Date(expiryMs).toISOString(),
     updated_at: new Date().toISOString()
   };
 
@@ -1071,6 +1083,270 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     subscriptionUrl,
     vpnAccountId
   };
+};
+
+export const disable3XUiClient = async (inboundId: number | null, uuid: string, email?: string): Promise<boolean> => {
+  try {
+    const config = await getXuiConfig();
+    const token = config.apiToken || config.password;
+    if (!token) return false;
+
+    const endpointsToTry = [
+      `/panel/api/inbounds/updateClient/${uuid}`,
+      `/panel/api/clients/update/${uuid}`
+    ];
+
+    if (inboundId) {
+      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/delClient/${uuid}`);
+    }
+
+    for (const endpoint of endpointsToTry) {
+      try {
+        const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, endpoint);
+        const client = createAxiosInstance(baseUrl);
+
+        if (endpoint.includes('delClient')) {
+          await client.post(fullPath, {}, { headers: { Authorization: `Bearer ${token}` } });
+          return true;
+        } else {
+          const payload = {
+            id: inboundId || 1,
+            settings: JSON.stringify({
+              clients: [{
+                id: uuid,
+                email: email || '',
+                enable: false,
+                expiryTime: 0,
+                totalGB: 0
+              }]
+            })
+          };
+          const res = await client.post(fullPath, payload, { headers: { Authorization: `Bearer ${token}` } });
+          if (res.data && (res.data.success || res.status === 200)) return true;
+        }
+      } catch (e) {
+        // Continue to next endpoint
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[3X-UI] Error disabling client ${uuid}:`, err);
+    return false;
+  }
+};
+
+let lastCleanupTime = 0;
+
+export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
+  const now = Date.now();
+  if (now - lastCleanupTime < 3000) {
+    return { count: 0 };
+  }
+  lastCleanupTime = now;
+
+  let expiredCount = 0;
+  try {
+    const dbClient = supabaseAdmin;
+
+    // 1. Fetch vpn_configs
+    const { data: configs } = await dbClient
+      .from('vpn_configs')
+      .select('*');
+
+    // 2. Fetch vpn_accounts
+    const { data: accounts } = await dbClient
+      .from('vpn_accounts')
+      .select('*');
+
+    // 3. Fetch 3X-UI inbounds for live stats
+    let inbounds: any[] = [];
+    try {
+      inbounds = await getInbounds();
+    } catch (e) {
+      // Inbound fetch error, fallback to DB timestamps
+    }
+
+    const candidateTrials: Array<{
+      type: 'config' | 'account';
+      id: string;
+      orderId: string;
+      uuid: string;
+      customerUid: string;
+      email: string;
+      packageName: string;
+      inboundId: number | null;
+      expiryMs: number | null;
+      status: string;
+      enabled: boolean;
+      totalBytes: number;
+      isTrial: boolean;
+    }> = [];
+
+    if (configs && Array.isArray(configs)) {
+      configs.forEach(cfg => {
+        const orderId = String(cfg.order_id || '');
+        const isTrial = !!(cfg.is_trial || cfg.isTrial || cfg.trial || orderId.startsWith('TRIAL-') || String(cfg.package_type || '').toLowerCase().includes('trial'));
+        const isAlreadyExpired = String(cfg.status || '').toLowerCase() === 'expired' || cfg.enabled === false;
+
+        if (isTrial && !isAlreadyExpired) {
+          const expVal = cfg.expires_at || cfg.expiry_date || cfg.expiry_time;
+          let expMs: number | null = null;
+          if (expVal) {
+            expMs = typeof expVal === 'number' ? (expVal < 10000000000 ? expVal * 1000 : expVal) : new Date(expVal).getTime();
+          }
+
+          candidateTrials.push({
+            type: 'config',
+            id: cfg.id,
+            orderId,
+            uuid: cfg.uuid,
+            customerUid: cfg.customer_uid,
+            email: cfg.user_email || cfg.email || '',
+            packageName: cfg.package_name || cfg.config_name || 'FIREVPN Package',
+            inboundId: cfg.inbound_id || null,
+            expiryMs: expMs,
+            status: cfg.status,
+            enabled: cfg.enabled !== false,
+            totalBytes: 1073741824, // 1 GB
+            isTrial: true
+          });
+        }
+      });
+    }
+
+    if (accounts && Array.isArray(accounts)) {
+      accounts.forEach(acc => {
+        const orderId = String(acc.order_id || '');
+        const isTrial = !!(acc.is_trial || acc.isTrial || acc.trial || orderId.startsWith('TRIAL-'));
+        const isAlreadyExpired = String(acc.status || '').toLowerCase() === 'expired' || acc.enable === false;
+
+        if (isTrial && !isAlreadyExpired) {
+          const existsInCandidates = candidateTrials.some(c => c.orderId === orderId || (c.uuid && acc.uuid && c.uuid.toLowerCase() === acc.uuid.toLowerCase()));
+          if (!existsInCandidates) {
+            const expVal = acc.expires_at || acc.expiry_date || acc.expiry_time;
+            let expMs: number | null = null;
+            if (expVal) {
+              expMs = typeof expVal === 'number' ? (expVal < 10000000000 ? expVal * 1000 : expVal) : new Date(expVal).getTime();
+            }
+
+            candidateTrials.push({
+              type: 'account',
+              id: acc.id,
+              orderId,
+              uuid: acc.uuid,
+              customerUid: acc.user_id,
+              email: acc.email || '',
+              packageName: acc.remark || 'FIREVPN Package',
+              inboundId: null,
+              expiryMs: expMs,
+              status: acc.status,
+              enabled: acc.enable !== false,
+              totalBytes: acc.total_bytes || 1073741824,
+              isTrial: true
+            });
+          }
+        }
+      });
+    }
+
+    for (const trial of candidateTrials) {
+      let isExpiredByTime = false;
+      let isExpiredByData = false;
+
+      // Requirement 2: Trial expires when expires_at <= NOW()
+      if (trial.expiryMs && trial.expiryMs <= now) {
+        isExpiredByTime = true;
+      }
+
+      // Requirement 2: Or when user reaches the 1 GB data limit (1,073,741,824 bytes)
+      const ONE_GB_BYTES = 1073741824;
+      let usedBytes = 0;
+
+      if (inbounds.length > 0 && trial.uuid) {
+        for (const ib of inbounds) {
+          const clientStats = ib.clientStats || [];
+          const stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(trial.uuid).toLowerCase());
+          if (stat) {
+            usedBytes = (stat.up || 0) + (stat.down || 0);
+            break;
+          }
+        }
+      }
+
+      if (usedBytes >= ONE_GB_BYTES) {
+        isExpiredByData = true;
+      }
+
+      if (isExpiredByTime || isExpiredByData) {
+        // Requirement 3: Disable or remove VPN client from 3X-UI
+        if (trial.uuid) {
+          await disable3XUiClient(trial.inboundId, trial.uuid, trial.email);
+        }
+
+        // Requirement 3 & 4: Mark trial as Expired in database (keep record for history)
+        if (trial.type === 'config' || trial.id) {
+          await dbClient
+            .from('vpn_configs')
+            .update({ status: 'expired', enabled: false })
+            .eq('id', trial.id);
+        }
+
+        if (trial.orderId) {
+          await dbClient
+            .from('vpn_accounts')
+            .update({ status: 'expired', enable: false })
+            .eq('order_id', trial.orderId);
+
+          await dbClient
+            .from('orders')
+            .update({ status: 'expired', payment_status: 'Expired', updated_at: new Date().toISOString() })
+            .eq('id', trial.orderId);
+
+          await dbClient
+            .from('orders')
+            .update({ status: 'expired', payment_status: 'Expired', updated_at: new Date().toISOString() })
+            .eq('order_id', trial.orderId);
+        }
+
+        // Requirement 5: Show customer a dashboard notification
+        const targetUserId = trial.customerUid;
+        const targetEmail = trial.email;
+
+        if (targetUserId || targetEmail) {
+          let notifQuery = dbClient
+            .from('notifications')
+            .select('id')
+            .eq('type', 'trial_expired');
+
+          if (trial.orderId) {
+            notifQuery = notifQuery.eq('order_id', trial.orderId);
+          } else if (targetEmail) {
+            notifQuery = notifQuery.eq('user_email', targetEmail);
+          }
+
+          const { data: existingNotifs } = await notifQuery.maybeSingle();
+
+          if (!existingNotifs) {
+            await createCustomerNotification({
+              userId: targetUserId || null,
+              userEmail: targetEmail,
+              title: 'Free Trial Expired',
+              message: 'Your free trial has ended. Upgrade to continue using FIREVPNs.',
+              type: 'trial_expired',
+              orderId: trial.orderId,
+              vpnName: trial.packageName
+            });
+          }
+        }
+
+        expiredCount++;
+      }
+    }
+  } catch (err) {
+    console.warn('[Cleanup Expired Trials] Error during trial cleanup execution:', err);
+  }
+
+  return { count: expiredCount };
 };
 
 
