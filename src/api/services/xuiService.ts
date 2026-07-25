@@ -621,6 +621,7 @@ export const add3XUiClient = async (
     inboundIds: [inboundId]
   };
 
+  console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
   try {
     const response = await client.request({
@@ -732,7 +733,21 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('[Purchase Flow] Selected template name:', template.package_name || template.name);
   console.log('[Purchase Flow] Loaded template:', JSON.stringify(template, null, 2));
 
-  let inboundId = Number(template.inbound_id) || 1;
+  // Requirement 2: Ensure inbound_id comes from template
+  if (!template.inbound_id) {
+    const errorMsg = `Provisioning template '${template.id}' for package '${packageName}' is missing 'inbound_id'.`;
+    console.error(`[Purchase Flow] Error: ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  const inboundId = Number(template.inbound_id);
+  console.log(`[Purchase Flow] DEBUG: Selected Template ID: ${template.id}`);
+  console.log(`[Purchase Flow] DEBUG: Template inbound_id: ${template.inbound_id}`);
+  console.log(`[Purchase Flow] DEBUG: Final inboundId: ${inboundId}`);
+  
+  // Note: 3X-UI inbound used will be logged when calling the 3X-UI API, which typically logs inboundId.
+  // We already have the inboundId here.
+
   const address = template.address || '';
   const sni = template.sni || '';
   const remarkFormat = template.remark_template || template.remarkFormat || '{{customerName}}';
@@ -815,7 +830,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     if (found) {
       existingClient = found;
       targetInboundId = Number(ib.id);
-      inboundId = targetInboundId; // Reassign inboundId to maintain existing inbound mapping
       break;
     }
   }
@@ -859,6 +873,22 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   // Determine UUID and subId, prioritizing existing records to prevent duplicates
   let uuid = existingClient ? existingClient.id : (existingTrialConfig ? existingTrialConfig.uuid : (existingAcc ? existingAcc.uuid : crypto.randomUUID()));
   let subId = existingClient ? existingClient.subId : crypto.randomBytes(12).toString('hex');
+
+  // Let's ensure if existingAcc is null, we fetch any existing account with the same UUID to prevent duplicate key constraint violation.
+  if (!existingAcc && uuid) {
+    const { data: accByUuid, error: errByUuid } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('uuid', uuid)
+      .maybeSingle();
+    if (errByUuid) {
+      console.warn('[3X-UI Provisioning DB] vpn_accounts select by uuid notice:', errByUuid);
+    }
+    if (accByUuid) {
+      console.log(`[3X-UI Provisioning DB] Found existing vpn_account matching UUID: ${uuid}. Setting existingAcc to avoid duplicate INSERT.`);
+      existingAcc = accByUuid;
+    }
+  }
 
   // Find target inbound details from our cached list
   const inbound = allInbounds.find((i: any) => Number(i.id) === inboundId) || {
