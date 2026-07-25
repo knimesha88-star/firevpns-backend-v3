@@ -250,42 +250,18 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
 
 export const getInbounds = async (): Promise<XuiInbound[]> => {
   console.log('[xuiService] [FUNCTION ENTERED] getInbounds');
-  const endpoints = ['/panel/api/inbounds/list', '/panel/api/inbounds', '/api/inbounds'];
-  let inboundsData: any = null;
-
-  for (const ep of endpoints) {
-    try {
-      inboundsData = await requestApi<XuiInbound[]>(ep);
-      if (Array.isArray(inboundsData)) {
-        break;
-      }
-    } catch (error: any) {
-      console.warn(`[XUI Service] Failed to retrieve inbounds from ${ep}:`, error.message);
+  // Use only the supported endpoint
+  const endpoint = '/panel/api/inbounds/list';
+  try {
+    const inboundsData = await requestApi<XuiInbound[]>(endpoint);
+    if (Array.isArray(inboundsData)) {
+        return inboundsData;
     }
-  }
-
-  if (!Array.isArray(inboundsData)) {
-    console.error('[XUI Service] Failed to retrieve inbounds from all endpoints');
+    return [];
+  } catch (error: any) {
+    console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
     return [];
   }
-
-  try {
-    inboundsData.forEach((inbound: any) => {
-        const settings =
-            typeof inbound.settings === "string"
-                ? JSON.parse(inbound.settings)
-                : inbound.settings;
-
-        if (settings && settings.clients) {
-            settings.clients.forEach((c: any) => {
-            });
-        }
-    });
-  } catch (e) {
-    // Ignore parsing issues in audit loop
-  }
-
-  return inboundsData;
 };
 
 export const getClientByEmail = async (email: string): Promise<any | null> => {
@@ -1444,13 +1420,8 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       .from('vpn_accounts')
       .select('*');
 
-    // 3. Fetch 3X-UI inbounds for live stats
+    // 3. Fetch 3X-UI inbounds for live stats - Removed: unnecessary API requests
     let inbounds: any[] = [];
-    try {
-      inbounds = await getInbounds();
-    } catch (e) {
-      // Inbound fetch error, fallback to DB timestamps
-    }
 
     const candidateTrials: Array<{
       type: 'config' | 'account';
