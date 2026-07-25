@@ -2,8 +2,6 @@ import { supabase } from '../../lib/supabase.js';
 import { getInbounds } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
-  console.log("Current UID:", uid);
-  console.log("Current Email:", email);
 
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
@@ -22,9 +20,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     const { data: vpnAccs } = await query.order('created_at', { ascending: false });
 
     if (vpnAccs && Array.isArray(vpnAccs)) {
-      console.log(`[VPN Lookup] Found ${vpnAccs.length} vpn_accounts for user.`);
       vpnAccs.forEach((acc, index) => {
-        console.log(`[VPN Lookup] Row ${index + 1}: id=${acc.id}, email=${acc.email}, uuid=${acc.uuid}, remark=${acc.remark}, server_id=${acc.server_id}, created_at=${acc.created_at}, status=${acc.status}`);
       });
       vpnAccs.forEach(acc => {
         const docUserId = String(acc.user_id || '').trim();
@@ -66,7 +62,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     return matchesUser && isApproved;
   });
 
-  console.log("Orders Found:", matchedDocs.length);
 
   matchedDocs.forEach(data => {
     const vlessUrl = data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '';
@@ -168,23 +163,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
-      console.log(`Stored UUID: ${config.uuid}`);
-      console.log(`3X-UI UUIDs checked: ${JSON.stringify(checkedUuids)}`);
-      console.log("No matching UUID found.");
     }
 
     const totalUsed = up + down;
     const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
 
-    console.log(`[VPN Audit] User email: ${userEmail}`);
-    console.log(`[VPN Audit] UUID: ${config.uuid}`);
-    console.log(`[VPN Audit] Inbound ID: ${inboundId}`);
-    console.log(`[VPN Audit] Client email: ${clientEmail}`);
-    console.log(`[VPN Audit] Upload: ${up}`);
-    console.log(`[VPN Audit] Download: ${down}`);
-    console.log(`[VPN Audit] Total: ${total}`);
-    console.log(`[VPN Audit] Remaining: ${remainingTraffic}`);
-    console.log(`[VPN Audit] Last online: ${lastOnline}`);
 
     const usedGB = parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2));
     const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : 'Unlimited';

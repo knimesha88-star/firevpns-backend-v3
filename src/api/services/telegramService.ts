@@ -95,7 +95,6 @@ ${paymentDate}`;
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
     } else {
-      console.log('[TelegramService] Renewal notification sent successfully via Telegram.');
     }
   } catch (err: any) {
     console.error('[TelegramService] Failed to send Telegram notification:', err?.message || err);
@@ -153,10 +152,84 @@ ${approved_at}
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
     } else {
-      console.log('[TelegramService] Renewal approved notification sent successfully via Telegram.');
     }
   } catch (err: any) {
     console.error('[TelegramService] Failed to send Telegram approved notification:', err?.message || err);
+  }
+};
+
+export interface SupportTicketNotificationData {
+  ticketId?: string;
+  customerName?: string;
+  email?: string;
+  category?: string;
+  priority?: string;
+  subject?: string;
+  message?: string;
+  time?: string;
+}
+
+export const sendNewSupportTicketNotification = async (data: SupportTicketNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram new support ticket notification.');
+    return;
+  }
+
+  const ticketId = data.ticketId || 'N/A';
+  const customer = data.customerName || 'N/A';
+  const email = data.email || 'N/A';
+  const category = data.category || 'N/A';
+  const priority = data.priority || 'N/A';
+  const subject = data.subject || 'N/A';
+  const message = data.message || 'N/A';
+  
+  let currentDateTime = data.time;
+  if (!currentDateTime) {
+    try {
+      currentDateTime = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+    } catch (e) {
+      currentDateTime = 'N/A';
+    }
+  }
+
+  const text = `🎫 New Support Ticket
+
+Ticket ID: ${ticketId}
+Customer: ${customer}
+Email: ${email}
+Category: ${category}
+Priority: ${priority}
+Subject: ${subject}
+
+Message:
+${message}
+
+Time:
+${currentDateTime}
+
+🔗 Admin Support Page: https://firevpns.com/admin/support`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    } else {
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram new support ticket notification:', err?.message || err);
   }
 };
 
@@ -271,7 +344,6 @@ Status:
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
     } else {
-      console.log('[TelegramService] New order notification sent successfully via Telegram.');
     }
   } catch (err: any) {
     console.error('[TelegramService] Failed to send Telegram new order notification:', err?.message || err);
@@ -367,7 +439,6 @@ VPN has been generated successfully.`;
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
     } else {
-      console.log('[TelegramService] Order approved Telegram notification sent successfully.');
     }
   } catch (err: any) {
     console.error('[TelegramService] Failed to send Telegram order approved notification:', err?.message || err);
@@ -415,7 +486,6 @@ ${reason}`;
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
     } else {
-      console.log('[TelegramService] Order rejected Telegram notification sent successfully.');
     }
   } catch (err: any) {
     console.error('[TelegramService] Failed to send Telegram order rejected notification:', err?.message || err);

@@ -132,7 +132,6 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
   const client = createAxiosInstance(baseUrl);
 
-  console.log(`[XUI API] ${method} ${fullUrl}`);
   
   try {
     const response = await client.request({
@@ -144,7 +143,6 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
       }
     });
 
-    console.log(`[XUI API] Response status for ${endpoint}: ${response.status}`);
 
     if (response.status !== 200) {
       throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
@@ -173,7 +171,6 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, '/panel/api/inbounds/list');
   const client = createAxiosInstance(baseUrl);
 
-  console.log(`[XUI API] Testing connection with GET ${fullUrl}`);
   
   const response = await client.request({
     url: fullPath,
@@ -183,7 +180,6 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
     }
   });
 
-  console.log(`[XUI API] Test connection response status: ${response.status}`);
 
   if (response.status !== 200) {
     throw new Error(`Connection test failed: ${response.status} ${response.statusText}`);
@@ -201,20 +197,16 @@ export const getInbounds = async (): Promise<XuiInbound[]> => {
     const inboundsData = await requestApi<XuiInbound[]>('/panel/api/inbounds/list');
     const response = { data: { obj: inboundsData } };
 
-    console.log("Total inbounds:", response.data.obj.length);
 
     response.data.obj.forEach((inbound: any) => {
-        console.log("Inbound:", inbound.id, inbound.remark);
 
         const settings =
             typeof inbound.settings === "string"
                 ? JSON.parse(inbound.settings)
                 : inbound.settings;
 
-        console.log("Clients in this inbound:", settings.clients.length);
 
         settings.clients.forEach((c: any) => {
-            console.log("Client:", c.email);
         });
     });
 
@@ -229,7 +221,6 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
   try {
     const inbounds = await getInbounds();
     
-    console.log("Searching for email:", email);
     
     for (const inbound of inbounds) {
       let settingsObj: { clients?: XuiClient[] } = {};
@@ -245,9 +236,7 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       const clientStats = inbound.clientStats || [];
       
       for (const c of clients) {
-        console.log("Comparing:", c.email, "==", email);
         if (String(c.email).trim().toLowerCase() === String(email).trim().toLowerCase()) {
-          console.log("MATCH FOUND");
           const stat = (inbound.clientStats || []).find((s) => s.email === c.email);
           
           let total = c.totalGB || 0;
@@ -293,7 +282,6 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
         }
       }
     }
-    console.log("NO MATCH FOUND AFTER CHECKING ALL CLIENTS");
     return null;
   } catch (error: any) {
     console.error(`[XUI Service] Error looking up client by email (${email}):`, error.message);
@@ -557,12 +545,6 @@ export const add3XUiClient = async (
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
 
-  console.log("==================================================");
-  console.log("[3X-UI add3XUiClient] Sending client payload with generated values:");
-  console.log(`1. client.id (UUID v4): ${clientData.uuid}`);
-  console.log(`2. client.subId: ${clientData.subId}`);
-  console.log(`3. client.email (remark): ${clientData.email}`);
-  console.log(`4. client.flow: ${clientFlow}`);
 
   const payload = {
     client: {
@@ -578,9 +560,6 @@ export const add3XUiClient = async (
     inboundIds: [inboundId]
   };
 
-  console.log("Request URL:", fullUrl);
-  console.log("=== 3X-UI REQUEST ===");
-  console.log(JSON.stringify(payload, null, 2));
 
   try {
     const response = await client.request({
@@ -592,8 +571,6 @@ export const add3XUiClient = async (
       }
     });
 
-    console.log("=== 3X-UI RESPONSE ===");
-    console.log(JSON.stringify(response.data, null, 2));
 
     if (response.status !== 200 && response.status !== 201) {
       throw new Error(`3X-UI API Error: HTTP status ${response.status}`);
@@ -604,7 +581,6 @@ export const add3XUiClient = async (
       throw new Error(`3X-UI API Error: ${errorMsg}`);
     }
 
-    console.log("Client Created Successfully");
     return response.data;
   } catch (error: any) {
     console.error("=== 3X-UI ERROR ===");
@@ -629,12 +605,10 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     order = queryOrder;
   }
 
-  console.log(`[3X-UI Provisioning] Starting approval transaction for Order ID: ${order.id} (${order.order_id || 'N/A'}) - Customer: ${order.email}`);
 
   // Idempotency Check: If order is already completed/active with existing VPN link, return existing details
   const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active') && order.vless_url;
   if (isAlreadyCompleted) {
-    console.log(`[3X-UI Provisioning] Order ${order.id} is already completed/active. Returning existing VPN.`);
     const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
     return {
       success: true,
@@ -752,7 +726,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       subId,
       flow
     });
-    console.log(`[3X-UI Provisioning] Client '${remark}' created successfully on 3X-UI server.`);
   } catch (addErr: any) {
     const errMsg = String(
       addErr?.message || 
@@ -771,7 +744,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       errMsg.includes('email');
 
     if (isDuplicate) {
-      console.log(`[3X-UI Provisioning] Client '${remark}' already exists on 3X-UI. Reusing existing client...`);
     } else {
       console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
       throw addErr;
@@ -783,7 +755,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (readBackClient && readBackClient.uuid) {
     uuid = readBackClient.uuid;
     if (readBackClient.subId) subId = readBackClient.subId;
-    console.log(`[3X-UI Provisioning] Read back exact client from 3X-UI: uuid=${uuid}`);
   } else {
     console.warn(`[3X-UI Provisioning] Read back client returned null for remark '${remark}', using UUID: ${uuid}`);
   }
@@ -796,7 +767,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
 
   // Step 4: Upsert vpn_accounts
-  console.log(`[3X-UI Provisioning DB] Step 4: Upserting vpn_accounts for order ${order.id}...`);
   let vpnAccountId = '';
   let existingAcc: any = null;
 
@@ -872,11 +842,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_accounts':", accErr);
     throw new Error(`Database update failed for table 'vpn_accounts': ${accErr.message || JSON.stringify(accErr)}`);
   } else {
-    console.log(`[3X-UI Provisioning DB] vpn_accounts updated successfully for order ${order.id}.`);
   }
 
   // Step 5: Upsert vpn_configs
-  console.log(`[3X-UI Provisioning DB] Step 5: Upserting vpn_configs for order ${order.id}...`);
   let existingConfig: any = null;
   if (order.id) {
     const { data: cData, error: cErr } = await dbClient.from('vpn_configs').select('id').eq('order_id', order.id).maybeSingle();
@@ -919,11 +887,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     console.error("[3X-UI Provisioning DB] Error updating table 'vpn_configs':", confErr);
     throw new Error(`Database update failed for table 'vpn_configs': ${confErr.message || JSON.stringify(confErr)}`);
   } else {
-    console.log(`[3X-UI Provisioning DB] vpn_configs updated successfully for order ${order.id}.`);
   }
 
   // Step 6: Update orders (payment_status='Paid', status='completed', provisioning_status='completed')
-  console.log(`[3X-UI Provisioning DB] Step 6: Updating orders table for order ${order.id}...`);
   const ordersPayload: any = {
     payment_status: 'Paid',
     status: 'completed',
@@ -949,11 +915,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
   } else {
-    console.log(`[3X-UI Provisioning DB] orders table updated successfully for order ${order.id} (status='completed', payment_status='Paid').`);
   }
 
   // Step 7: Create customer notification in notifications table
-  console.log(`[3X-UI Provisioning DB] Step 7: Creating notification for user ${order.email}...`);
   try {
     const notif = await createCustomerNotification({
       userId: validUserId,
@@ -963,7 +927,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       type: 'success',
       orderId: order.id
     });
-    console.log(`[3X-UI Provisioning DB] Customer notification result:`, notif ? 'Created' : 'Logged warning');
   } catch (notifErr) {
     console.warn('[3X-UI Provisioning DB] Customer notification warning:', notifErr);
   }

@@ -36,7 +36,6 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
     }
 
     if (activeConfig) {
-      console.log(`[clientService] Found active config: UUID: ${activeConfig.uuid}, ServerNode: ${activeConfig.serverNode}, Upload: ${activeConfig.upload}, Download: ${activeConfig.download}`);
       return {
         email,
         uuid: activeConfig.uuid,

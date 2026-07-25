@@ -18,7 +18,6 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
       throw error || new Error('User not found');
     }
 
-    console.log('[AuthMiddleware] Verified Supabase token for:', user.email);
     req.user = {
       uid: user.id,
       email: user.email,
@@ -42,7 +41,6 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
             role: payload.role || payload.user_metadata?.role || 'customer',
             ...payload
           };
-          console.log('[AuthMiddleware] Authenticated user via JWT fallback:', decodedToken.email || decodedToken.uid);
           req.user = decodedToken;
           next();
           return;
@@ -52,7 +50,6 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
       }
     }
 
-    console.log('[AuthMiddleware] Authentication failed');
     res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
 };
