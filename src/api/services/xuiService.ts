@@ -813,6 +813,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       .maybeSingle();
     if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by order_id notice:', e1);
     existingAcc = d1;
+    console.log('Lookup by order_id:', d1);
   }
 
   // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
@@ -825,6 +826,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       .maybeSingle();
     if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by trial/user notice:', e1);
     existingAcc = d1;
+    console.log('Lookup by trial:', d1);
   }
 
   // Fetch all inbounds to search for an existing client in 3X-UI panel
@@ -901,6 +903,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     if (errByUuid) {
       console.warn('[3X-UI Provisioning DB] vpn_accounts select by uuid notice:', errByUuid);
     }
+    console.log('Lookup by uuid:', accByUuid);
     if (accByUuid) {
       console.log(`[3X-UI Provisioning DB] Found existing vpn_account matching UUID: ${uuid}. Setting existingAcc to avoid duplicate INSERT.`);
       existingAcc = accByUuid;
@@ -1177,6 +1180,14 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     data_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
     updated_at: new Date().toISOString()
   };
+
+  console.log('========== VPN ACCOUNT DECISION ==========');
+  console.log('Order ID:', order.id);
+  console.log('UUID:', uuid);
+  console.log('isTrialOrder:', isTrialOrder);
+  console.log('existingAcc:', JSON.stringify(existingAcc, null, 2));
+  console.log('Will perform:', existingAcc ? 'UPDATE' : 'INSERT');
+  console.log('==========================================');
 
   let accErr: any = null;
   if (existingAcc && existingAcc.id) {
