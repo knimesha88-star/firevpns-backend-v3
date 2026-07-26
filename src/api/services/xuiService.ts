@@ -1031,12 +1031,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const existingClients: any[] = settingsObj.clients;
   const clientCountBefore = existingClients.length;
 
-  // Check whether the UUID or email already exists
-  const existingIndex = existingClients.findIndex((c: any) =>
-    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
-    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
-  );
-
   const newClientRecord = {
     id: uuid,
     email: remark,
@@ -1049,6 +1043,18 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     subId: subId,
     reset: 0
   };
+
+  console.log('=== [DIAGNOSTIC] 1. Before update ===');
+  console.log(`Target inbound ID: ${inboundId}`);
+  console.log(`settingsObj.clients.length: ${settingsObj.clients.length}`);
+  console.log(`New UUID already exists in settingsObj.clients: ${settingsObj.clients.some((c: any) => c.id === uuid)}`);
+  console.log('New client object being appended/updated:', JSON.stringify(newClientRecord, null, 2));
+
+  // Check whether the UUID or email already exists
+  const existingIndex = existingClients.findIndex((c: any) =>
+    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+  );
 
   if (existingIndex >= 0) {
     console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
@@ -1081,6 +1087,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   console.log(`[3X-UI Provisioning] Clean update payload for POST /panel/api/inbounds/update/${inboundId}:`, JSON.stringify(updateInboundPayload, null, 2));
 
+  console.log('=== [DIAGNOSTIC] 2. Immediately before requestApi ===');
+  console.log('settingsObj.clients payload:', JSON.stringify(settingsObj.clients, null, 2));
+
   console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
   console.log(`[3X-UI Provisioning] Detailed Logs:`);
   console.log(`  - Client count before update: ${clientCountBefore}`);
@@ -1091,6 +1100,54 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const updateRes = await requestApi<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
 
   console.log(`[3X-UI Provisioning] Inbound update HTTP response:`, JSON.stringify(updateRes, null, 2));
+
+  console.log('=== [DIAGNOSTIC] 3. Post-update verification ===');
+  let afterInboundObj: any = null;
+  try {
+    const getRes = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+    afterInboundObj = getRes?.obj || getRes;
+  } catch (getErr: any) {
+    console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
+  }
+
+  if (!afterInboundObj || typeof afterInboundObj !== 'object' || !afterInboundObj.id) {
+    const allInboundsList = await getInbounds();
+    afterInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
+  }
+
+  let afterSettingsObj: any = {};
+  if (afterInboundObj) {
+    if (typeof afterInboundObj.settings === 'string') {
+      try {
+        afterSettingsObj = JSON.parse(afterInboundObj.settings);
+      } catch (e) {
+        afterSettingsObj = { clients: [] };
+      }
+    } else if (afterInboundObj.settings && typeof afterInboundObj.settings === 'object') {
+      afterSettingsObj = afterInboundObj.settings;
+    }
+  }
+
+  const afterClients: any[] = Array.isArray(afterSettingsObj.clients) ? afterSettingsObj.clients : [];
+
+  console.log('=== [DIAGNOSTIC] 4. Length comparison ===');
+  console.log(`BEFORE update settings.clients.length: ${clientCountBefore}`);
+  console.log(`AFTER update settings.clients.length: ${afterClients.length}`);
+
+  console.log('=== [DIAGNOSTIC] 5, 6, 7. UUID Search ===');
+  const foundClient = afterClients.find((c: any) =>
+    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+  );
+
+  if (foundClient) {
+    console.log('UUID Search Result: FOUND');
+    console.log('Complete returned client object:', JSON.stringify(foundClient, null, 2));
+  } else {
+    console.log('UUID Search Result: NOT FOUND');
+    const firstFive = afterClients.slice(0, 5).map((c: any) => c.id || c.email);
+    console.log('First 5 client IDs/emails currently present in inbound:', JSON.stringify(firstFive, null, 2));
+  }
 
   // Immediately read back the created client from 3X-UI to get the exact UUID returned
   const readBackClient = await getClientByEmail(remark);
