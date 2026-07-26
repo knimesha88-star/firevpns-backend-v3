@@ -834,7 +834,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let existingClient = null;
   let targetInboundId = inboundId;
 
-  // Search by remark (email) or by known UUIDs from database
+  // Search by known UUIDs from database (or by remark if it is a trial order)
   for (const ib of allInbounds) {
     let settingsObj: any = {};
     try {
@@ -842,9 +842,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     } catch (e) { continue; }
     const clients = settingsObj.clients || [];
     const found = clients.find((c: any) => 
-      String(c.email).trim().toLowerCase() === remark.trim().toLowerCase() ||
+      (existingAcc && String(c.id).trim().toLowerCase() === String(existingAcc.uuid).trim().toLowerCase()) ||
       (existingTrialConfig && String(c.id).trim().toLowerCase() === String(existingTrialConfig.uuid).trim().toLowerCase()) ||
-      (existingAcc && String(c.id).trim().toLowerCase() === String(existingAcc.uuid).trim().toLowerCase())
+      (isTrialOrder && String(c.email).trim().toLowerCase() === remark.trim().toLowerCase())
     );
     if (found) {
       existingClient = found;
@@ -889,9 +889,22 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     expiryMs = Date.now() + (1 * 24 * 60 * 60 * 1000);
   }
 
-  // Determine UUID and subId, prioritizing existing records to prevent duplicates
-  let uuid = existingClient ? existingClient.id : (existingTrialConfig ? existingTrialConfig.uuid : (existingAcc ? existingAcc.uuid : crypto.randomUUID()));
-  let subId = existingClient ? existingClient.subId : crypto.randomBytes(12).toString('hex');
+  // Determine UUID and subId:
+  // For re-provisioning an existing order or updating a trial: reuse existing UUID
+  // For new paid orders: ALWAYS generate a brand new UUID
+  let uuid: string;
+  let subId: string;
+
+  if (existingAcc && existingAcc.uuid) {
+    uuid = existingAcc.uuid;
+    subId = (existingClient && existingClient.subId) || existingAcc.sub_id || crypto.randomBytes(12).toString('hex');
+  } else if (isTrialOrder && (existingTrialConfig?.uuid || existingAcc?.uuid)) {
+    uuid = existingTrialConfig?.uuid || existingAcc?.uuid;
+    subId = (existingClient && existingClient.subId) || existingTrialConfig?.sub_id || crypto.randomBytes(12).toString('hex');
+  } else {
+    uuid = crypto.randomUUID();
+    subId = crypto.randomBytes(12).toString('hex');
+  }
 
   // Let's ensure if existingAcc is null, we fetch any existing account with the same UUID to prevent duplicate key constraint violation.
   if (!existingAcc && uuid) {
@@ -1044,10 +1057,10 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log(`New UUID already exists in settingsObj.clients: ${settingsObj.clients.some((c: any) => c.id === uuid)}`);
   console.log('New client object being appended/updated:', JSON.stringify(newClientRecord, null, 2));
 
-  // Check whether the UUID or email already exists
+  // Check whether the UUID already exists on this inbound (or by email for trial orders)
   const existingIndex = existingClients.findIndex((c: any) =>
     (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
-    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+    (isTrialOrder && c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
   );
 
   if (existingIndex >= 0) {
