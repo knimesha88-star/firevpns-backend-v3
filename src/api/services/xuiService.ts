@@ -663,26 +663,23 @@ export const add3XUiClient = async (
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
   const payload = {
-    id: inboundId,
-    settings: JSON.stringify({
-      clients: [
-        {
-          id: clientData.uuid,
-          email: clientData.email,
-          flow: clientFlow,
-          limitIp: 0,
-          totalGB: clientData.totalBytes,
-          expiryTime: clientData.expiryMs,
-          enable: true,
-          subId: clientData.subId
-        }
-      ]
-    })
+    client: {
+      id: clientData.uuid,
+      email: clientData.email,
+      flow: clientFlow,
+      limitIp: 0,
+      totalGB: clientData.totalBytes,
+      expiryTime: clientData.expiryMs,
+      enable: true,
+      subId: clientData.subId
+    },
+    inboundIds: [inboundId]
   };
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
   const endpoint = '/panel/api/inbounds/addClient';
+  
   try {
     return await requestApi<any>(endpoint, 'POST', payload);
   } catch (error: any) {
@@ -1018,30 +1015,40 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
     // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
     try {
+      const updateEndpoints = [
+        `/panel/api/inbounds/updateClient/${uuid}`,
+        `/panel/api/clients/update/${uuid}`
+      ];
+
       const updatePayload = {
-        id: inboundId,
-        settings: JSON.stringify({
-          clients: [
-            {
-              id: uuid,
-              email: remark,
-              flow: flow,
-              limitIp: 0,
-              totalGB: totalBytes,
-              expiryTime: expiryMs,
-              enable: true,
-              subId: subId
-            }
-          ]
-        })
+        client: {
+          id: uuid,
+          email: remark,
+          flow: flow,
+          limitIp: 0,
+          totalGB: totalBytes,
+          expiryTime: expiryMs,
+          enable: true,
+          subId: subId
+        },
+        inboundIds: [inboundId]
       };
 
       console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI payload:', JSON.stringify(updatePayload, null, 2));
 
-      try {
-        await requestApi<any>(`/panel/api/inbounds/updateClient/${uuid}`, 'POST', updatePayload);
-      } catch (epErr: any) {
-        console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', epErr?.message || epErr);
+      let updated = false;
+      for (const endpoint of updateEndpoints) {
+        try {
+          await requestApi<any>(endpoint, 'POST', updatePayload);
+          updated = true;
+          break;
+        } catch (epErr: any) {
+          console.warn(`[3X-UI Provisioning] Update on ${endpoint} failed:`, epErr?.message || epErr);
+        }
+      }
+
+      if (!updated) {
+        console.warn('[3X-UI Provisioning] Update of existing client settings failed across all endpoints.');
       }
     } catch (updErr: any) {
       console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', updErr?.message || updErr);
