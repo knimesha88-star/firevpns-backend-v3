@@ -538,12 +538,21 @@ export const updateClientExpiry = async (
           reset: parsedReset
         };
 
-        console.log('[updateClientExpiry] Final JSON payload immediately before 3X-UI API request:');
-        console.log(JSON.stringify(clientPayload, null, 2));
+        // Remove subId to prevent duplicate subId errors on 3X-UI panel during update
+        const { subId, ...finalPayload } = clientPayload;
+
+        const maskedPayload = {
+          ...finalPayload,
+          id: finalPayload.id ? `${finalPayload.id.substring(0, 8)}...` : undefined,
+          email: finalPayload.email ? `${finalPayload.email.substring(0, 4)}...` : undefined
+        };
+
+        console.log('[updateClientExpiry] Final JSON payload immediately before 3X-UI API request (sensitive data masked):');
+        console.log(JSON.stringify(maskedPayload, null, 2));
 
         for (const ep of updateEndpoints) {
           try {
-            await requestApi<any>(ep, 'POST', clientPayload);
+            await requestApi<any>(ep, 'POST', finalPayload);
             updated = true;
             break;
           } catch (e: any) {
