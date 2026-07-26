@@ -175,11 +175,13 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
 
     console.log(`[RenewController] Approving renewal request ${requestId} for ${email} (UUID: ${targetUuid}, ${durationMonths} month(s)). Old Expiry: ${oldExpiryIso}`);
     
+    const planName = data.plan_name || data.planName || data.plan || parsedNotes?.plan_name || parsedNotes?.planName || '';
+
     // 2. Extend client expiry in 3X-UI using UUID
-    const new_expiryMs = await xuiService.updateClientExpiry(targetUuid, durationMonths);
+    const { new_expiryMs, newTotalBytes } = await xuiService.updateClientExpiry(targetUuid, durationMonths, planName);
     const new_expiryIso = new Date(new_expiryMs).toISOString();
 
-    console.log(`[RenewController] 3X-UI update successful. New expiry time: ${new_expiryIso}. Executing atomic database updates...`);
+    console.log(`[RenewController] 3X-UI update successful. New expiry time: ${new_expiryIso}. New total bytes: ${newTotalBytes}. Executing atomic database updates...`);
     
     const nowIso = new Date().toISOString();
     const adminEmail = req.user?.email || req.user?.uid || 'Admin';
@@ -200,6 +202,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       throw updateErr;
     }
     
+    const dataLimitStr = newTotalBytes > 0 
+      ? `${newTotalBytes / (1024 * 1024 * 1024)}GB` 
+      : 'Unlimited';
+
     // 4. Update vpn_accounts
     try {
       let updatedSpecific = false;
@@ -210,12 +216,13 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           .update({
             expiry_date: new_expiryIso,
             expiry_time: new_expiryMs,
+            data_limit: dataLimitStr,
             updated_at: nowIso
           })
           .eq('id', targetVpnAcc.id);
         if (!vErr) {
           updatedSpecific = true;
-          console.log(`[RenewController] Successfully renewed vpn_account by ID: ${targetVpnAcc.id}`);
+          console.log(`[RenewController] Successfully renewed vpn_account by ID: ${targetVpnAcc.id} with data limit: ${dataLimitStr}`);
         } else {
           console.warn(`[RenewController] Failed to renew vpn_account by ID: ${targetVpnAcc.id}`, vErr);
         }
@@ -225,24 +232,26 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           .update({
             expiry_date: new_expiryIso,
             expiry_time: new_expiryMs,
+            data_limit: dataLimitStr,
             updated_at: nowIso
           })
           .eq('uuid', targetUuid);
         if (!vErr) {
           updatedSpecific = true;
-          console.log(`[RenewController] Successfully renewed vpn_account by UUID: ${targetUuid}`);
+          console.log(`[RenewController] Successfully renewed vpn_account by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
         } else {
           console.warn(`[RenewController] Failed to renew vpn_account by UUID: ${targetUuid}`, vErr);
         }
       }
 
       if (!updatedSpecific && targetUuid) {
-        console.log(`[RenewController] Fallback: Renewing vpn_accounts by UUID: ${targetUuid}`);
+        console.log(`[RenewController] Fallback: Renewing vpn_accounts by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
         await supabase
           .from('vpn_accounts')
           .update({
             expiry_date: new_expiryIso,
             expiry_time: new_expiryMs,
+            data_limit: dataLimitStr,
             updated_at: nowIso
           })
           .eq('uuid', targetUuid);
@@ -258,10 +267,11 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           .from('vpn_configs')
           .update({
             expiry_date: new_expiryIso,
+            data_limit: dataLimitStr,
           })
           .eq('uuid', targetUuid);
         if (!cErr) {
-          console.log(`[RenewController] Successfully renewed vpn_configs by UUID: ${targetUuid}`);
+          console.log(`[RenewController] Successfully renewed vpn_configs by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
         } else {
           console.warn(`[RenewController] Failed to renew vpn_configs by UUID: ${targetUuid}`, cErr);
         }

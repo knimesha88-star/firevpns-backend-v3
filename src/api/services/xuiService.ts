@@ -420,7 +420,11 @@ export const getClientExpiry = async (identifier: string): Promise<number | null
   return null;
 };
 
-export const updateClientExpiry = async (uuid: string, durationMonths: number): Promise<number> => {
+export const updateClientExpiry = async (
+  uuid: string,
+  durationMonths: number,
+  planName?: string
+): Promise<{ new_expiryMs: number; newTotalBytes: number }> => {
   const inbounds = await getInbounds();
   
   for (const inbound of inbounds) {
@@ -443,6 +447,37 @@ export const updateClientExpiry = async (uuid: string, durationMonths: number): 
         date.setMonth(date.getMonth() + durationMonths);
         const new_expiryTime = date.getTime();
         
+        // Parse traffic / limit GB based on planName
+        let isLimitedPlan = false;
+        let packageDataLimitBytes = 0;
+
+        if (planName) {
+          const lowerPlan = planName.toLowerCase();
+          if (lowerPlan.includes('unlimited') || lowerPlan.includes('unlimit')) {
+            isLimitedPlan = false;
+          } else if (lowerPlan.includes('100gb') || lowerPlan.includes('100 gb') || lowerPlan.includes('100')) {
+            isLimitedPlan = true;
+            packageDataLimitBytes = 100 * 1024 * 1024 * 1024;
+          } else {
+            const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
+            if (gbMatch) {
+              isLimitedPlan = true;
+              packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024;
+            }
+          }
+        }
+
+        const currentTotalBytes = Number(c.totalGB || 0);
+        let newTotalBytes = currentTotalBytes; // default fallback if no plan specified
+
+        if (planName) {
+          if (isLimitedPlan) {
+            newTotalBytes = currentTotalBytes + packageDataLimitBytes;
+          } else {
+            newTotalBytes = 0; // Unlimited
+          }
+        }
+
         const updateEndpoints = [
           `/panel/api/inbounds/updateClient/${c.id}`,
           `/panel/api/inbounds/updateClient/${c.email}`,
@@ -452,34 +487,38 @@ export const updateClientExpiry = async (uuid: string, durationMonths: number): 
         let updated = false;
         let lastErr: any = null;
 
+        const clientAny = c as any;
+
         // Ensure all numeric fields match 3X-UI Go Client struct types (int64 / int):
         let parsedTgId = 0;
-        if (c.tgId !== undefined && c.tgId !== null && c.tgId !== '') {
-          const num = Number(c.tgId);
+        if (clientAny.tgId !== undefined && clientAny.tgId !== null && clientAny.tgId !== '') {
+          const num = Number(clientAny.tgId);
           if (!isNaN(num)) {
             parsedTgId = Math.floor(num);
           }
         }
 
         let parsedLimitIp = 0;
-        if (c.limitIp !== undefined && c.limitIp !== null && c.limitIp !== '') {
-          const num = Number(c.limitIp);
+        if (clientAny.limitIp !== undefined && clientAny.limitIp !== null && clientAny.limitIp !== '') {
+          const num = Number(clientAny.limitIp);
           if (!isNaN(num)) {
             parsedLimitIp = Math.floor(num);
           }
         }
 
         let parsedTotalGB = 0;
-        if (c.totalGB !== undefined && c.totalGB !== null && c.totalGB !== '') {
-          const num = Number(c.totalGB);
+        if (newTotalBytes !== undefined && newTotalBytes !== null) {
+          parsedTotalGB = Math.floor(newTotalBytes);
+        } else if (clientAny.totalGB !== undefined && clientAny.totalGB !== null && clientAny.totalGB !== '') {
+          const num = Number(clientAny.totalGB);
           if (!isNaN(num)) {
             parsedTotalGB = Math.floor(num);
           }
         }
 
         let parsedReset = 0;
-        if (c.reset !== undefined && c.reset !== null && c.reset !== '') {
-          const num = Number(c.reset);
+        if (clientAny.reset !== undefined && clientAny.reset !== null && clientAny.reset !== '') {
+          const num = Number(clientAny.reset);
           if (!isNaN(num)) {
             parsedReset = Math.floor(num);
           }
@@ -489,7 +528,7 @@ export const updateClientExpiry = async (uuid: string, durationMonths: number): 
           ...c,
           id: String(c.id),
           email: String(c.email || ''),
-          flow: String(c.flow || ''),
+          flow: String(clientAny.flow || ''),
           subId: String(c.subId || ''),
           limitIp: parsedLimitIp,
           totalGB: parsedTotalGB,
@@ -517,7 +556,7 @@ export const updateClientExpiry = async (uuid: string, durationMonths: number): 
           throw lastErr;
         }
         
-        return new_expiryTime;
+        return { new_expiryMs: new_expiryTime, newTotalBytes };
       }
     }
   }
