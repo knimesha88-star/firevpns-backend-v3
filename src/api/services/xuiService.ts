@@ -988,6 +988,8 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   console.log('=== [PURCHASE FLOW LOGGING END] ===');
 
+  let skipMsg = '';
+
   // Step 2: Provision client using inbound update strategy (GET inbound -> update settings.clients -> POST /panel/api/inbounds/update/{id})
   console.log(`[3X-UI Provisioning] Provisioning client for inbound ${inboundId} using inbound update strategy...`);
   
@@ -1057,6 +1059,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   );
 
   if (existingIndex >= 0) {
+    skipMsg = 'Client already exists on this inbound. Updated existing client settings.';
     console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
     existingClients[existingIndex] = {
       ...existingClients[existingIndex],
