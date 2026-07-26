@@ -214,6 +214,10 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
 
     const response = await client.request(axiosConfig);
 
+    console.log(`[requestApi Debug] HTTP Status: ${response.status}`);
+    console.log(`[requestApi Debug] HTTP Headers:`, JSON.stringify(response.headers));
+    console.log(`[requestApi Debug] Raw response.data:`, JSON.stringify(response.data));
+
     console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
 
     if (response.status !== 200) {
@@ -700,25 +704,24 @@ export const add3XUiClient = async (
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
-  const endpoints = ['/panel/api/clients/add'];
-  let lastErr: any = null;
-  
-  for (const ep of endpoints) {
-    try {
-      return await requestApi<any>(ep, 'POST', payload);
-    } catch (error: any) {
-      lastErr = error;
-    }
-  }
-  
-  throw lastErr || new Error('Failed to add client to 3X-UI');
-
-//
-  
+  const endpoint = '/panel/api/inbounds/addClient';
   try {
-    return await requestApi<any>(endpoint, 'POST', payload);
-  } catch (error: any) {
-    throw error;
+    const result = await requestApi<any>(endpoint, 'POST', payload);
+    console.log('===== ADD CLIENT DEBUG =====');
+    console.log('Endpoint:', endpoint);
+    console.log('Payload:', JSON.stringify(payload));
+    console.log('HTTP Status: 200');
+    console.log('Response Body:', JSON.stringify(result));
+    console.log('===========================');
+    return result;
+  } catch (err: any) {
+    console.log('===== ADD CLIENT DEBUG =====');
+    console.log('Endpoint:', endpoint);
+    console.log('Payload:', JSON.stringify(payload));
+    console.log('HTTP Status:', err?.response?.status || err?.status || 'Non-200 / Exception');
+    console.log('Response Body:', JSON.stringify(err?.response?.data || err?.message || err));
+    console.log('===========================');
+    throw err;
   }
 };
 
