@@ -827,17 +827,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     existingAcc = d1;
   }
 
-  if (!existingAcc && validUserId && remark) {
-    const { data: d1, error: e1 } = await dbClient
-      .from('vpn_accounts')
-      .select('*')
-      .eq('user_id', validUserId)
-      .eq('remark', remark)
-      .maybeSingle();
-    if (e1) console.warn('[3X-UI Provisioning DB] vpn_accounts select by user/remark notice:', e1);
-    existingAcc = d1;
-  }
-
   // Fetch all inbounds to search for an existing client in 3X-UI panel
   const allInbounds = await getInbounds();
   let existingClient = null;
