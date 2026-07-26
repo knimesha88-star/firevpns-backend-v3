@@ -1168,9 +1168,20 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   // Step 4: Upsert vpn_accounts
   let vpnAccountId = '';
 
+  let accountEmail = (order.email || extra.email || extra.user_email || extra.customerEmail || '').trim();
+  if (!accountEmail && order.customer_id) {
+    const { data: prof } = await dbClient.from('profiles').select('email').eq('id', order.customer_id).maybeSingle();
+    if (prof?.email) {
+      accountEmail = prof.email.trim();
+    }
+  }
+
   const accPayload: any = {
     user_id: validUserId,
     order_id: order.id,
+    email: accountEmail,
+    remark: remark,
+    uuid: uuid,
     vless_url: vlessUrl,
     expiry_date: new Date(expiryMs).toISOString(),
     status: 'active',
@@ -1181,13 +1192,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let accErr: any = null;
   if (existingAcc && existingAcc.id) {
     vpnAccountId = existingAcc.id;
+    console.log('[3X-UI Provisioning DB] Updating vpn_accounts payload:', JSON.stringify(accPayload, null, 2));
     const { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
     accErr = error;
   } else {
-    const { data: newAcc, error } = await dbClient.from('vpn_accounts').insert({
+    const insertPayload = {
       ...accPayload,
       created_at: new Date().toISOString()
-    }).select('id').maybeSingle();
+    };
+    console.log('[3X-UI Provisioning DB] Inserting into vpn_accounts payload:', JSON.stringify(insertPayload, null, 2));
+    const { data: newAcc, error } = await dbClient.from('vpn_accounts').insert(insertPayload).select('id').maybeSingle();
     accErr = error;
     vpnAccountId = newAcc?.id || vpnAccountId;
   }
