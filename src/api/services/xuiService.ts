@@ -1045,7 +1045,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     totalGB: totalBytes,
     expiryTime: expiryMs,
     enable: true,
-    subId: subId
+    tgId: '',
+    subId: subId,
+    reset: 0
   };
 
   if (existingIndex >= 0) {
@@ -1069,6 +1071,15 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     id: Number(inboundId),
     settings: JSON.stringify(settingsObj)
   };
+
+  // Remove runtime / statistics fields
+  delete updateInboundPayload.up;
+  delete updateInboundPayload.down;
+  delete updateInboundPayload.clientStats;
+  delete updateInboundPayload.trafficReset;
+  delete updateInboundPayload.lastTrafficResetTime;
+
+  console.log(`[3X-UI Provisioning] Clean update payload for POST /panel/api/inbounds/update/${inboundId}:`, JSON.stringify(updateInboundPayload, null, 2));
 
   console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
   console.log(`[3X-UI Provisioning] Detailed Logs:`);
