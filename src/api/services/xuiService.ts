@@ -396,13 +396,31 @@ export const getSubscriptionUriHelper = async (email: string): Promise<string | 
   }
 };
 
-export const getClientExpiry = async (email: string): Promise<number | null> => {
-  const client = await getClientByEmail(email);
-  if (!client) return null;
-  return client.expiryTime;
+export const getClientExpiry = async (identifier: string): Promise<number | null> => {
+  const inbounds = await getInbounds();
+  for (const inbound of inbounds) {
+    let settingsObj: { clients?: XuiClient[] } = {};
+    try {
+      if (inbound.settings) {
+        settingsObj = typeof inbound.settings === 'string' ? JSON.parse(inbound.settings) : inbound.settings;
+      }
+    } catch (parseError) {
+      continue;
+    }
+    const clients = settingsObj.clients || [];
+    for (const c of clients) {
+      if (
+        (c.id && String(c.id).trim().toLowerCase() === String(identifier).trim().toLowerCase()) ||
+        (c.email && String(c.email).trim().toLowerCase() === String(identifier).trim().toLowerCase())
+      ) {
+        return c.expiryTime || null;
+      }
+    }
+  }
+  return null;
 };
 
-export const updateClientExpiry = async (email: string, durationMonths: number): Promise<number> => {
+export const updateClientExpiry = async (uuid: string, durationMonths: number): Promise<number> => {
   const inbounds = await getInbounds();
   
   for (const inbound of inbounds) {
@@ -417,7 +435,7 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
     
     const clients = settingsObj.clients || [];
     for (const c of clients) {
-      if (String(c.email).trim().toLowerCase() === String(email).trim().toLowerCase()) {
+      if (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) {
         const currentExpiry = c.expiryTime || 0;
         
         let baseTime = currentExpiry > Date.now() ? currentExpiry : Date.now();
@@ -458,7 +476,7 @@ export const updateClientExpiry = async (email: string, durationMonths: number):
     }
   }
   
-  throw new Error(`Client with email ${email} not found in 3X-UI inbounds`);
+  throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbounds`);
 };
 
 export const findProvisioningTemplate = async (
