@@ -121,14 +121,10 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   });
 
   let inbounds: any[] = [];
-  // Only fetch inbounds if any config is missing an inboundId
-  const needsInboundMetadata = configs.some(c => !c.inboundId);
-  if (needsInboundMetadata) {
-    try {
-      inbounds = await getInbounds();
-    } catch (error) {
-      console.warn('[vpnService] Failed to fetch inbounds metadata:', error);
-    }
+  try {
+    inbounds = await getInbounds();
+  } catch (error) {
+    console.warn('[vpnService] Failed to fetch inbounds metadata:', error);
   }
 
   const resultConfigs = configs.map(config => {

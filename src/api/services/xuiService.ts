@@ -660,63 +660,34 @@ export const add3XUiClient = async (
 ): Promise<any> => {
   console.log(`[xuiService] [FUNCTION ENTERED] add3XUiClient - inboundId: ${inboundId}, email: ${clientData.email}, uuid: ${clientData.uuid}`);
   const config = await getXuiConfig();
-  const token = config.apiToken || config.password;
-  if (!token) {
-    throw new Error('API token is missing in 3X-UI settings');
-  }
-
-  const endpoint = '/panel/api/inbounds/addClient';
-  let lastErr: any = null;
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
   const payload = {
-    client: {
-      id: clientData.uuid,
-      email: clientData.email,
-      flow: clientFlow,
-      limitIp: 0,
-      totalGB: clientData.totalBytes,
-      expiryTime: clientData.expiryMs,
-      enable: true,
-      subId: clientData.subId
-    },
-    inboundIds: [inboundId]
+    id: inboundId,
+    settings: JSON.stringify({
+      clients: [
+        {
+          id: clientData.uuid,
+          email: clientData.email,
+          flow: clientFlow,
+          limitIp: 0,
+          totalGB: clientData.totalBytes,
+          expiryTime: clientData.expiryMs,
+          enable: true,
+          subId: clientData.subId
+        }
+      ]
+    })
   };
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
+  const endpoint = '/panel/api/inbounds/addClient';
   try {
-    const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-    const client = createAxiosInstance(baseUrl);
-    
-    console.log(`[xuiService] [DEBUG] Preparing POST request`);
-    console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
-    console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
-    console.log(`[xuiService] [DEBUG] Method: POST`);
-    console.log(`[xuiService] [DEBUG] Payload: ${JSON.stringify(payload)}`);
-    console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(payload));
-
-    const response = await client.request({
-      url: fullPath,
-      method: 'POST',
-      data: payload,
-      headers: {
-        Authorization: `Bearer ${token}`
-      }
-    });
-
-    console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
-
-    if ((response.status === 200 || response.status === 201) && (!response.data || response.data.success !== false)) {
-      return response.data;
-    }
-    lastErr = new Error(`3X-UI API Error: HTTP status ${response.status}, msg: ${response.data?.msg || 'unknown'}`);
+    return await requestApi<any>(endpoint, 'POST', payload);
   } catch (error: any) {
-    lastErr = error;
-    logAxiosError(error);
+    throw error;
   }
-
-  throw lastErr || new Error('Failed to add client to 3X-UI');
 };
 
 const activeProvisionings = new Set<string>();
@@ -1047,50 +1018,30 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
     // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
     try {
-      const config = await getXuiConfig();
-      const token = config.apiToken || config.password;
-      const updateEndpoints = [
-        `/panel/api/inbounds/updateClient/${uuid}`,
-        `/panel/api/clients/update/${uuid}`
-      ];
-
       const updatePayload = {
-        client: {
-          id: uuid,
-          email: remark,
-          flow: flow,
-          limitIp: 0,
-          totalGB: totalBytes,
-          expiryTime: expiryMs,
-          enable: true,
-          subId: subId
-        },
-        inboundIds: [inboundId]
+        id: inboundId,
+        settings: JSON.stringify({
+          clients: [
+            {
+              id: uuid,
+              email: remark,
+              flow: flow,
+              limitIp: 0,
+              totalGB: totalBytes,
+              expiryTime: expiryMs,
+              enable: true,
+              subId: subId
+            }
+          ]
+        })
       };
 
       console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI payload:', JSON.stringify(updatePayload, null, 2));
 
-      let updated = false;
-      for (const endpoint of updateEndpoints) {
-        try {
-          const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-          const clientAxios = createAxiosInstance(baseUrl);
-          console.log(`[3X-UI Provisioning] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | Payload:`, JSON.stringify(updatePayload));
-
-          const res = await clientAxios.post(fullPath, updatePayload, { headers: { Authorization: `Bearer ${token}` } });
-          console.log(`[3X-UI Provisioning] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: POST | Endpoint path: ${fullPath} | HTTP status: ${res.status} ${res.statusText} | Response body:`, JSON.stringify(res.data));
-
-          if ((res.status === 200 || res.status === 201) && (!res.data || res.data.success !== false)) {
-            updated = true;
-            break;
-          }
-        } catch (epErr: any) {
-          logAxiosError(epErr);
-        }
-      }
-
-      if (!updated) {
-        console.warn('[3X-UI Provisioning] Update of existing client settings failed across all endpoints.');
+      try {
+        await requestApi<any>(`/panel/api/inbounds/updateClient/${uuid}`, 'POST', updatePayload);
+      } catch (epErr: any) {
+        console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', epErr?.message || epErr);
       }
     } catch (updErr: any) {
       console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', updErr?.message || updErr);
