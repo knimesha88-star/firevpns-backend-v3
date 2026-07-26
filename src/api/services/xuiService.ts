@@ -452,17 +452,63 @@ export const updateClientExpiry = async (uuid: string, durationMonths: number): 
         let updated = false;
         let lastErr: any = null;
 
+        // Ensure all numeric fields match 3X-UI Go Client struct types (int64 / int):
+        let parsedTgId = 0;
+        if (c.tgId !== undefined && c.tgId !== null && c.tgId !== '') {
+          const num = Number(c.tgId);
+          if (!isNaN(num)) {
+            parsedTgId = Math.floor(num);
+          }
+        }
+
+        let parsedLimitIp = 0;
+        if (c.limitIp !== undefined && c.limitIp !== null && c.limitIp !== '') {
+          const num = Number(c.limitIp);
+          if (!isNaN(num)) {
+            parsedLimitIp = Math.floor(num);
+          }
+        }
+
+        let parsedTotalGB = 0;
+        if (c.totalGB !== undefined && c.totalGB !== null && c.totalGB !== '') {
+          const num = Number(c.totalGB);
+          if (!isNaN(num)) {
+            parsedTotalGB = Math.floor(num);
+          }
+        }
+
+        let parsedReset = 0;
+        if (c.reset !== undefined && c.reset !== null && c.reset !== '') {
+          const num = Number(c.reset);
+          if (!isNaN(num)) {
+            parsedReset = Math.floor(num);
+          }
+        }
+
+        const clientPayload = {
+          ...c,
+          id: String(c.id),
+          email: String(c.email || ''),
+          flow: String(c.flow || ''),
+          subId: String(c.subId || ''),
+          limitIp: parsedLimitIp,
+          totalGB: parsedTotalGB,
+          expiryTime: Math.floor(new_expiryTime),
+          enable: c.enable !== undefined ? Boolean(c.enable) : true,
+          tgId: parsedTgId,
+          reset: parsedReset
+        };
+
+        console.log('[updateClientExpiry] Final JSON payload immediately before 3X-UI API request:');
+        console.log(JSON.stringify(clientPayload, null, 2));
+
         for (const ep of updateEndpoints) {
           try {
-            await requestApi<any>(ep, 'POST', {
-              ...c,
-              id: String(c.id),
-              email: c.email,
-              expiryTime: new_expiryTime
-            });
+            await requestApi<any>(ep, 'POST', clientPayload);
             updated = true;
             break;
           } catch (e: any) {
+            console.warn(`[updateClientExpiry] Update endpoint ${ep} failed:`, e?.message || e);
             lastErr = e;
           }
         }
@@ -1064,7 +1110,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     totalGB: totalBytes,
     expiryTime: expiryMs,
     enable: true,
-    tgId: '',
+    tgId: 0,
     subId: subId,
     reset: 0
   };
