@@ -72,16 +72,57 @@ export const notifySupportTicket = async (req: AuthRequest, res: Response): Prom
       time: data.time || new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC',
     };
 
+    try {
+      await notificationService.createCustomerNotification({
+        userId: req.user?.uid || data.userId || null,
+        userEmail: notificationData.email,
+        title: 'Support Ticket Created',
+        message: `Your support ticket #${notificationData.ticketId} ("${notificationData.subject}") has been created.`,
+        type: 'support_ticket_created'
+      });
+    } catch (notifErr: any) {
+      console.error('[UserController] Support ticket customer notification error:', notifErr?.message || notifErr);
+    }
+
     sendNewSupportTicketNotification(notificationData).catch((err) => {
       console.error('[UserController] Telegram support ticket notification error:', err?.message || err);
     });
 
     res.json({
       success: true,
-      message: 'Support ticket Telegram notification triggered successfully.'
+      message: 'Support ticket notification triggered successfully.'
     });
   } catch (error: any) {
     console.error('[UserController] Error processing support ticket notification:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const notifySupportTicketReply = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+    const ticketId = data.ticketId || data.id || 'N/A';
+    const email = data.email || data.userEmail || req.user?.email || 'N/A';
+    const replyMessage = data.reply || data.message || 'An update was posted to your support ticket.';
+
+    try {
+      await notificationService.createCustomerNotification({
+        userId: data.userId || req.user?.uid || null,
+        userEmail: email,
+        title: 'Support Ticket Replied',
+        message: `Your support ticket #${ticketId} has a new reply: "${replyMessage}"`,
+        type: 'support_ticket_replied'
+      });
+    } catch (notifErr: any) {
+      console.error('[UserController] Support ticket reply customer notification error:', notifErr?.message || notifErr);
+    }
+
+    res.json({
+      success: true,
+      message: 'Support ticket reply notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[UserController] Error processing support ticket reply notification:', error.message);
     res.status(500).json({ error: error.message });
   }
 };

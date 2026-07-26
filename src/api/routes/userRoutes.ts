@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getProfile, updateProfile, getNotifications, readNotification, notifySupportTicket } from '../controllers/userController.js';
+import { getProfile, updateProfile, getNotifications, readNotification, notifySupportTicket, notifySupportTicketReply } from '../controllers/userController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 
 const router = Router();
@@ -31,5 +31,6 @@ router.get('/support', (req, res) => {
 });
 
 router.post('/support/notify', notifySupportTicket);
+router.post('/support/reply', notifySupportTicketReply);
 
 export default router;

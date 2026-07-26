@@ -129,7 +129,15 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
           orderId: order.id
         });
       } else {
-        console.log('[AdminController] Sending Payment Rejected notification');
+        console.log('[AdminController] Sending Order Rejected and Payment Rejected notifications');
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Order Rejected',
+          message: `Your order #${order.order_id || order.id} was rejected: ${reason}`,
+          type: 'order_rejected',
+          orderId: order.id
+        });
         await createCustomerNotification({
           userId: order.customer_id || null,
           userEmail: order.email,

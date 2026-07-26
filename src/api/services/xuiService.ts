@@ -1317,7 +1317,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
         vpnName: packageName
       });
     } else {
-      console.log('[3X-UI Provisioning DB] Triggering Payment Approved and VPN Created notifications');
+      console.log('[3X-UI Provisioning DB] Triggering Order Approved, Payment Approved, and VPN Created notifications');
+      await createCustomerNotification({
+        userId: validUserId,
+        userEmail: order.email,
+        title: 'Order Approved',
+        message: `Your order for "${packageName}" has been approved!`,
+        type: 'order_approved',
+        orderId: order.id,
+        vpnName: packageName
+      });
       await createCustomerNotification({
         userId: validUserId,
         userEmail: order.email,

@@ -380,9 +380,17 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       notes: data.notes || '',
     };
 
-    // Create customer notification
+    // Create customer notifications
     try {
-      console.log('[RenewController] Creating Payment Submitted notification for order');
+      console.log('[RenewController] Creating Order Placed and Payment Submitted notifications for order');
+      await createCustomerNotification({
+        userId: req.user?.uid || data.userId || null,
+        userEmail: notificationData.email,
+        title: 'Order Placed',
+        message: `Your order #${notificationData.orderId} for "${notificationData.plan}" has been placed successfully.`,
+        type: 'order_placed',
+        orderId: notificationData.orderId
+      });
       await createCustomerNotification({
         userId: req.user?.uid || data.userId || null,
         userEmail: notificationData.email,
@@ -392,7 +400,7 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
         orderId: notificationData.orderId
       });
     } catch (notifErr: any) {
-      console.error('[RenewController] CRITICAL: Error creating Payment Submitted notification in createOrderNotification:', notifErr.message || notifErr);
+      console.error('[RenewController] CRITICAL: Error creating Order Placed/Payment Submitted notifications in createOrderNotification:', notifErr.message || notifErr);
     }
 
     sendNewOrderNotification(notificationData).catch((err) => {

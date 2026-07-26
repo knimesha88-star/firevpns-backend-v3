@@ -24,7 +24,7 @@ export const createCustomerNotification = async (params: CreateNotificationParam
     vpnUuid
   });
 
-  let resolvedUserId = userId;
+  let resolvedUserId = (userId && String(userId).trim() !== 'N/A' && String(userId).trim() !== 'null' && String(userId).trim() !== 'undefined' && String(userId).trim() !== '') ? String(userId).trim() : null;
   if (!resolvedUserId && userEmail) {
     try {
       console.log(`[NotificationService] Attempting to resolve user ID for email: ${userEmail}`);
@@ -33,7 +33,7 @@ export const createCustomerNotification = async (params: CreateNotificationParam
         resolvedUserId = profile.id;
         console.log(`[NotificationService] Resolved user ID from profiles: ${resolvedUserId}`);
       } else {
-        const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
+        const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).not('customer_id', 'is', null).neq('customer_id', 'N/A').limit(1).maybeSingle();
         if (orderUser?.customer_id) {
           resolvedUserId = orderUser.customer_id;
           console.log(`[NotificationService] Resolved user ID from orders: ${resolvedUserId}`);
@@ -210,13 +210,13 @@ export const getUserNotifications = async (userId?: string, userEmail?: string):
 
     const uId = userId ? String(userId).trim() : '';
     let resolvedEmailUserId = '';
-    if (!uId && userEmail) {
+    if (userEmail) {
       try {
         const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
         if (profile?.id) {
           resolvedEmailUserId = profile.id;
         } else {
-          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
+          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).not('customer_id', 'is', null).neq('customer_id', 'N/A').limit(1).maybeSingle();
           if (orderUser?.customer_id) {
             resolvedEmailUserId = orderUser.customer_id;
           }
@@ -226,15 +226,18 @@ export const getUserNotifications = async (userId?: string, userEmail?: string):
       }
     }
 
-    const targetUserId = uId || resolvedEmailUserId;
-    console.log(`[NotificationService] Filtering all notifications for user ID: ${targetUserId}`);
+    const targetUserIds = new Set<string>();
+    if (uId && uId !== 'N/A' && uId !== 'null' && uId !== 'undefined') targetUserIds.add(uId);
+    if (resolvedEmailUserId && resolvedEmailUserId !== 'N/A' && resolvedEmailUserId !== 'null' && resolvedEmailUserId !== 'undefined') targetUserIds.add(resolvedEmailUserId);
+
+    console.log(`[NotificationService] Filtering all notifications for user IDs:`, Array.from(targetUserIds));
 
     const filtered = allNotifs.filter((item: any) => {
       const itemUserId = String(item.user_id || '').trim();
-      return targetUserId && itemUserId === targetUserId;
+      return targetUserIds.has(itemUserId);
     });
 
-    console.log(`[NotificationService] Found ${filtered.length} notifications for user ID: ${targetUserId}`);
+    console.log(`[NotificationService] Found ${filtered.length} notifications for user IDs: ${Array.from(targetUserIds).join(', ')}`);
     return filtered;
   } catch (err: any) {
     console.warn('[NotificationService] Error in getUserNotifications:', err.message || err);
