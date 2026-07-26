@@ -1171,20 +1171,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const accPayload: any = {
     user_id: validUserId,
     order_id: order.id,
-    email: order.email,
-    remark: remark,
-    uuid: uuid,
     vless_url: vlessUrl,
-    subscription_url: subscriptionUrl,
-    server_name: template.server || extra.server || 'Singapore',
     expiry_date: new Date(expiryMs).toISOString(),
-    expiry_time: expiryMs,
-    total_bytes: totalBytes,
     status: 'active',
-    enable: true,
-    is_trial: isTrialOrder,
-    activated_at: new Date().toISOString(),
-    expires_at: new Date(expiryMs).toISOString(),
     data_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
     updated_at: new Date().toISOString()
   };
@@ -1220,23 +1209,14 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     customer_uid: validUserId,
     order_id: order.id,
     package_name: packageName,
-    package_type: extra.packageType || 'SIM Unlimited',
-    config_name: extra.configurationName || customerName,
     uuid: uuid,
     subscription_url: subscriptionUrl,
     vless_url: vlessUrl,
-    server_address: address,
-    server: template.server || extra.server || 'Singapore',
-    sni: sni,
     inbound_id: inboundId,
-    traffic_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
-    expiry_time: new Date(expiryMs).toISOString(),
     expiry_date: new Date(expiryMs).toISOString(),
     enabled: true,
     status: 'active',
     is_trial: isTrialOrder,
-    activated_at: new Date().toISOString(),
-    expires_at: new Date(expiryMs).toISOString(),
     data_limit: isTrialOrder ? '1GB' : (totalBytes > 0 ? `${totalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited')
   };
 
@@ -1268,15 +1248,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const ordersPayload: any = {
     payment_status: 'Paid',
     status: 'completed',
-    provisioning_status: 'completed',
     client_uuid: uuid,
     vless_url: vlessUrl,
     subscription_url: subscriptionUrl,
-    inbound_id: inboundId,
     expiry_date: new Date(expiryMs).toISOString(),
     is_trial: isTrialOrder,
     activated_at: new Date().toISOString(),
-    expires_at: new Date(expiryMs).toISOString(),
     updated_at: new Date().toISOString()
   };
 
@@ -1285,13 +1262,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   if (orderUpdateErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
-  }
-
-  const { data: savedOrder } = await dbClient.from('orders').select('inbound_id').eq('id', order.id).maybeSingle();
-  console.log(`[Provisioning Audit] Database inbound_id after save (orders): ${savedOrder?.inbound_id}`);
-  if (!savedOrder || Number(savedOrder.inbound_id) !== Number(inboundId)) {
-    console.error(`[Provisioning Audit] ERROR: inbound_id in orders after save is ${savedOrder?.inbound_id}, expected ${inboundId}`);
-    throw new Error(`Failed to persist inbound_id in orders: expected ${inboundId}, got ${savedOrder?.inbound_id}`);
   }
 
   // Step 7: Create customer notification in notifications table
@@ -1605,8 +1575,7 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
             .from('vpn_configs')
             .update({ 
               status: 'expired', 
-              enabled: false,
-              updated_at: expirationTimeIso
+              enabled: false
             })
             .eq('id', trial.id);
 
@@ -1668,21 +1637,12 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
         const targetUserId = trial.customerUid;
         const targetEmail = trial.email;
 
-        if (targetUserId || targetEmail) {
+        if (targetUserId) {
           let notifQuery = dbClient
             .from('notifications')
             .select('id')
-            .eq('type', 'trial_expired');
-
-          if (targetUserId) {
-            notifQuery = notifQuery.eq('user_id', targetUserId);
-          } else if (targetEmail) {
-            notifQuery = notifQuery.eq('user_email', targetEmail);
-          }
-
-          if (trial.orderId) {
-            notifQuery = notifQuery.eq('order_id', trial.orderId);
-          }
+            .eq('type', 'trial_expired')
+            .eq('user_id', targetUserId);
 
           const { data: existingNotifs, error: notifFetchErr } = await notifQuery.maybeSingle();
 

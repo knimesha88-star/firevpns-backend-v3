@@ -148,10 +148,6 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       .from('renew_requests')
       .update({
         status: 'approved',
-        old_expiry: oldExpiryIso,
-        new_expiry: new_expiryIso,
-        approved_at: nowIso,
-        approved_by: adminEmail,
         updated_at: nowIso,
       })
       .eq('id', requestId)
@@ -228,7 +224,6 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           .from('vpn_configs')
           .update({
             expiry_date: new_expiryIso,
-            updated_at: nowIso
           })
           .eq('uuid', specUuid);
         if (!cErr) {
@@ -245,7 +240,6 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           .from('vpn_configs')
           .update({
             expiry_date: new_expiryIso,
-            updated_at: nowIso
           })
           .eq('customer_uid', data.user_id || 'N/A');
       }
@@ -324,9 +318,6 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       .from('renew_requests')
       .update({
         status: 'rejected',
-        reject_reason: reason,
-        rejection_reason: reason,
-        rejected_at: nowIso,
         updated_at: nowIso
       })
       .eq('id', requestId)

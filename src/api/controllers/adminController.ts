@@ -99,7 +99,6 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
     const rejectPayload = {
       status: 'rejected',
       payment_status: 'Cancelled',
-      reject_reason: reason,
       updated_at: new Date().toISOString()
     };
 
