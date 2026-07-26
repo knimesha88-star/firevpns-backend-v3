@@ -158,10 +158,15 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
 
   for (const loginEp of loginEndpoints) {
     try {
-      const res = await client.post(loginEp, {
-        username,
-        password
-      });
+      const res = await client.post(
+        loginEp,
+        `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
       const setCookie = res.headers['set-cookie'];
       if (setCookie && Array.isArray(setCookie)) {
         cookieHeader = setCookie.map(c => c.split(';')[0]).join('; ');
@@ -197,12 +202,17 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
   console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | Payload:`, data ? JSON.stringify(data) : 'None');
   
   try {
-    const response = await client.request({
+    const axiosConfig = {
       url: fullPath,
       method,
       data,
       headers
-    });
+    };
+    console.log(`[xuiService] [API TRANSPORT DEBUG] Exact request URL before axios sends: ${fullUrl}`);
+    console.log(`[xuiService] [API TRANSPORT DEBUG] final axios config.baseURL: ${client.defaults.baseURL}`);
+    console.log(`[xuiService] [API TRANSPORT DEBUG] final axios config.url: ${axiosConfig.url}`);
+
+    const response = await client.request(axiosConfig);
 
     console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
 
@@ -217,6 +227,14 @@ const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', d
     console.log(`[xuiService] [3X-UI API SUCCESS] Success response for ${endpoint}`);
     return response.data.obj;
   } catch (error: any) {
+    console.error(`[xuiService] [API TRANSPORT ERROR] Axios error on ${fullUrl}`);
+    console.error(`[xuiService] [API TRANSPORT ERROR] config.baseURL: ${error.config?.baseURL}`);
+    console.error(`[xuiService] [API TRANSPORT ERROR] config.url: ${error.config?.url}`);
+    
+    if (error.response) {
+      console.error(`[xuiService] [API TRANSPORT ERROR] HTTP Status: ${error.response.status}`);
+      console.error(`[xuiService] [API TRANSPORT ERROR] HTTP Response Body:`, JSON.stringify(error.response.data));
+    }
     logAxiosError(error);
     throw error;
   }
@@ -663,22 +681,39 @@ export const add3XUiClient = async (
 
   const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
   const payload = {
-    client: {
-      id: clientData.uuid,
-      email: clientData.email,
-      flow: clientFlow,
-      limitIp: 0,
-      totalGB: clientData.totalBytes,
-      expiryTime: clientData.expiryMs,
-      enable: true,
-      subId: clientData.subId
-    },
-    inboundIds: [inboundId]
+    id: inboundId,
+    settings: JSON.stringify({
+      clients: [
+        {
+          id: clientData.uuid,
+          email: clientData.email,
+          flow: clientFlow,
+          limitIp: 0,
+          totalGB: clientData.totalBytes,
+          expiryTime: clientData.expiryMs,
+          enable: true,
+          subId: clientData.subId
+        }
+      ]
+    })
   };
 
   console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
 
-  const endpoint = '/panel/api/inbounds/addClient';
+  const endpoints = ['/panel/api/clients/add'];
+  let lastErr: any = null;
+  
+  for (const ep of endpoints) {
+    try {
+      return await requestApi<any>(ep, 'POST', payload);
+    } catch (error: any) {
+      lastErr = error;
+    }
+  }
+  
+  throw lastErr || new Error('Failed to add client to 3X-UI');
+
+//
   
   try {
     return await requestApi<any>(endpoint, 'POST', payload);
@@ -1021,17 +1056,21 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       ];
 
       const updatePayload = {
-        client: {
-          id: uuid,
-          email: remark,
-          flow: flow,
-          limitIp: 0,
-          totalGB: totalBytes,
-          expiryTime: expiryMs,
-          enable: true,
-          subId: subId
-        },
-        inboundIds: [inboundId]
+        id: inboundId,
+        settings: JSON.stringify({
+          clients: [
+            {
+              id: uuid,
+              email: remark,
+              flow: flow,
+              limitIp: 0,
+              totalGB: totalBytes,
+              expiryTime: expiryMs,
+              enable: true,
+              subId: subId
+            }
+          ]
+        })
       };
 
       console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI payload:', JSON.stringify(updatePayload, null, 2));
