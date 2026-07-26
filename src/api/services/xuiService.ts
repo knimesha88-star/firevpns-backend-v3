@@ -669,61 +669,7 @@ export const buildVlessLink = (
   return `vless://${uuid}@${address}:${port}${queryString ? '?' + queryString : ''}#${remarkEncoded}`;
 };
 
-export const add3XUiClient = async (
-  inboundId: number,
-  clientData: {
-    uuid: string;
-    email: string;
-    totalBytes: number;
-    expiryMs: number;
-    subId: string;
-    flow?: string;
-  }
-): Promise<any> => {
-  console.log(`[xuiService] [FUNCTION ENTERED] add3XUiClient - inboundId: ${inboundId}, email: ${clientData.email}, uuid: ${clientData.uuid}`);
-  const config = await getXuiConfig();
 
-  const clientFlow = clientData.flow !== undefined ? clientData.flow : '';
-  const payload = {
-    id: inboundId,
-    settings: JSON.stringify({
-      clients: [
-        {
-          id: clientData.uuid,
-          email: clientData.email,
-          flow: clientFlow,
-          limitIp: 0,
-          totalGB: clientData.totalBytes,
-          expiryTime: clientData.expiryMs,
-          enable: true,
-          subId: clientData.subId
-        }
-      ]
-    })
-  };
-
-  console.log('[xuiService] [DEBUG] add3XUiClient payload:', JSON.stringify(payload, null, 2));
-
-  const endpoint = '/panel/api/inbounds/addClient';
-  try {
-    const result = await requestApi<any>(endpoint, 'POST', payload);
-    console.log('===== ADD CLIENT DEBUG =====');
-    console.log('Endpoint:', endpoint);
-    console.log('Payload:', JSON.stringify(payload));
-    console.log('HTTP Status: 200');
-    console.log('Response Body:', JSON.stringify(result));
-    console.log('===========================');
-    return result;
-  } catch (err: any) {
-    console.log('===== ADD CLIENT DEBUG =====');
-    console.log('Endpoint:', endpoint);
-    console.log('Payload:', JSON.stringify(payload));
-    console.log('HTTP Status:', err?.response?.status || err?.status || 'Non-200 / Exception');
-    console.log('Response Body:', JSON.stringify(err?.response?.data || err?.message || err));
-    console.log('===========================');
-    throw err;
-  }
-};
 
 const activeProvisionings = new Set<string>();
 
@@ -1042,99 +988,98 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   console.log('=== [PURCHASE FLOW LOGGING END] ===');
 
-  let skipAttachment = false;
-  let skipMsg = '';
-
-  // Requirement 4 & 6 & 8: Check if client is already assigned to the inbound
-  if (alreadyAssignedToTarget) {
-    skipAttachment = true;
-    skipMsg = "Client already exists on this inbound. Skipping duplicate assignment.";
-    console.log(`[3X-UI Provisioning] ${skipMsg}`);
-
-    // Requirement 5: If the customer already has an existing trial configuration, update it instead of creating a duplicate.
-    try {
-      const updateEndpoints = [
-        `/panel/api/inbounds/updateClient/${uuid}`,
-        `/panel/api/clients/update/${uuid}`
-      ];
-
-      const updatePayload = {
-        id: inboundId,
-        settings: JSON.stringify({
-          clients: [
-            {
-              id: uuid,
-              email: remark,
-              flow: flow,
-              limitIp: 0,
-              totalGB: totalBytes,
-              expiryTime: expiryMs,
-              enable: true,
-              subId: subId
-            }
-          ]
-        })
-      };
-
-      console.log('[3X-UI Provisioning] Updating existing client settings in 3X-UI payload:', JSON.stringify(updatePayload, null, 2));
-
-      let updated = false;
-      for (const endpoint of updateEndpoints) {
-        try {
-          await requestApi<any>(endpoint, 'POST', updatePayload);
-          updated = true;
-          break;
-        } catch (epErr: any) {
-          console.warn(`[3X-UI Provisioning] Update on ${endpoint} failed:`, epErr?.message || epErr);
-        }
-      }
-
-      if (!updated) {
-        console.warn('[3X-UI Provisioning] Update of existing client settings failed across all endpoints.');
-      }
-    } catch (updErr: any) {
-      console.warn('[3X-UI Provisioning] Update of existing client settings failed (non-fatal):', updErr?.message || updErr);
-    }
+  // Step 2: Provision client using inbound update strategy (GET inbound -> update settings.clients -> POST /panel/api/inbounds/update/{id})
+  console.log(`[3X-UI Provisioning] Provisioning client for inbound ${inboundId} using inbound update strategy...`);
+  
+  // Fetch target inbound
+  let targetInboundObj: any = null;
+  try {
+    const getRes = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+    targetInboundObj = getRes?.obj || getRes;
+  } catch (getErr: any) {
+    console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
   }
 
-  // Step 2: Create or reuse the 3X-UI client (Do NOT stop if client already exists)
-  if (!skipAttachment) {
-    console.log(`[3X-UI Provisioning] Calling add3XUiClient with inboundId: ${inboundId}, Package: ${template.package_name}, Template ID: ${template.id}`);
-    try {
-      await add3XUiClient(inboundId, {
-        uuid,
-        email: remark,
-        totalBytes,
-        expiryMs,
-        subId,
-        flow
-      });
-    } catch (addErr: any) {
-      const errMsg = String(
-        addErr?.message || 
-        addErr?.response?.data?.msg || 
-        addErr?.response?.data?.message || 
-        addErr?.response?.data || 
-        ''
-      ).toLowerCase();
-
-      console.warn(`[3X-UI Provisioning] add3XUiClient warning/notice: ${errMsg}`);
-
-      const isDuplicate = 
-        errMsg.includes('already exist') || 
-        errMsg.includes('duplicate') || 
-        errMsg.includes('exists') || 
-        errMsg.includes('email');
-
-      if (isDuplicate) {
-        skipMsg = "Client already exists on this inbound. Skipping duplicate assignment.";
-        console.log(`[3X-UI Provisioning] ${skipMsg}`);
-      } else {
-        console.error('[3X-UI Provisioning] Failed to create 3X-UI client:', addErr);
-        throw addErr;
-      }
-    }
+  if (!targetInboundObj || typeof targetInboundObj !== 'object' || !targetInboundObj.id) {
+    console.log(`[3X-UI Provisioning] Falling back to getInbounds() list to find inbound ${inboundId}`);
+    const allInboundsList = await getInbounds();
+    targetInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
   }
+
+  if (!targetInboundObj) {
+    throw new Error(`Target inbound with ID ${inboundId} not found on 3X-UI panel.`);
+  }
+
+  // Parse inbound.settings.clients
+  let settingsObj: any = {};
+  if (typeof targetInboundObj.settings === 'string') {
+    try {
+      settingsObj = JSON.parse(targetInboundObj.settings);
+    } catch (e) {
+      settingsObj = { clients: [] };
+    }
+  } else if (targetInboundObj.settings && typeof targetInboundObj.settings === 'object') {
+    settingsObj = targetInboundObj.settings;
+  } else {
+    settingsObj = { clients: [] };
+  }
+
+  if (!Array.isArray(settingsObj.clients)) {
+    settingsObj.clients = [];
+  }
+
+  const existingClients: any[] = settingsObj.clients;
+  const clientCountBefore = existingClients.length;
+
+  // Check whether the UUID or email already exists
+  const existingIndex = existingClients.findIndex((c: any) =>
+    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+  );
+
+  const newClientRecord = {
+    id: uuid,
+    email: remark,
+    flow: flow || '',
+    limitIp: 0,
+    totalGB: totalBytes,
+    expiryTime: expiryMs,
+    enable: true,
+    subId: subId
+  };
+
+  if (existingIndex >= 0) {
+    console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
+    existingClients[existingIndex] = {
+      ...existingClients[existingIndex],
+      ...newClientRecord
+    };
+  } else {
+    console.log(`[3X-UI Provisioning] Client not found on inbound. Appending new client record.`);
+    existingClients.push(newClientRecord);
+  }
+
+  const clientCountAfter = existingClients.length;
+
+  // Preserve every existing client & preserve every inbound property
+  settingsObj.clients = existingClients;
+
+  const updateInboundPayload: any = {
+    ...targetInboundObj,
+    id: Number(inboundId),
+    settings: JSON.stringify(settingsObj)
+  };
+
+  console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
+  console.log(`[3X-UI Provisioning] Detailed Logs:`);
+  console.log(`  - Client count before update: ${clientCountBefore}`);
+  console.log(`  - Client count after update: ${clientCountAfter}`);
+  console.log(`  - UUID added/updated: ${uuid}`);
+  console.log(`  - Email added/updated: ${remark}`);
+
+  const updateRes = await requestApi<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
+
+  console.log(`[3X-UI Provisioning] Inbound update HTTP response:`, JSON.stringify(updateRes, null, 2));
 
   // Immediately read back the created client from 3X-UI to get the exact UUID returned
   const readBackClient = await getClientByEmail(remark);
