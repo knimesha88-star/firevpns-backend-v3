@@ -49,6 +49,11 @@ export interface XuiClient {
   reset: number;
 }
 
+// Global in-memory cache and state for 3X-UI inbounds metadata
+export let cachedInbounds: XuiInbound[] = [];
+export let lastInboundsCacheTime = 0;
+export let isCacheRefreshing = false;
+
 export interface XuiInbound {
   id: number;
   up: number;
@@ -275,19 +280,26 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
   throw lastError || new Error('Connection test failed on all endpoints');
 };
 
-export const getInbounds = async (): Promise<XuiInbound[]> => {
-  console.log('[xuiService] [FUNCTION ENTERED] getInbounds');
+export const getInbounds = async (forceRefresh: boolean = false): Promise<XuiInbound[]> => {
+  const now = Date.now();
+  const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache TTL
+
+  if (!forceRefresh && cachedInbounds.length > 0 && (now - lastInboundsCacheTime < CACHE_TTL_MS)) {
+    return cachedInbounds;
+  }
+
   // Use only the supported endpoint
   const endpoint = '/panel/api/inbounds/list';
   try {
     const inboundsData = await requestApi<XuiInbound[]>(endpoint);
     if (Array.isArray(inboundsData)) {
-        return inboundsData;
+      setCachedInbounds(inboundsData);
+      return inboundsData;
     }
-    return [];
+    return cachedInbounds;
   } catch (error: any) {
     console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
-    return [];
+    return cachedInbounds;
   }
 };
 
@@ -1501,6 +1513,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     console.warn('[3X-UI Provisioning DB] Telegram notification warning:', tgErr);
   }
 
+  // Trigger background synchronization asynchronously and non-blockingly
+  triggerBackgroundSyncIfNeeded('VPN Created', true);
+
   return {
     success: true,
     message: skipMsg || 'VPN client provisioned and order completed successfully',
@@ -1567,7 +1582,7 @@ export const disable3XUiClient = async (inboundId: number | null, uuid: string, 
 
 let lastCleanupTime = 0;
 
-export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
+export const cleanupExpiredTrials = async (inboundsList?: XuiInbound[]): Promise<{ count: number }> => {
   const now = Date.now();
   if (now - lastCleanupTime < 3000) {
     return { count: 0 };
@@ -1588,8 +1603,8 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       .from('vpn_accounts')
       .select('*');
 
-    // 3. Fetch 3X-UI inbounds for live stats - Removed: unnecessary API requests
-    let inbounds: any[] = [];
+    // 3. Get inbounds
+    const inbounds = inboundsList || await getCachedInbounds();
 
     const candidateTrials: Array<{
       type: 'config' | 'account';
@@ -1611,7 +1626,8 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       configs.forEach(cfg => {
         const orderId = String(cfg.order_id || '');
         const isTrial = !!(cfg.is_trial || cfg.isTrial || cfg.trial || orderId.startsWith('TRIAL-') || String(cfg.package_type || '').toLowerCase().includes('trial'));
-        const isAlreadyExpired = String(cfg.status || '').toLowerCase() === 'expired' || cfg.enabled === false;
+        const currentStatus = String(cfg.status || '').toLowerCase();
+        const isAlreadyExpired = currentStatus === 'expired' || cfg.enabled === false;
 
         if (isTrial && !isAlreadyExpired) {
           const expVal = cfg.expires_at || cfg.expiry_date || cfg.expiry_time;
@@ -1643,7 +1659,8 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       accounts.forEach(acc => {
         const orderId = String(acc.order_id || '');
         const isTrial = !!(acc.is_trial || acc.isTrial || acc.trial || orderId.startsWith('TRIAL-'));
-        const isAlreadyExpired = String(acc.status || '').toLowerCase() === 'expired' || acc.enable === false;
+        const currentStatus = String(acc.status || '').toLowerCase();
+        const isAlreadyExpired = currentStatus === 'expired' || acc.enable === false;
 
         if (isTrial && !isAlreadyExpired) {
           const existsInCandidates = candidateTrials.some(c => c.orderId === orderId || (c.uuid && acc.uuid && c.uuid.toLowerCase() === acc.uuid.toLowerCase()));
@@ -1674,25 +1691,26 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       });
     }
 
+    const cfgIdsToExpire: string[] = [];
+    const accOrderIdsToExpire: string[] = [];
+    const ordIdsToExpire: string[] = [];
+
     for (const trial of candidateTrials) {
       let isExpiredByTime = false;
       let isExpiredByData = false;
 
-      // Requirement 1, 3 & 4: Trial expires only when current_time >= expires_at + grace_period
+      // Trial expires only when current_time >= expires_at + grace_period
       if (trial.expiryMs) {
         if (now >= trial.expiryMs + TRIAL_GRACE_PERIOD_MS) {
           isExpiredByTime = true;
-          console.log(`[Trial Expiry Scheduler] Grace period completed: Order ID = ${trial.orderId}, UUID = ${trial.uuid}. Expiry = ${new Date(trial.expiryMs).toISOString()}, Grace Period End = ${new Date(trial.expiryMs + TRIAL_GRACE_PERIOD_MS).toISOString()}`);
-        } else if (now >= trial.expiryMs) {
-          console.log(`[Trial Expiry Scheduler] Trial entered grace period: Order ID = ${trial.orderId}, UUID = ${trial.uuid}. Expiry = ${new Date(trial.expiryMs).toISOString()}, Grace Period End = ${new Date(trial.expiryMs + TRIAL_GRACE_PERIOD_MS).toISOString()}`);
         }
       }
 
-      // Requirement 2: Or when user reaches the 1 GB data limit (1,073,741,824 bytes)
+      // Or when user reaches the 1 GB data limit
       const ONE_GB_BYTES = 1073741824;
       let usedBytes = 0;
 
-      if (inbounds.length > 0 && trial.uuid) {
+      if (inbounds && inbounds.length > 0 && trial.uuid) {
         for (const ib of inbounds) {
           const clientStats = ib.clientStats || [];
           const stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(trial.uuid).toLowerCase());
@@ -1708,18 +1726,10 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
       }
 
       if (isExpiredByTime || isExpiredByData) {
-        console.log(`[Trial Expiry Scheduler] Trial found for expiration: Order ID = ${trial.orderId}, UUID = ${trial.uuid}, Email = ${trial.email}, Reason = ${isExpiredByTime ? 'Time Expired (Grace Period Completed)' : 'Data Limit (1GB) Reached'}, Expiry = ${trial.expiryMs ? new Date(trial.expiryMs).toISOString() : 'N/A'}`);
-
-        // Requirement 3 & 6: Disable or remove VPN client from 3X-UI. Do not mark database as expired if this fails.
         let removedSuccessfully = true;
         if (trial.uuid) {
           try {
             removedSuccessfully = await disable3XUiClient(trial.inboundId, trial.uuid, trial.email);
-            if (removedSuccessfully) {
-              console.log(`[Trial Expiry Scheduler] Trial successfully removed from 3X-UI: UUID = ${trial.uuid}, Email = ${trial.email}`);
-            } else {
-              console.error(`[Trial Expiry Scheduler] Error removing client ${trial.uuid} from 3X-UI: disable3XUiClient returned false.`);
-            }
           } catch (err: any) {
             removedSuccessfully = false;
             console.error(`[Trial Expiry Scheduler] Error removing client ${trial.uuid} from 3X-UI:`, err.message || err);
@@ -1727,94 +1737,29 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
         }
 
         if (!removedSuccessfully) {
-          console.warn(`[Trial Expiry Scheduler] 3X-UI panel is temporarily unavailable or client deletion failed for UUID: ${trial.uuid}. Skipping DB updates and retrying on next run.`);
+          console.warn(`[Trial Expiry Scheduler] 3X-UI removal failed for UUID: ${trial.uuid}. Skipping DB update.`);
           continue;
         }
 
-        // Requirement 3: Mark trial as Expired in database and record exact expiration time in updated_at (keep record for history)
-        const expirationTimeIso = new Date().toISOString();
-
         if (trial.type === 'config' || trial.id) {
-          const { error: cfgErr } = await dbClient
-            .from('vpn_configs')
-            .update({ 
-              status: 'expired', 
-              enabled: false
-            })
-            .eq('id', trial.id);
-
-          if (cfgErr) {
-            console.error(`[Trial Expiry Scheduler] Database error updating vpn_configs for ID ${trial.id}:`, cfgErr);
-          } else {
-            console.log(`[Trial Expiry Scheduler] Database updated (vpn_configs) to status 'expired' and updated_at recorded for ID ${trial.id}`);
-          }
+          cfgIdsToExpire.push(trial.id);
         }
-
         if (trial.orderId) {
-          const accUpdatePayload = { 
-            status: 'expired', 
-            enable: false,
-            updated_at: expirationTimeIso
-          };
-          console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
-          const { error: accErr } = await dbClient
-            .from('vpn_accounts')
-            .update(accUpdatePayload)
-            .eq('order_id', trial.orderId);
-
-          if (accErr) {
-            console.error(`[Trial Expiry Scheduler] Database error updating vpn_accounts for order ID ${trial.orderId}:`, accErr);
-          } else {
-            console.log(`[Trial Expiry Scheduler] Database updated (vpn_accounts) to status 'expired' and updated_at recorded for order ID ${trial.orderId}`);
-          }
-
-          const { error: ordErr } = await dbClient
-            .from('orders')
-            .update({ 
-              status: 'expired', 
-              payment_status: 'Expired', 
-              updated_at: expirationTimeIso
-            })
-            .eq('id', trial.orderId);
-
-          if (ordErr) {
-            console.error(`[Trial Expiry Scheduler] Database error updating orders (by ID) for ID ${trial.orderId}:`, ordErr);
-          } else {
-            console.log(`[Trial Expiry Scheduler] Database updated (orders table ID) to status 'expired' for ID ${trial.orderId}`);
-          }
-
-          const { error: ordErr2 } = await dbClient
-            .from('orders')
-            .update({ 
-              status: 'expired', 
-              payment_status: 'Expired', 
-              updated_at: expirationTimeIso
-            })
-            .eq('order_id', trial.orderId);
-
-          if (ordErr2) {
-            console.error(`[Trial Expiry Scheduler] Database error updating orders (by order_id) for ID ${trial.orderId}:`, ordErr2);
-          } else {
-            console.log(`[Trial Expiry Scheduler] Database updated (orders table order_id) to status 'expired' for ID ${trial.orderId}`);
-          }
+          accOrderIdsToExpire.push(trial.orderId);
+          ordIdsToExpire.push(trial.orderId);
         }
 
-        // Requirement 3 & 4: Create customer notification (idempotency check ensures never duplicated)
+        // Create customer notification
         const targetUserId = trial.customerUid;
         const targetEmail = trial.email;
 
         if (targetUserId) {
-          let notifQuery = dbClient
+          const { data: existingNotifs } = await dbClient
             .from('notifications')
             .select('id')
             .eq('type', 'trial_expired')
-            .eq('user_id', targetUserId);
-
-          const { data: existingNotifs, error: notifFetchErr } = await notifQuery.maybeSingle();
-
-          if (notifFetchErr) {
-            console.error(`[Trial Expiry Scheduler] Database error searching existing notifications:`, notifFetchErr);
-          }
+            .eq('user_id', targetUserId)
+            .maybeSingle();
 
           if (!existingNotifs) {
             try {
@@ -1827,40 +1772,60 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
                 orderId: trial.orderId,
                 vpnName: trial.packageName
               });
-              console.log(`[Trial Expiry Scheduler] Notification created successfully for user: ${targetUserId || targetEmail}`);
             } catch (notifCreateErr: any) {
-              console.error(`[Trial Expiry Scheduler] Error creating customer notification:`, notifCreateErr.message || notifCreateErr);
+              console.error(`[Trial Expiry Scheduler] Error creating notification:`, notifCreateErr.message || notifCreateErr);
             }
-          } else {
-            console.log(`[Trial Expiry Scheduler] Idempotency: Skip duplicate notification for trial ID/Order: ${trial.orderId}`);
           }
         }
 
-        console.log(`[Trial Expiry Scheduler] Trial expired successfully: Order ID = ${trial.orderId}, UUID = ${trial.uuid}`);
         expiredCount++;
       }
     }
+
+    // Perform bulk database updates
+    const expirationTimeIso = new Date().toISOString();
+
+    if (cfgIdsToExpire.length > 0) {
+      console.log(`[Trial Expiry Scheduler] Bulk updating ${cfgIdsToExpire.length} vpn_configs to 'expired'...`);
+      const { error: cfgErr } = await dbClient
+        .from('vpn_configs')
+        .update({ status: 'expired', enabled: false, updated_at: expirationTimeIso })
+        .in('id', cfgIdsToExpire);
+      if (cfgErr) console.error('[Trial Expiry Scheduler] Bulk update error for vpn_configs:', cfgErr.message || cfgErr);
+    }
+
+    if (accOrderIdsToExpire.length > 0) {
+      console.log(`[Trial Expiry Scheduler] Bulk updating ${accOrderIdsToExpire.length} vpn_accounts to 'expired'...`);
+      const { error: accErr } = await dbClient
+        .from('vpn_accounts')
+        .update({ status: 'expired', enable: false, updated_at: expirationTimeIso })
+        .in('order_id', accOrderIdsToExpire);
+      if (accErr) console.error('[Trial Expiry Scheduler] Bulk update error for vpn_accounts:', accErr.message || accErr);
+    }
+
+    if (ordIdsToExpire.length > 0) {
+      console.log(`[Trial Expiry Scheduler] Bulk updating ${ordIdsToExpire.length} orders to 'expired'...`);
+      const { error: ordErr } = await dbClient
+        .from('orders')
+        .update({ status: 'expired', payment_status: 'Expired', updated_at: expirationTimeIso })
+        .in('id', ordIdsToExpire);
+      if (ordErr) console.error('[Trial Expiry Scheduler] Bulk update error for orders by id:', ordErr.message || ordErr);
+
+      const { error: ordErr2 } = await dbClient
+        .from('orders')
+        .update({ status: 'expired', payment_status: 'Expired', updated_at: expirationTimeIso })
+        .in('order_id', ordIdsToExpire);
+      if (ordErr2) console.error('[Trial Expiry Scheduler] Bulk update error for orders by order_id:', ordErr2.message || ordErr2);
+    }
+
   } catch (err) {
     console.error('[Cleanup Expired Trials] Error during trial cleanup execution:', err);
-  }
-
-  // Automatic synchronization with 3X-UI panel: remove/archive database records for clients deleted in 3X-UI
-  try {
-    await syncDeleted3XUiClients();
-  } catch (syncErr: any) {
-    console.warn('[Cleanup Expired Trials] Notice running syncDeleted3XUiClients:', syncErr.message || syncErr);
   }
 
   return { count: expiredCount };
 };
 
 // In-memory cache for 3X-UI inbounds metadata to avoid 3X-UI network calls on user HTTP requests
-let cachedInbounds: XuiInbound[] = [];
-let lastInboundsCacheTime = 0;
-
-export const getCachedInbounds = (): XuiInbound[] => {
-  return cachedInbounds;
-};
 
 export const setCachedInbounds = (inbounds: XuiInbound[]): void => {
   if (Array.isArray(inbounds)) {
@@ -1869,15 +1834,19 @@ export const setCachedInbounds = (inbounds: XuiInbound[]): void => {
   }
 };
 
+export const getCachedInbounds = async (): Promise<XuiInbound[]> => {
+  return cachedInbounds;
+};
+
 let isSyncInProgress = false;
 let lastSyncAt = 0;
 
-export const triggerBackgroundSyncIfNeeded = (): void => {
+export const triggerBackgroundSyncIfNeeded = (reason: string = 'Scheduled', force: boolean = false): void => {
   const now = Date.now();
-  const FIVE_MINUTES_MS = 5 * 60 * 1000;
+  const TEN_MINUTES_MS = 10 * 60 * 1000; // 10 minutes cooldown
 
-  if (now - lastSyncAt < FIVE_MINUTES_MS) {
-    console.log('[Background Sync] Skipped (recent sync)');
+  if (!force && (now - lastSyncAt < TEN_MINUTES_MS)) {
+    console.log(`[Background Sync] Skipped (recent sync ${Math.round((now - lastSyncAt)/1000)}s ago)`);
     return;
   }
 
@@ -1887,46 +1856,68 @@ export const triggerBackgroundSyncIfNeeded = (): void => {
   }
 
   // Trigger asynchronously without awaiting
-  runBackgroundSync().catch((err) => {
-    console.error('[Background Sync] Failed:', err.message || err);
+  runBackgroundSync(reason, force).catch((err) => {
+    console.error(`[Background Sync] Failed for reason "${reason}":`, err.message || err);
   });
 };
 
-export const runBackgroundSync = async (): Promise<void> => {
+export const runBackgroundSync = async (reason: string = 'Scheduled', force: boolean = false): Promise<void> => {
   if (isSyncInProgress) {
     console.log('[Background Sync] Skipped (sync already in progress)');
     return;
   }
   isSyncInProgress = true;
-  console.log('[Background Sync] Started');
+  console.log(`[Background Sync] Synchronization started (Reason: ${reason})`);
   const syncStartTime = Date.now();
 
-  let xuiTime = 0;
-  let dbTime = 0;
-
   try {
-    // 1. Fetch live 3X-UI inbounds once and cache them in memory
-    const xuiStart = Date.now();
-    let inbounds: XuiInbound[] = [];
-    try {
-      inbounds = await getInbounds();
-      setCachedInbounds(inbounds);
-    } catch (err: any) {
-      console.warn('[Background Sync] Could not fetch 3X-UI inbounds list:', err.message || err);
-    }
-    xuiTime = Date.now() - xuiStart;
+    // 1. Fetch live 3X-UI inbounds once and cache them in memory.
+    // If it's forced or we need a fresh list, we can pass forceRefresh=true to getInbounds.
+    const inbounds = await getInbounds(force);
 
     // 2. Run trial cleanup & sync deleted clients
-    const dbStart = Date.now();
-    await cleanupExpiredTrials();
+    const trialCleanupResult = await cleanupExpiredTrials();
+    
+    let deletedCount = 0;
     if (inbounds && inbounds.length > 0) {
-      await syncDeleted3XUiClients(inbounds);
+      const syncResult = await syncDeleted3XUiClients(inbounds);
+      deletedCount = syncResult.deletedCount;
     }
-    dbTime = Date.now() - dbStart;
 
     lastSyncAt = Date.now();
-    const totalSyncDuration = Date.now() - syncStartTime;
-    console.log(`[Background Sync] Completed (${totalSyncDuration}ms, 3X-UI: ${xuiTime}ms, DB: ${dbTime}ms)`);
+    const durationSec = ((Date.now() - syncStartTime) / 1000).toFixed(1);
+    
+    // Fetch total active orders count from orders for the summary
+    let ordersCount = 0;
+    try {
+      const { count } = await supabaseAdmin
+        .from('orders')
+        .select('*', { count: 'exact', head: true })
+        .in('status', ['active', 'trial', 'pending']);
+      ordersCount = count || 0;
+    } catch (e) {}
+
+    // Count client stats in inbounds
+    let clientsCount = 0;
+    if (inbounds && inbounds.length > 0) {
+      for (const ib of inbounds) {
+        let settingsObj: any = {};
+        try {
+          if (ib.settings) settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+        } catch (e) {}
+        const clients = settingsObj.clients || [];
+        clientsCount += clients.length;
+      }
+    }
+
+    console.log(`Synchronization completed`);
+    console.log(`Reason: ${reason}`);
+    console.log(`Orders scanned: ${ordersCount}`);
+    console.log(`Clients found: ${clientsCount}`);
+    console.log(`Expired clients: ${trialCleanupResult.count}`);
+    console.log(`Database updates: ${trialCleanupResult.count + deletedCount}`);
+    console.log(`Completed in: ${durationSec} seconds`);
+
   } catch (error: any) {
     console.error('[Background Sync] Failed:', error.message || error);
   } finally {

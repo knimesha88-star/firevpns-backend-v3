@@ -1,10 +1,7 @@
 import { supabase } from '../../lib/supabase.js';
-import { getCachedInbounds, triggerBackgroundSyncIfNeeded } from './xuiService.js';
+import { getCachedInbounds } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
-  // Fire background sync check non-blockingly
-  triggerBackgroundSyncIfNeeded();
-
   const dbStart = Date.now();
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
@@ -118,7 +115,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   });
 
   // Retrieve fast in-memory cached inbounds metadata from background worker if available
-  const inbounds = getCachedInbounds();
+  const inbounds = await getCachedInbounds();
 
   const resultConfigs = configs.map(config => {
     let up = 0;

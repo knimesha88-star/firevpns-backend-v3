@@ -300,6 +300,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
     });
     
+    // Trigger background synchronization asynchronously and non-blockingly
+    xuiService.triggerBackgroundSyncIfNeeded('VPN Renewed', true);
+
     res.json({
       success: true,
       message: 'Renewal request approved and client subscription extended successfully.',
