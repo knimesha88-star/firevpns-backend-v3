@@ -54,6 +54,7 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
         expiryTime: activeConfig.expiryDate || activeConfig.expiryTime || 0,
         enableStatus: activeConfig.enableStatus,
         onlineStatus: activeConfig.onlineStatus,
+        lastOnline: activeConfig.lastOnline || 0,
         subId: '',
         port: activeConfig.port || 443,
         protocol: activeConfig.protocol || 'vless',

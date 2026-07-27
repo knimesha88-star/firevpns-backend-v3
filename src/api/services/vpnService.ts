@@ -1,5 +1,5 @@
 import { supabase } from '../../lib/supabase.js';
-import { getCachedInbounds } from './xuiService.js';
+import { getCachedInbounds, getLiveInbound } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
   const dbStart = Date.now();
@@ -115,7 +115,59 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   });
 
   // Retrieve fast in-memory cached inbounds metadata from background worker if available
-  const inbounds = await getCachedInbounds();
+  // To restore TRUE live traffic without cached delays, fetch the customer's specific inbounds directly from 3X-UI in parallel.
+  const cached = await getCachedInbounds();
+  const inboundsMap = new Map<number, any>();
+  if (Array.isArray(cached)) {
+    cached.forEach(ib => {
+      if (ib && ib.id) inboundsMap.set(Number(ib.id), ib);
+    });
+
+    // Resolve any missing inboundId from cached inbounds list in memory for faster lookups
+    configs.forEach(config => {
+      if (config.uuid && (config.inboundId === null || config.inboundId === undefined || Number(config.inboundId) <= 0)) {
+        for (const ib of cached) {
+          let settingsObj: any = {};
+          try {
+            if (ib.settings) {
+              settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+            }
+          } catch (e) {}
+          const clients = settingsObj.clients || [];
+          const found = clients.some((c: any) => String(c.id || '').toLowerCase() === String(config.uuid).toLowerCase());
+          if (found) {
+            config.inboundId = Number(ib.id);
+            console.log(`[Live Traffic Engine] Found missing inboundId ${ib.id} for UUID ${config.uuid} from cached list.`);
+            break;
+          }
+        }
+      }
+    });
+  }
+
+  const userInboundIds = Array.from(new Set(
+    configs
+      .map(c => c.inboundId)
+      .filter(id => id !== null && id !== undefined && Number(id) > 0)
+  ));
+
+  if (userInboundIds.length > 0) {
+    try {
+      console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds directly from 3X-UI...`);
+      const liveResults = await Promise.all(
+        userInboundIds.map(id => getLiveInbound(Number(id)))
+      );
+      liveResults.forEach(ib => {
+        if (ib && ib.id) {
+          inboundsMap.set(Number(ib.id), ib);
+        }
+      });
+    } catch (err: any) {
+      console.warn(`[Live Traffic Engine] Error fetching live customer inbounds:`, err.message || err);
+    }
+  }
+
+  const inbounds = Array.from(inboundsMap.values());
 
   const resultConfigs = configs.map(config => {
     let up = 0;
@@ -211,6 +263,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       console.log(`[Provisioning Audit] No live stats found for UUID: ${config.uuid}. Using DB values.`);
     }
 
+    let lastOnlineMs = lastOnline;
+    if (lastOnlineMs > 0 && lastOnlineMs < 10000000000) {
+      lastOnlineMs = lastOnlineMs * 1000;
+    }
+
     const totalUsed = up + down;
     const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
 
@@ -282,6 +339,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       status,
       enableStatus: status === 'Active',
       onlineStatus: status === 'Active' && (lastOnline > 0 || up > 0 || down > 0),
+      lastOnline: lastOnlineMs,
       serverNode: config.serverNode,
       port,
       protocol,

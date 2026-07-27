@@ -303,6 +303,20 @@ export const getInbounds = async (forceRefresh: boolean = false): Promise<XuiInb
   }
 };
 
+export const getLiveInbound = async (inboundId: number): Promise<XuiInbound | null> => {
+  try {
+    console.log(`[XUI Service] Fetching live inbound ${inboundId} directly for dashboard query...`);
+    const res = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+    const inbound = res?.obj || res;
+    if (inbound && typeof inbound === 'object' && inbound.id !== undefined) {
+      return inbound as XuiInbound;
+    }
+  } catch (err: any) {
+    console.warn(`[XUI Service] Failed to fetch live inbound ${inboundId} directly:`, err.message || err);
+  }
+  return null;
+};
+
 export const getClientByEmail = async (email: string): Promise<any | null> => {
   try {
     const inbounds = await getInbounds();
