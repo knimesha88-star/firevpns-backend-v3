@@ -1926,7 +1926,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         const orderId = acc.order_id || acc.id;
         const currentStatus = String(acc.status || '').toLowerCase();
 
-        if (currentStatus === 'removed' || currentStatus === 'deleted') {
+        if (currentStatus === 'disabled' || currentStatus === 'expired' || acc.enable === false) {
           continue;
         }
 
@@ -1938,13 +1938,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Detected client UUID ${uuid} (Order: ${orderId}, Email: ${acc.email || 'N/A'}) no longer exists in 3X-UI. Removing/archiving record in vpn_accounts...`);
+          console.log(`[3X-UI Sync] Detected client UUID ${uuid} (Order: ${orderId}, Email: ${acc.email || 'N/A'}) no longer exists in 3X-UI. Updating record in vpn_accounts to disabled...`);
           
           const timestamp = new Date().toISOString();
           const { error: updateAccErr } = await dbClient
             .from('vpn_accounts')
             .update({
-              status: 'removed',
+              status: 'disabled',
               enable: false,
               updated_at: timestamp
             })
@@ -1953,7 +1953,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
           if (updateAccErr) {
             console.error(`[3X-UI Sync] Failed to update vpn_accounts for ID ${acc.id}:`, updateAccErr.message || updateAccErr);
           } else {
-            console.log(`[3X-UI Sync] Successfully marked vpn_accounts ID ${acc.id} (UUID: ${uuid}) as 'removed'.`);
+            console.log(`[3X-UI Sync] Successfully marked vpn_accounts ID ${acc.id} (UUID: ${uuid}) as 'disabled' (enable=false).`);
             deletedCount++;
           }
         }
@@ -1969,7 +1969,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         const uuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : '';
         const currentStatus = String(cfg.status || '').toLowerCase();
 
-        if (currentStatus === 'removed' || currentStatus === 'deleted') {
+        if (currentStatus === 'disabled' || currentStatus === 'expired' || cfg.enabled === false) {
           continue;
         }
 
@@ -1981,13 +1981,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Detected config UUID ${uuid} (ID: ${cfg.id}, Order: ${cfg.order_id || 'N/A'}) no longer exists in 3X-UI. Removing/archiving record in vpn_configs...`);
+          console.log(`[3X-UI Sync] Detected config UUID ${uuid} (ID: ${cfg.id}, Order: ${cfg.order_id || 'N/A'}) no longer exists in 3X-UI. Updating record in vpn_configs to disabled...`);
           
           const timestamp = new Date().toISOString();
           const { error: updateCfgErr } = await dbClient
             .from('vpn_configs')
             .update({
-              status: 'removed',
+              status: 'disabled',
               enabled: false,
               updated_at: timestamp
             })
@@ -1996,7 +1996,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
           if (updateCfgErr) {
             console.error(`[3X-UI Sync] Failed to update vpn_configs for ID ${cfg.id}:`, updateCfgErr.message || updateCfgErr);
           } else {
-            console.log(`[3X-UI Sync] Successfully marked vpn_configs ID ${cfg.id} (UUID: ${uuid}) as 'removed'.`);
+            console.log(`[3X-UI Sync] Successfully marked vpn_configs ID ${cfg.id} (UUID: ${uuid}) as 'disabled' (enabled=false).`);
             deletedCount++;
           }
         }
@@ -2010,7 +2010,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
         const currentStatus = String(ord.status || '').toLowerCase();
 
-        if (currentStatus === 'removed' || currentStatus === 'deleted' || currentStatus === 'expired' || currentStatus === 'cancelled') {
+        if (currentStatus === 'expired' || currentStatus === 'disabled' || currentStatus === 'cancelled') {
           continue;
         }
 
@@ -2022,13 +2022,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Order ID ${ord.id} has client UUID ${uuid} which no longer exists in 3X-UI. Updating order status to 'removed'...`);
+          console.log(`[3X-UI Sync] Order ID ${ord.id} has client UUID ${uuid} which no longer exists in 3X-UI. Updating order status to 'expired'...`);
           const timestamp = new Date().toISOString();
           await dbClient
             .from('orders')
             .update({
-              status: 'removed',
-              payment_status: 'Removed',
+              status: 'expired',
+              payment_status: 'Expired',
               updated_at: timestamp
             })
             .eq('id', ord.id);
