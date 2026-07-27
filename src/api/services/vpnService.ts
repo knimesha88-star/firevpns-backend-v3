@@ -1,14 +1,11 @@
 import { supabase } from '../../lib/supabase.js';
-import { getInbounds, cleanupExpiredTrials, syncDeleted3XUiClients } from './xuiService.js';
+import { getCachedInbounds, triggerBackgroundSyncIfNeeded } from './xuiService.js';
 
-export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
-  // Requirement 8: Automatic cleanup of expired trials on config retrieval
-  try {
-    await cleanupExpiredTrials();
-  } catch (err) {
-    console.warn('[vpnService] cleanupExpiredTrials notice:', err);
-  }
+export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
+  // Fire background sync check non-blockingly
+  triggerBackgroundSyncIfNeeded();
 
+  const dbStart = Date.now();
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
 
@@ -120,15 +117,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     }
   });
 
-  let inbounds: any[] = [];
-  try {
-    inbounds = await getInbounds();
-    if (inbounds && inbounds.length > 0) {
-      await syncDeleted3XUiClients(inbounds).catch(e => console.warn('[vpnService] syncDeleted3XUiClients notice:', e));
-    }
-  } catch (error) {
-    console.warn('[vpnService] Failed to fetch inbounds metadata:', error);
-  }
+  // Retrieve fast in-memory cached inbounds metadata from background worker if available
+  const inbounds = getCachedInbounds();
 
   const resultConfigs = configs.map(config => {
     let up = 0;
@@ -308,6 +298,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     };
   });
 
+  const dbTime = Date.now() - dbStart;
+
   if (inbounds && inbounds.length > 0) {
     const liveUuids = new Set<string>();
     for (const ib of inbounds) {
@@ -327,7 +319,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       }
     }
 
-    return resultConfigs.filter(cfg => {
+    const filtered = resultConfigs.filter(cfg => {
       if (!cfg.uuid) return false;
       const isLive = liveUuids.has(String(cfg.uuid).trim().toLowerCase());
       if (!isLive) {
@@ -335,7 +327,9 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       }
       return isLive;
     });
+
+    return { configs: filtered, dbTime };
   }
 
-  return resultConfigs;
+  return { configs: resultConfigs, dbTime };
 };

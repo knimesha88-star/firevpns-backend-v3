@@ -22,7 +22,8 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
   }
 
   // Fetch all user configs
-  const myConfigs = await vpnService.getMyConfigs(uid || '', email);
+  const myConfigsRes = await vpnService.getMyConfigs(uid || '', email);
+  const myConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
 
   if (myConfigs && myConfigs.length > 0) {
     let activeConfig = null;

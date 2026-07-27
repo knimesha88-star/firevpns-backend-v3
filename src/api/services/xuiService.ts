@@ -1854,6 +1854,86 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
   return { count: expiredCount };
 };
 
+// In-memory cache for 3X-UI inbounds metadata to avoid 3X-UI network calls on user HTTP requests
+let cachedInbounds: XuiInbound[] = [];
+let lastInboundsCacheTime = 0;
+
+export const getCachedInbounds = (): XuiInbound[] => {
+  return cachedInbounds;
+};
+
+export const setCachedInbounds = (inbounds: XuiInbound[]): void => {
+  if (Array.isArray(inbounds)) {
+    cachedInbounds = inbounds;
+    lastInboundsCacheTime = Date.now();
+  }
+};
+
+let isSyncInProgress = false;
+let lastSyncAt = 0;
+
+export const triggerBackgroundSyncIfNeeded = (): void => {
+  const now = Date.now();
+  const FIVE_MINUTES_MS = 5 * 60 * 1000;
+
+  if (now - lastSyncAt < FIVE_MINUTES_MS) {
+    console.log('[Background Sync] Skipped (recent sync)');
+    return;
+  }
+
+  if (isSyncInProgress) {
+    console.log('[Background Sync] Skipped (sync already in progress)');
+    return;
+  }
+
+  // Trigger asynchronously without awaiting
+  runBackgroundSync().catch((err) => {
+    console.error('[Background Sync] Failed:', err.message || err);
+  });
+};
+
+export const runBackgroundSync = async (): Promise<void> => {
+  if (isSyncInProgress) {
+    console.log('[Background Sync] Skipped (sync already in progress)');
+    return;
+  }
+  isSyncInProgress = true;
+  console.log('[Background Sync] Started');
+  const syncStartTime = Date.now();
+
+  let xuiTime = 0;
+  let dbTime = 0;
+
+  try {
+    // 1. Fetch live 3X-UI inbounds once and cache them in memory
+    const xuiStart = Date.now();
+    let inbounds: XuiInbound[] = [];
+    try {
+      inbounds = await getInbounds();
+      setCachedInbounds(inbounds);
+    } catch (err: any) {
+      console.warn('[Background Sync] Could not fetch 3X-UI inbounds list:', err.message || err);
+    }
+    xuiTime = Date.now() - xuiStart;
+
+    // 2. Run trial cleanup & sync deleted clients
+    const dbStart = Date.now();
+    await cleanupExpiredTrials();
+    if (inbounds && inbounds.length > 0) {
+      await syncDeleted3XUiClients(inbounds);
+    }
+    dbTime = Date.now() - dbStart;
+
+    lastSyncAt = Date.now();
+    const totalSyncDuration = Date.now() - syncStartTime;
+    console.log(`[Background Sync] Completed (${totalSyncDuration}ms, 3X-UI: ${xuiTime}ms, DB: ${dbTime}ms)`);
+  } catch (error: any) {
+    console.error('[Background Sync] Failed:', error.message || error);
+  } finally {
+    isSyncInProgress = false;
+  }
+};
+
 /**
  * Automatically synchronizes 3X-UI panel clients with local database (vpn_accounts, vpn_configs, orders).
  * Verifies that every stored VPN UUID still exists in the corresponding 3X-UI panel.
@@ -1876,6 +1956,7 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         return { synced: false, deletedCount: 0 };
       }
       inbounds = inboundsData;
+      setCachedInbounds(inbounds);
     } catch (error: any) {
       console.warn(`[3X-UI Sync] 3X-UI panel is temporarily unavailable. Skipping deletion/sync cycle and will retry on next cycle. Error: ${error.message || error}`);
       return { synced: false, deletedCount: 0 };
@@ -1916,16 +1997,21 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
   const dbClient = supabaseAdmin;
   const now = Date.now();
   const RECENT_PROVISION_GRACE_PERIOD_MS = 30000; // 30 seconds grace period for brand new records
+  const timestamp = new Date().toISOString();
 
   try {
+    // Collect IDs for bulk database updates instead of N+1 individual updates
+    const accIdsToDisable: string[] = [];
+    const cfgIdsToDisable: string[] = [];
+    const orderIdsToExpire: string[] = [];
+
     // 1. Sync vpn_accounts table
-    const { data: accounts, error: accError } = await dbClient.from('vpn_accounts').select('*');
+    const { data: accounts, error: accError } = await dbClient.from('vpn_accounts').select('id, uuid, status, enable, created_at, email, order_id');
     if (accError) {
       console.error('[3X-UI Sync] Error querying vpn_accounts:', accError.message || accError);
     } else if (accounts && Array.isArray(accounts)) {
       for (const acc of accounts) {
         const uuid = acc.uuid ? String(acc.uuid).trim().toLowerCase() : '';
-        const orderId = acc.order_id || acc.id;
         const currentStatus = String(acc.status || '').toLowerCase();
 
         if (currentStatus === 'disabled' || currentStatus === 'expired' || acc.enable === false) {
@@ -1940,32 +2026,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Detected client UUID ${uuid} (Order: ${orderId}, Email: ${acc.email || 'N/A'}) no longer exists in 3X-UI. Updating record in vpn_accounts to disabled...`);
-          
-          const timestamp = new Date().toISOString();
-          const syncAccPayload = {
-            status: 'disabled',
-            enable: false,
-            updated_at: timestamp
-          };
-          console.log('[vpn_accounts.update payload]:', JSON.stringify(syncAccPayload, null, 2));
-          const { error: updateAccErr } = await dbClient
-            .from('vpn_accounts')
-            .update(syncAccPayload)
-            .eq('id', acc.id);
-
-          if (updateAccErr) {
-            console.error(`[3X-UI Sync] Failed to update vpn_accounts for ID ${acc.id}:`, updateAccErr.message || updateAccErr);
-          } else {
-            console.log(`[3X-UI Sync] Successfully marked vpn_accounts ID ${acc.id} (UUID: ${uuid}) as 'disabled' (enable=false).`);
-            deletedCount++;
-          }
+          accIdsToDisable.push(acc.id);
         }
       }
     }
 
     // 2. Sync vpn_configs table
-    const { data: configs, error: cfgError } = await dbClient.from('vpn_configs').select('*');
+    const { data: configs, error: cfgError } = await dbClient.from('vpn_configs').select('id, uuid, status, enabled, created_at, order_id');
     if (cfgError) {
       console.error('[3X-UI Sync] Error querying vpn_configs:', cfgError.message || cfgError);
     } else if (configs && Array.isArray(configs)) {
@@ -1985,30 +2052,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Detected config UUID ${uuid} (ID: ${cfg.id}, Order: ${cfg.order_id || 'N/A'}) no longer exists in 3X-UI. Updating record in vpn_configs to disabled...`);
-          
-          const timestamp = new Date().toISOString();
-          const { error: updateCfgErr } = await dbClient
-            .from('vpn_configs')
-            .update({
-              status: 'disabled',
-              enabled: false,
-              updated_at: timestamp
-            })
-            .eq('id', cfg.id);
-
-          if (updateCfgErr) {
-            console.error(`[3X-UI Sync] Failed to update vpn_configs for ID ${cfg.id}:`, updateCfgErr.message || updateCfgErr);
-          } else {
-            console.log(`[3X-UI Sync] Successfully marked vpn_configs ID ${cfg.id} (UUID: ${uuid}) as 'disabled' (enabled=false).`);
-            deletedCount++;
-          }
+          cfgIdsToDisable.push(cfg.id);
         }
       }
     }
 
     // 3. Sync orders table
-    const { data: orders, error: ordError } = await dbClient.from('orders').select('*');
+    const { data: orders, error: ordError } = await dbClient.from('orders').select('id, client_uuid, uuid, vpn_credentials, status, created_at');
     if (!ordError && orders && Array.isArray(orders)) {
       for (const ord of orders) {
         const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
@@ -2026,17 +2076,49 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         }
 
         if (uuid && !live3XUiUuids.has(uuid)) {
-          console.log(`[3X-UI Sync] Order ID ${ord.id} has client UUID ${uuid} which no longer exists in 3X-UI. Updating order status to 'expired'...`);
-          const timestamp = new Date().toISOString();
-          await dbClient
-            .from('orders')
-            .update({
-              status: 'expired',
-              payment_status: 'Expired',
-              updated_at: timestamp
-            })
-            .eq('id', ord.id);
+          orderIdsToExpire.push(ord.id);
         }
+      }
+    }
+
+    // Perform bulk database updates
+    if (accIdsToDisable.length > 0) {
+      console.log(`[3X-UI Sync] Bulk updating ${accIdsToDisable.length} vpn_accounts to 'disabled'...`);
+      const { error: updateAccErr } = await dbClient
+        .from('vpn_accounts')
+        .update({ status: 'disabled', enable: false, updated_at: timestamp })
+        .in('id', accIdsToDisable);
+
+      if (updateAccErr) {
+        console.error('[3X-UI Sync] Bulk update error for vpn_accounts:', updateAccErr.message || updateAccErr);
+      } else {
+        deletedCount += accIdsToDisable.length;
+      }
+    }
+
+    if (cfgIdsToDisable.length > 0) {
+      console.log(`[3X-UI Sync] Bulk updating ${cfgIdsToDisable.length} vpn_configs to 'disabled'...`);
+      const { error: updateCfgErr } = await dbClient
+        .from('vpn_configs')
+        .update({ status: 'disabled', enabled: false, updated_at: timestamp })
+        .in('id', cfgIdsToDisable);
+
+      if (updateCfgErr) {
+        console.error('[3X-UI Sync] Bulk update error for vpn_configs:', updateCfgErr.message || updateCfgErr);
+      } else {
+        deletedCount += cfgIdsToDisable.length;
+      }
+    }
+
+    if (orderIdsToExpire.length > 0) {
+      console.log(`[3X-UI Sync] Bulk updating ${orderIdsToExpire.length} orders to 'expired'...`);
+      const { error: updateOrdErr } = await dbClient
+        .from('orders')
+        .update({ status: 'expired', payment_status: 'Expired', updated_at: timestamp })
+        .in('id', orderIdsToExpire);
+
+      if (updateOrdErr) {
+        console.error('[3X-UI Sync] Bulk update error for orders:', updateOrdErr.message || updateOrdErr);
       }
     }
 

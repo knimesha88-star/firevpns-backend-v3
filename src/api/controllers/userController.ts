@@ -33,12 +33,22 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
 };
 
 export const getNotifications = async (req: AuthRequest, res: Response): Promise<void> => {
+  const reqStart = Date.now();
+  console.log(`[API Performance] [GET /api/user/notifications] Request started for UID: ${req.user?.uid || 'none'}`);
   try {
     const uid = req.user?.uid;
     const email = req.user?.email;
+
+    const dbStart = Date.now();
     const notifications = await notificationService.getUserNotifications(uid, email);
+    const dbTime = Date.now() - dbStart;
+
+    const totalTime = Date.now() - reqStart;
+    console.log(`[API Performance] [GET /api/user/notifications] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
     res.json({ success: true, notifications });
   } catch (error: any) {
+    const totalTime = Date.now() - reqStart;
+    console.error(`[API Performance] [GET /api/user/notifications] Request failed after ${totalTime}ms:`, error);
     res.status(500).json({ error: error.message });
   }
 };

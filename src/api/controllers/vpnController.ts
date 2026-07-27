@@ -6,6 +6,8 @@ import { sendTrialRequestNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
 
 export const getMyConfigs = async (req: AuthRequest, res: Response): Promise<void> => {
+  const reqStart = Date.now();
+  console.log(`[API Performance] [GET /api/vpn/my-configs] Request started for UID: ${req.user?.uid || 'none'}`);
   try {
     const uid = req.user?.uid;
     const email = req.user?.email;
@@ -13,14 +15,19 @@ export const getMyConfigs = async (req: AuthRequest, res: Response): Promise<voi
     const token = authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : undefined;
 
     if (!uid) {
+      const totalTime = Date.now() - reqStart;
+      console.log(`[API Performance] [GET /api/vpn/my-configs] Request finished (401) | Total Execution: ${totalTime}ms | Database Time: 0ms | 3X-UI Time: 0ms`);
       res.status(401).json({ success: false, error: 'Unauthorized: No UID found' });
       return;
     }
 
-    const configs = await vpnService.getMyConfigs(uid, email, token);
+    const { configs, dbTime } = await vpnService.getMyConfigs(uid, email, token);
+    const totalTime = Date.now() - reqStart;
+    console.log(`[API Performance] [GET /api/vpn/my-configs] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
     res.json({ success: true, configs });
   } catch (error: any) {
-    console.error('[vpnController] Error fetching configs:', error);
+    const totalTime = Date.now() - reqStart;
+    console.error(`[API Performance] [GET /api/vpn/my-configs] Request failed after ${totalTime}ms:`, error);
     res.status(500).json({ success: false, error: error.message || 'Internal Server Error' });
   }
 };
