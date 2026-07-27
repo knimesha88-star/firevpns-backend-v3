@@ -1342,7 +1342,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   let accErr: any = null;
   if (existingAcc && existingAcc.id) {
     vpnAccountId = existingAcc.id;
-    console.log('[3X-UI Provisioning DB] Updating vpn_accounts payload:', JSON.stringify(accPayload, null, 2));
+    console.log('[vpn_accounts.update payload]:', JSON.stringify(accPayload, null, 2));
     const { error } = await dbClient.from('vpn_accounts').update(accPayload).eq('id', existingAcc.id);
     accErr = error;
   } else {
@@ -1751,13 +1751,15 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
         }
 
         if (trial.orderId) {
+          const accUpdatePayload = { 
+            status: 'expired', 
+            enable: false,
+            updated_at: expirationTimeIso
+          };
+          console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
           const { error: accErr } = await dbClient
             .from('vpn_accounts')
-            .update({ 
-              status: 'expired', 
-              enable: false,
-              updated_at: expirationTimeIso
-            })
+            .update(accUpdatePayload)
             .eq('order_id', trial.orderId);
 
           if (accErr) {
@@ -1941,13 +1943,15 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
           console.log(`[3X-UI Sync] Detected client UUID ${uuid} (Order: ${orderId}, Email: ${acc.email || 'N/A'}) no longer exists in 3X-UI. Updating record in vpn_accounts to disabled...`);
           
           const timestamp = new Date().toISOString();
+          const syncAccPayload = {
+            status: 'disabled',
+            enable: false,
+            updated_at: timestamp
+          };
+          console.log('[vpn_accounts.update payload]:', JSON.stringify(syncAccPayload, null, 2));
           const { error: updateAccErr } = await dbClient
             .from('vpn_accounts')
-            .update({
-              status: 'disabled',
-              enable: false,
-              updated_at: timestamp
-            })
+            .update(syncAccPayload)
             .eq('id', acc.id);
 
           if (updateAccErr) {

@@ -209,16 +209,18 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     // 4. Update vpn_accounts
     try {
       let updatedSpecific = false;
+      const accUpdatePayload = {
+        expiry_date: new_expiryIso,
+        expiry_time: new_expiryMs,
+        data_limit: dataLimitStr,
+        updated_at: nowIso
+      };
 
       if (targetVpnAcc?.id) {
+        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
         const { error: vErr } = await supabase
           .from('vpn_accounts')
-          .update({
-            expiry_date: new_expiryIso,
-            expiry_time: new_expiryMs,
-            data_limit: dataLimitStr,
-            updated_at: nowIso
-          })
+          .update(accUpdatePayload)
           .eq('id', targetVpnAcc.id);
         if (!vErr) {
           updatedSpecific = true;
@@ -227,14 +229,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           console.warn(`[RenewController] Failed to renew vpn_account by ID: ${targetVpnAcc.id}`, vErr);
         }
       } else if (targetUuid) {
+        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
         const { error: vErr } = await supabase
           .from('vpn_accounts')
-          .update({
-            expiry_date: new_expiryIso,
-            expiry_time: new_expiryMs,
-            data_limit: dataLimitStr,
-            updated_at: nowIso
-          })
+          .update(accUpdatePayload)
           .eq('uuid', targetUuid);
         if (!vErr) {
           updatedSpecific = true;
@@ -246,14 +244,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
 
       if (!updatedSpecific && targetUuid) {
         console.log(`[RenewController] Fallback: Renewing vpn_accounts by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
+        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
         await supabase
           .from('vpn_accounts')
-          .update({
-            expiry_date: new_expiryIso,
-            expiry_time: new_expiryMs,
-            data_limit: dataLimitStr,
-            updated_at: nowIso
-          })
+          .update(accUpdatePayload)
           .eq('uuid', targetUuid);
       }
     } catch (vErr) {
