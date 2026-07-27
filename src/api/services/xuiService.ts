@@ -311,16 +311,30 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
       
       for (const c of clients) {
         if (String(c.email).trim().toLowerCase() === String(email).trim().toLowerCase()) {
-          const stat = (inbound.clientStats || []).find((s) => s.email === c.email);
+          const stat = (inbound.clientStats || []).find((s: any) => 
+            (s.id && c.id && String(s.id).toLowerCase() === String(c.id).toLowerCase()) ||
+            (s.email && c.email && String(s.email).toLowerCase() === String(c.email).toLowerCase())
+          );
           
-          let total = c.totalGB || 0;
-          let up = stat?.up || 0;
-          let down = stat?.down || 0;
+          let total = c.totalGB || (c as any).total || (c as any).totalBytes || 0;
+          
+          const extractTraffic = (obj: any, type: 'up' | 'down') => {
+            if (!obj) return 0;
+            const val = obj[type] || obj[`${type}load`] || 0;
+            return typeof val === 'number' ? val : (parseFloat(val) || 0);
+          };
+
+          const statUp = extractTraffic(stat, 'up');
+          const statDown = extractTraffic(stat, 'down');
+          const clientUp = extractTraffic(c, 'up');
+          const clientDown = extractTraffic(c, 'down');
+
+          let up = Math.max(statUp, clientUp);
+          let down = Math.max(statDown, clientDown);
+
           let remaining = 0;
-          
           if (total > 0) {
-            remaining = total - (up + down);
-            if (remaining < 0) remaining = 0;
+            remaining = Math.max(total - (up + down), 0);
           }
           
           let streamSettings: any = {};
@@ -340,8 +354,13 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
             remark: inbound.remark,
             upload: up,
             download: down,
+            upBytes: up,
+            downBytes: down,
             totalTraffic: total,
             remainingTraffic: remaining,
+            trafficLimit: total > 0 ? `${total / (1024 * 1024 * 1024)}GB` : 'Unlimited',
+            remainingGB: total > 0 ? `${(remaining / (1024 * 1024 * 1024)).toFixed(2)}GB` : 'Unlimited',
+            usedGB: parseFloat(((up + down) / (1024 * 1024 * 1024)).toFixed(2)),
             expiryTime: c.expiryTime || 0,
             enableStatus: c.enable,
             onlineStatus: c.enable && (total === 0 || remaining > 0),

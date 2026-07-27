@@ -112,7 +112,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           inboundId,
           trafficLimit: isTrialOrd ? '1GB' : (data.traffic_limit || 'Unlimited'),
           serverNode: data.server || 'Singapore',
-          _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : 0,
+          _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : (data.traffic_limit && String(data.traffic_limit).toLowerCase() !== 'unlimited' ? ((parseFloat(String(data.traffic_limit)) || 0) * 1024 * 1024 * 1024) : 0),
           isTrial: isTrialOrd,
           templateId: tplId,
         });
@@ -187,16 +187,20 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       }
 
       const extractTraffic = (obj: any, type: 'up' | 'down') => {
+        if (!obj) return 0;
         const val = obj[type] || obj[`${type}load`] || 0;
-        return val;
+        return typeof val === 'number' ? val : (parseFloat(val) || 0);
       };
+
+      const clientUp = extractTraffic(foundClient, 'up');
+      const clientDown = extractTraffic(foundClient, 'down');
 
       if (stat) {
         const statUp = extractTraffic(stat, 'up');
         const statDown = extractTraffic(stat, 'down');
         
-        if (statUp > 0 || up === 0) up = statUp;
-        if (statDown > 0 || down === 0) down = statDown;
+        up = Math.max(statUp, clientUp, up);
+        down = Math.max(statDown, clientDown, down);
         
         if (stat.total !== undefined && stat.total > 0) {
           total = stat.total;
@@ -209,8 +213,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         }
         lastOnline = stat.lastOnline || stat.online || stat.time || 0;
       } else {
-        up = extractTraffic(foundClient, 'up');
-        down = extractTraffic(foundClient, 'down');
+        up = Math.max(clientUp, up);
+        down = Math.max(clientDown, down);
         lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
