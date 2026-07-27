@@ -69,3 +69,12 @@ export const deleteSettings = async (req: AuthRequest, res: Response): Promise<v
     res.status(500).json({ error: error.message });
   }
 };
+
+export const syncClients = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const result = await xuiService.syncDeleted3XUiClients();
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message || 'Synchronization failed' });
+  }
+};

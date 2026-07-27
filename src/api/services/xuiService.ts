@@ -347,6 +347,11 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
           const config = await getXuiConfig();
           const { baseUrl } = parseUrl(config.panelUrl);
           
+          let expTimeMs = c.expiryTime || 0;
+          if (expTimeMs > 0 && expTimeMs < 10000000000) expTimeMs = expTimeMs * 1000;
+          const isExpired = c.enable === false || (expTimeMs > 0 && expTimeMs <= Date.now()) || expTimeMs < 0;
+          const isClientEnabled = c.enable !== false && !isExpired;
+
           return {
             email: c.email,
             uuid: c.id,
@@ -362,8 +367,9 @@ export const getClientByEmail = async (email: string): Promise<any | null> => {
             remainingGB: total > 0 ? `${(remaining / (1024 * 1024 * 1024)).toFixed(2)}GB` : 'Unlimited',
             usedGB: parseFloat(((up + down) / (1024 * 1024 * 1024)).toFixed(2)),
             expiryTime: c.expiryTime || 0,
-            enableStatus: c.enable,
-            onlineStatus: c.enable && (total === 0 || remaining > 0),
+            enableStatus: isClientEnabled,
+            onlineStatus: isClientEnabled,
+            status: isClientEnabled ? 'Active' : 'Expired',
             subId: c.subId || '',
             port: inbound.port,
             protocol: inbound.protocol,
@@ -1836,7 +1842,211 @@ export const cleanupExpiredTrials = async (): Promise<{ count: number }> => {
     console.error('[Cleanup Expired Trials] Error during trial cleanup execution:', err);
   }
 
+  // Automatic synchronization with 3X-UI panel: remove/archive database records for clients deleted in 3X-UI
+  try {
+    await syncDeleted3XUiClients();
+  } catch (syncErr: any) {
+    console.warn('[Cleanup Expired Trials] Notice running syncDeleted3XUiClients:', syncErr.message || syncErr);
+  }
+
   return { count: expiredCount };
+};
+
+/**
+ * Automatically synchronizes 3X-UI panel clients with local database (vpn_accounts, vpn_configs, orders).
+ * Verifies that every stored VPN UUID still exists in the corresponding 3X-UI panel.
+ * If a client no longer exists in 3X-UI (deleted manually or otherwise), automatically removes or archives
+ * the matching records so they no longer appear on the customer's dashboard or configuration list.
+ * Fault-tolerant: if 3X-UI panel is temporarily unavailable, does NOT delete anything and retries next cycle.
+ */
+export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): Promise<{ synced: boolean; deletedCount: number }> => {
+  console.log('[3X-UI Sync] Starting VPN client synchronization check with 3X-UI panel...');
+
+  let inbounds: XuiInbound[] = [];
+  if (inboundsOverride && Array.isArray(inboundsOverride) && inboundsOverride.length > 0) {
+    inbounds = inboundsOverride;
+  } else {
+    try {
+      const endpoint = '/panel/api/inbounds/list';
+      const inboundsData = await requestApi<XuiInbound[]>(endpoint);
+      if (!Array.isArray(inboundsData)) {
+        console.warn('[3X-UI Sync] 3X-UI panel returned non-array inbounds response. Skipping deletion check for safety.');
+        return { synced: false, deletedCount: 0 };
+      }
+      inbounds = inboundsData;
+    } catch (error: any) {
+      console.warn(`[3X-UI Sync] 3X-UI panel is temporarily unavailable. Skipping deletion/sync cycle and will retry on next cycle. Error: ${error.message || error}`);
+      return { synced: false, deletedCount: 0 };
+    }
+  }
+
+  // Build the set of all live client UUIDs currently existing in 3X-UI panel across all inbounds
+  const live3XUiUuids = new Set<string>();
+
+  for (const ib of inbounds) {
+    let settingsObj: { clients?: XuiClient[] } = {};
+    try {
+      if (ib.settings) {
+        settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+      }
+    } catch (e) {
+      console.warn('[3X-UI Sync] Warning parsing inbound settings during sync:', e);
+    }
+
+    const clients = settingsObj.clients || [];
+    for (const c of clients) {
+      if (c.id) {
+        live3XUiUuids.add(String(c.id).trim().toLowerCase());
+      }
+    }
+
+    const clientStats = ib.clientStats || [];
+    for (const s of clientStats) {
+      if (s.id) {
+        live3XUiUuids.add(String(s.id).trim().toLowerCase());
+      }
+    }
+  }
+
+  console.log(`[3X-UI Sync] 3X-UI panel reachable. Found ${live3XUiUuids.size} active client UUIDs across ${inbounds.length} inbounds.`);
+
+  let deletedCount = 0;
+  const dbClient = supabaseAdmin;
+  const now = Date.now();
+  const RECENT_PROVISION_GRACE_PERIOD_MS = 30000; // 30 seconds grace period for brand new records
+
+  try {
+    // 1. Sync vpn_accounts table
+    const { data: accounts, error: accError } = await dbClient.from('vpn_accounts').select('*');
+    if (accError) {
+      console.error('[3X-UI Sync] Error querying vpn_accounts:', accError.message || accError);
+    } else if (accounts && Array.isArray(accounts)) {
+      for (const acc of accounts) {
+        const uuid = acc.uuid ? String(acc.uuid).trim().toLowerCase() : '';
+        const orderId = acc.order_id || acc.id;
+        const currentStatus = String(acc.status || '').toLowerCase();
+
+        if (currentStatus === 'removed' || currentStatus === 'deleted') {
+          continue;
+        }
+
+        if (acc.created_at) {
+          const createdAtMs = new Date(acc.created_at).getTime();
+          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
+            continue;
+          }
+        }
+
+        if (uuid && !live3XUiUuids.has(uuid)) {
+          console.log(`[3X-UI Sync] Detected client UUID ${uuid} (Order: ${orderId}, Email: ${acc.email || 'N/A'}) no longer exists in 3X-UI. Removing/archiving record in vpn_accounts...`);
+          
+          const timestamp = new Date().toISOString();
+          const { error: updateAccErr } = await dbClient
+            .from('vpn_accounts')
+            .update({
+              status: 'removed',
+              enable: false,
+              updated_at: timestamp
+            })
+            .eq('id', acc.id);
+
+          if (updateAccErr) {
+            console.error(`[3X-UI Sync] Failed to update vpn_accounts for ID ${acc.id}:`, updateAccErr.message || updateAccErr);
+          } else {
+            console.log(`[3X-UI Sync] Successfully marked vpn_accounts ID ${acc.id} (UUID: ${uuid}) as 'removed'.`);
+            deletedCount++;
+          }
+        }
+      }
+    }
+
+    // 2. Sync vpn_configs table
+    const { data: configs, error: cfgError } = await dbClient.from('vpn_configs').select('*');
+    if (cfgError) {
+      console.error('[3X-UI Sync] Error querying vpn_configs:', cfgError.message || cfgError);
+    } else if (configs && Array.isArray(configs)) {
+      for (const cfg of configs) {
+        const uuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : '';
+        const currentStatus = String(cfg.status || '').toLowerCase();
+
+        if (currentStatus === 'removed' || currentStatus === 'deleted') {
+          continue;
+        }
+
+        if (cfg.created_at) {
+          const createdAtMs = new Date(cfg.created_at).getTime();
+          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
+            continue;
+          }
+        }
+
+        if (uuid && !live3XUiUuids.has(uuid)) {
+          console.log(`[3X-UI Sync] Detected config UUID ${uuid} (ID: ${cfg.id}, Order: ${cfg.order_id || 'N/A'}) no longer exists in 3X-UI. Removing/archiving record in vpn_configs...`);
+          
+          const timestamp = new Date().toISOString();
+          const { error: updateCfgErr } = await dbClient
+            .from('vpn_configs')
+            .update({
+              status: 'removed',
+              enabled: false,
+              updated_at: timestamp
+            })
+            .eq('id', cfg.id);
+
+          if (updateCfgErr) {
+            console.error(`[3X-UI Sync] Failed to update vpn_configs for ID ${cfg.id}:`, updateCfgErr.message || updateCfgErr);
+          } else {
+            console.log(`[3X-UI Sync] Successfully marked vpn_configs ID ${cfg.id} (UUID: ${uuid}) as 'removed'.`);
+            deletedCount++;
+          }
+        }
+      }
+    }
+
+    // 3. Sync orders table
+    const { data: orders, error: ordError } = await dbClient.from('orders').select('*');
+    if (!ordError && orders && Array.isArray(orders)) {
+      for (const ord of orders) {
+        const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
+        const currentStatus = String(ord.status || '').toLowerCase();
+
+        if (currentStatus === 'removed' || currentStatus === 'deleted' || currentStatus === 'expired' || currentStatus === 'cancelled') {
+          continue;
+        }
+
+        if (ord.created_at) {
+          const createdAtMs = new Date(ord.created_at).getTime();
+          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
+            continue;
+          }
+        }
+
+        if (uuid && !live3XUiUuids.has(uuid)) {
+          console.log(`[3X-UI Sync] Order ID ${ord.id} has client UUID ${uuid} which no longer exists in 3X-UI. Updating order status to 'removed'...`);
+          const timestamp = new Date().toISOString();
+          await dbClient
+            .from('orders')
+            .update({
+              status: 'removed',
+              payment_status: 'Removed',
+              updated_at: timestamp
+            })
+            .eq('id', ord.id);
+        }
+      }
+    }
+
+    if (deletedCount > 0) {
+      console.log(`[3X-UI Sync] Synchronization completed. Removed/archived ${deletedCount} records for client UUIDs deleted from 3X-UI.`);
+    } else {
+      console.log('[3X-UI Sync] Synchronization completed. All stored VPN UUIDs exist in 3X-UI panel.');
+    }
+
+    return { synced: true, deletedCount };
+  } catch (err: any) {
+    console.error('[3X-UI Sync] Unexpected error during synchronization cycle:', err.message || err);
+    return { synced: false, deletedCount: 0 };
+  }
 };
 
 

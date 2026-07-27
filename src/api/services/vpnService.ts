@@ -1,5 +1,5 @@
 import { supabase } from '../../lib/supabase.js';
-import { getInbounds, cleanupExpiredTrials } from './xuiService.js';
+import { getInbounds, cleanupExpiredTrials, syncDeleted3XUiClients } from './xuiService.js';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string) => {
   // Requirement 8: Automatic cleanup of expired trials on config retrieval
@@ -123,6 +123,9 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   let inbounds: any[] = [];
   try {
     inbounds = await getInbounds();
+    if (inbounds && inbounds.length > 0) {
+      await syncDeleted3XUiClients(inbounds).catch(e => console.warn('[vpnService] syncDeleted3XUiClients notice:', e));
+    }
   } catch (error) {
     console.warn('[vpnService] Failed to fetch inbounds metadata:', error);
   }
@@ -229,16 +232,26 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : 'Unlimited';
 
     const now = Date.now();
+    let expTimeMs = expiryTime;
+    if (expTimeMs > 0 && expTimeMs < 10000000000) {
+      expTimeMs = expTimeMs * 1000;
+    }
+    if ((!expTimeMs || expTimeMs <= 0) && config.expiryDate) {
+      const parsed = new Date(config.expiryDate).getTime();
+      if (!isNaN(parsed)) expTimeMs = parsed;
+    }
+
+    const isExpiredByTime = (expTimeMs > 0 && expTimeMs <= now) || (expTimeMs < 0);
+    const isClientDisabled = enable === false;
+
     let status = 'Active';
-    if (!enable) {
-      status = 'Disabled';
-    } else if (expiryTime > 0 && expiryTime < now) {
+    if (isClientDisabled || isExpiredByTime) {
       status = 'Expired';
     }
 
     let currentExpiryDate = config.expiryDate;
-    if (expiryTime > 0) {
-      currentExpiryDate = new Date(expiryTime).toISOString();
+    if (expTimeMs > 0) {
+      currentExpiryDate = new Date(expTimeMs).toISOString();
     }
 
     let port = 443;
@@ -280,8 +293,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       expiryDate: currentExpiryDate,
       expiryTime: currentExpiryDate,
       status,
-      enableStatus: status !== 'Disabled',
-      onlineStatus: status === 'Active',
+      enableStatus: status === 'Active',
+      onlineStatus: status === 'Active' && (lastOnline > 0 || up > 0 || down > 0),
       serverNode: config.serverNode,
       port,
       protocol,
@@ -295,29 +308,34 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     };
   });
 
-  // Requirement 3: Remove expired/over-limit trials from customer's Purchased VPN Configurations list
-  const activeConfigs = resultConfigs.filter(cfg => {
-    const isExpiredStatus = cfg.status === 'Expired' || cfg.status === 'Disabled';
-
-    if (cfg.isTrial) {
-      const isOverDataLimit = cfg.usedGB >= 1 || (cfg.upBytes + cfg.downBytes >= 1073741824);
-      let expTimeMs: number | null = null;
-      if (cfg.expiryDate) {
-        expTimeMs = new Date(cfg.expiryDate).getTime();
+  if (inbounds && inbounds.length > 0) {
+    const liveUuids = new Set<string>();
+    for (const ib of inbounds) {
+      let settingsObj: any = {};
+      try {
+        if (ib.settings) {
+          settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+        }
+      } catch (e) {}
+      const clients = settingsObj.clients || [];
+      for (const c of clients) {
+        if (c.id) liveUuids.add(String(c.id).trim().toLowerCase());
       }
-      const isTimeExpired = expTimeMs ? expTimeMs <= Date.now() : false;
-
-      if (isExpiredStatus || isOverDataLimit || isTimeExpired) {
-        return false;
+      const clientStats = ib.clientStats || [];
+      for (const s of clientStats) {
+        if (s.id) liveUuids.add(String(s.id).trim().toLowerCase());
       }
     }
 
-    if (isExpiredStatus) {
-      return false;
-    }
+    return resultConfigs.filter(cfg => {
+      if (!cfg.uuid) return false;
+      const isLive = liveUuids.has(String(cfg.uuid).trim().toLowerCase());
+      if (!isLive) {
+        console.log(`[3X-UI Sync] Excluding deleted configuration (UUID: ${cfg.uuid}) from user response.`);
+      }
+      return isLive;
+    });
+  }
 
-    return true;
-  });
-
-  return activeConfigs;
+  return resultConfigs;
 };
