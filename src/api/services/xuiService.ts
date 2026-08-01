@@ -158,16 +158,23 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
   const { baseUrl } = parseUrl(config.panelUrl);
   const client = createAxiosInstance(baseUrl);
 
+  const headers: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    'X-Requested-With': 'XMLHttpRequest'
+  };
+
   const loginEndpoints = ['/login', '/panel/login'];
   let cookieHeader = '';
 
   for (const loginEp of loginEndpoints) {
     try {
+      const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
       const res = await client.post(
-        loginEp,
+        fullPath,
         `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
         {
           headers: {
+            ...headers,
             'Content-Type': 'application/x-www-form-urlencoded'
           }
         }
@@ -175,7 +182,7 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
       const setCookie = res.headers['set-cookie'];
       if (setCookie && Array.isArray(setCookie)) {
         cookieHeader = setCookie.map(c => c.split(';')[0]).join('; ');
-        console.log(`[xuiService] Successfully authenticated via ${loginEp} session login`);
+        console.log(`[xuiService] Successfully authenticated via ${fullPath} session login`);
         break;
       }
     } catch (e: any) {
@@ -183,15 +190,30 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
     }
   }
 
-  const headers: Record<string, string> = {};
   if (cookieHeader) {
     headers['Cookie'] = cookieHeader;
   }
   headers['Authorization'] = `Bearer ${password}`;
+
+  // Fetch CSRF token if available
+  try {
+    const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, '/csrf-token');
+    const csrfRes = await client.get(csrfPath, { headers });
+    if (csrfRes.data?.obj) {
+      headers['X-CSRF-Token'] = csrfRes.data.obj;
+    }
+    if (csrfRes.headers['set-cookie']) {
+      const csrfCookie = csrfRes.headers['set-cookie'].map((c: string) => c.split(';')[0]).join('; ');
+      headers['Cookie'] = headers['Cookie'] ? `${headers['Cookie']}; ${csrfCookie}` : csrfCookie;
+    }
+  } catch (e: any) {
+    // Non-fatal if csrf endpoint fails
+  }
+
   return headers;
 };
 
-const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
+export const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
   console.log(`[xuiService] [FUNCTION ENTERED] requestApi - Endpoint: ${endpoint}, Method: ${method}`);
   const config = await getXuiConfig();
   const headers = await getXuiAuthHeaders(config);
@@ -1201,7 +1223,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const existingClients: any[] = settingsObj.clients;
   const clientCountBefore = existingClients.length;
 
-  const newClientRecord = {
+  const newClientRecord: any = {
     id: uuid,
     email: remark,
     flow: flow || '',
@@ -1211,8 +1233,33 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     enable: true,
     tgId: 0,
     subId: subId,
-    reset: 0
+    reset: 0,
+    comment: '',
+    group: ''
   };
+
+  // Add protocol-specific fields if defined on target inbound (e.g., security, password, auth for VLESS/Reality)
+  if (targetInboundObj.protocol === 'vless' || targetInboundObj.protocol === 'trojan' || targetInboundObj.protocol === 'vmess') {
+    if (security) {
+      newClientRecord.security = security;
+    }
+  }
+
+  // Direct addClient payload format for 3X-UI /panel/api/inbounds/addClient
+  const addClientDirectPayload = {
+    id: Number(inboundId),
+    settings: JSON.stringify({
+      clients: [newClientRecord]
+    })
+  };
+
+  console.log('=== [3X-UI ADD CLIENT REQUEST BODY LOGGING] ===');
+  console.log('Target Inbound ID:', inboundId);
+  console.log('Client Record (Matches Manual Client Structure):');
+  console.log(JSON.stringify(newClientRecord, null, 2));
+  console.log('Direct addClient Payload:');
+  console.log(JSON.stringify(addClientDirectPayload, null, 2));
+  console.log('==============================================');
 
   console.log('=== [DIAGNOSTIC] 1. Before update ===');
   console.log(`Target inbound ID: ${inboundId}`);
