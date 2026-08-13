@@ -2,7 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as userService from '../services/userService.js';
 import * as notificationService from '../services/notificationService.js';
-import { sendNewSupportTicketNotification } from '../services/telegramService.js';
+import { sendNewSupportTicketNotification, sendLiveChatNotification } from '../services/telegramService.js';
 
 export const getProfile = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -137,3 +137,27 @@ export const notifySupportTicketReply = async (req: AuthRequest, res: Response):
   }
 };
 
+
+
+export const notifyLiveChat = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = req.body || {};
+    const email = data.customerEmail || req.user?.email || 'N/A';
+    
+    sendLiveChatNotification({
+      customerEmail: email,
+      customerName: data.customerName,
+      message: data.message
+    }).catch((err) => {
+      console.error('[UserController] Telegram live chat notification error:', err?.message || err);
+    });
+
+    res.json({
+      success: true,
+      message: 'Live chat notification triggered successfully.'
+    });
+  } catch (error: any) {
+    console.error('[UserController] Error processing live chat notification:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};

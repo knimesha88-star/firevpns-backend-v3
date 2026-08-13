@@ -601,3 +601,55 @@ ${reason}`;
   }
 };
 
+
+
+export interface LiveChatNotificationData {
+  customerEmail: string;
+  customerName?: string;
+  message: string;
+}
+
+export const sendLiveChatNotification = async (data: LiveChatNotificationData): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram live chat notification.');
+    return;
+  }
+
+  const customer = data.customerName || data.customerEmail.split('@')[0] || 'Unknown';
+  const email = data.customerEmail || 'N/A';
+  const msg = data.message || '';
+
+  const telegramMessage = `🔥 <b>FIREVPNs — New Live Chat</b>
+
+👤 <b>Customer:</b> ${customer} (${email})
+
+💬 <b>Message:</b>
+"${msg}"
+
+<i>Open the Admin Panel to reply.</i>`;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: telegramMessage,
+        parse_mode: 'HTML',
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+    }
+  } catch (err: any) {
+    console.error('[TelegramService] Failed to send Telegram live chat notification:', err?.message || err);
+  }
+};
