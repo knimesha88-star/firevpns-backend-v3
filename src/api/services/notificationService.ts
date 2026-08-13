@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../../lib/supabase.js';
+import { sendExpiryReminderEmail, sendVpnExpiredEmail } from './emailService.js';
 
 export interface CreateNotificationParams {
   userId?: string | null;
@@ -188,6 +189,26 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
           vpnName: vpnName,
           vpnUuid: vpnUuid
         });
+
+        // Trigger Email Notification
+        if (userEmail) {
+          if (daysLeft > 0) {
+            sendExpiryReminderEmail({
+              userEmail: userEmail,
+              vpnAccountId: vpnUuid || cfg.id,
+              packageName: vpnName,
+              daysLeft: daysLeft,
+              userId: targetUserId
+            }).catch(e => console.warn('[NotificationService] Expiry reminder email warning:', e));
+          } else {
+            sendVpnExpiredEmail({
+              userEmail: userEmail,
+              vpnAccountId: vpnUuid || cfg.id,
+              packageName: vpnName,
+              userId: targetUserId
+            }).catch(e => console.warn('[NotificationService] VPN expired email warning:', e));
+          }
+        }
       }
     }
   } catch (err: any) {

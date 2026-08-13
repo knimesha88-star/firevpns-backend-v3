@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosError } from 'axios';
 import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
 import { createCustomerNotification } from './notificationService.js';
+import { sendPaymentApprovedEmail, sendTrialApprovedEmail } from './emailService.js';
 
 import crypto from 'crypto';
 
@@ -1552,6 +1553,30 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
         orderId: order.id,
         vpnName: packageName
       });
+    }
+
+    // Trigger Email Notification (non-blocking)
+    if (order.email) {
+      if (isTrialOrder) {
+        sendTrialApprovedEmail({
+          userEmail: order.email,
+          trialId: order.id,
+          orderId: order.order_id || order.id,
+          packageName,
+          vlessUrl,
+          expiryDate: new Date(expiryMs).toISOString(),
+          userId: validUserId
+        }).catch(e => console.warn('[3X-UI Provisioning DB] Trial approved email notification warning:', e));
+      } else {
+        sendPaymentApprovedEmail({
+          userEmail: order.email,
+          orderId: order.order_id || order.id,
+          packageName,
+          vlessUrl,
+          expiryDate: new Date(expiryMs).toISOString(),
+          userId: validUserId
+        }).catch(e => console.warn('[3X-UI Provisioning DB] Payment approved email notification warning:', e));
+      }
     }
   } catch (notifErr: any) {
     console.error('[3X-UI Provisioning DB] CRITICAL: Customer notification creation failed:', notifErr.message || notifErr);

@@ -4,6 +4,11 @@ import * as xuiService from '../services/xuiService.js';
 import { supabase } from '../../lib/supabase.js';
 import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
+import {
+  sendOrderReceivedEmail,
+  sendRenewalApprovedEmail,
+  sendRenewalRejectedEmail
+} from '../services/emailService.js';
 
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -299,6 +304,18 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }).catch((telegramErr) => {
       console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
     });
+
+    // Send Renewal Approved Email (non-blocking)
+    if (email) {
+      sendRenewalApprovedEmail({
+        userEmail: email,
+        renewalId: requestId,
+        packageName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
+        expiryDate: new_expiryIso,
+        vlessUrl: targetVpnAcc?.vless_url || '',
+        userId: data.user_id || data.userId
+      }).catch(e => console.warn('[RenewController] Renewal approved email warning:', e));
+    }
     
     // Trigger background synchronization asynchronously and non-blockingly
     xuiService.triggerBackgroundSyncIfNeeded('VPN Renewed', true);
@@ -373,6 +390,17 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       console.error('[RenewController] CRITICAL: Customer notification creation error on reject:', nErr.message || nErr);
     }
 
+    // Send Renewal Rejected Email (non-blocking)
+    if (email) {
+      sendRenewalRejectedEmail({
+        userEmail: email,
+        renewalId: requestId,
+        packageName: data.plan_name || data.planName || 'VPN Plan',
+        reason: reason,
+        userId: data.user_id || data.userId
+      }).catch(e => console.warn('[RenewController] Renewal rejected email warning:', e));
+    }
+
     res.json({
       success: true,
       message: 'Renewal request rejected successfully.',
@@ -422,6 +450,17 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       });
     } catch (notifErr: any) {
       console.error('[RenewController] CRITICAL: Error creating Order Placed/Payment Submitted notifications in createOrderNotification:', notifErr.message || notifErr);
+    }
+
+    // Send Order Received Email (non-blocking)
+    if (notificationData.email && notificationData.email !== 'N/A') {
+      sendOrderReceivedEmail({
+        userEmail: notificationData.email,
+        orderId: notificationData.orderId,
+        packageName: notificationData.plan,
+        amount: Number(notificationData.amount) || 0,
+        userId: req.user?.uid || data.userId
+      }).catch(e => console.warn('[RenewController] Order received email warning:', e));
     }
 
     sendNewOrderNotification(notificationData).catch((err) => {

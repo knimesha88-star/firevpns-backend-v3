@@ -3,6 +3,7 @@ import { AuthRequest } from '../../types/interfaces.js';
 import * as userService from '../services/userService.js';
 import * as notificationService from '../services/notificationService.js';
 import { sendNewSupportTicketNotification, sendLiveChatNotification } from '../services/telegramService.js';
+import { sendSupportReplyEmail, sendLiveChatReplyEmail } from '../services/emailService.js';
 
 export const getProfile = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -127,6 +128,16 @@ export const notifySupportTicketReply = async (req: AuthRequest, res: Response):
       console.error('[UserController] Support ticket reply customer notification error:', notifErr?.message || notifErr);
     }
 
+    if (email && email !== 'N/A') {
+      sendSupportReplyEmail({
+        userEmail: email,
+        ticketId: ticketId,
+        subject: data.subject || 'Support Ticket Update',
+        replyMessage: replyMessage,
+        userId: data.userId || req.user?.uid
+      }).catch(e => console.warn('[UserController] Support ticket reply email warning:', e));
+    }
+
     res.json({
       success: true,
       message: 'Support ticket reply notification triggered successfully.'
@@ -151,6 +162,15 @@ export const notifyLiveChat = async (req: AuthRequest, res: Response): Promise<v
     }).catch((err) => {
       console.error('[UserController] Telegram live chat notification error:', err?.message || err);
     });
+
+    if (email && email !== 'N/A' && data.isAdmin) {
+      sendLiveChatReplyEmail({
+        userEmail: email,
+        customerName: data.customerName,
+        chatMessage: data.message,
+        userId: data.userId
+      }).catch(e => console.warn('[UserController] Live chat reply email warning:', e));
+    }
 
     res.json({
       success: true,

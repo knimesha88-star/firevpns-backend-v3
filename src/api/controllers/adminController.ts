@@ -5,6 +5,13 @@ import * as xuiService from '../services/xuiService.js';
 import { supabaseAdmin } from '../../lib/supabase.js';
 import { createCustomerNotification } from '../services/notificationService.js';
 import { sendOrderRejectedNotification } from '../services/telegramService.js';
+import {
+  getEmailSettings,
+  sendPaymentRejectedEmail,
+  sendTrialRejectedEmail,
+  sendMaintenanceAnnouncementEmail,
+  sendEmail
+} from '../services/emailService.js';
 
 export const getStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -146,6 +153,27 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
           orderId: order.id
         });
       }
+
+      // Send email notification non-blockingly
+      if (order.email) {
+        if (isTrial) {
+          sendTrialRejectedEmail({
+            userEmail: order.email,
+            orderId: order.id,
+            packageName: order.package_name || 'Free Trial',
+            reason: reason,
+            userId: order.customer_id
+          }).catch(e => console.warn('[AdminController] Trial rejected email warning:', e));
+        } else {
+          sendPaymentRejectedEmail({
+            userEmail: order.email,
+            orderId: order.order_id || order.id,
+            packageName: order.package_name || 'VPN Plan',
+            reason: reason,
+            userId: order.customer_id
+          }).catch(e => console.warn('[AdminController] Payment rejected email warning:', e));
+        }
+      }
     } catch (notifErr: any) {
       console.error('[AdminController] CRITICAL: Customer notification creation failed during rejection:', notifErr.message || notifErr);
     }
@@ -169,7 +197,7 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
 
 export const publishAnnouncementNotification = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { title, message, type } = req.body;
+    const { title, message, type, sendEmail } = req.body;
     if (!title || !message) {
       res.status(400).json({ error: 'Title and message are required' });
       return;
@@ -178,7 +206,7 @@ export const publishAnnouncementNotification = async (req: AuthRequest, res: Res
     console.log(`[AdminController] Publishing announcement: "${title}" (Type: ${type || 'announcement'})`);
 
     // 1. Fetch all profiles
-    const { data: profiles, error: fetchErr } = await supabaseAdmin.from('profiles').select('id');
+    const { data: profiles, error: fetchErr } = await supabaseAdmin.from('profiles').select('id, email');
     if (fetchErr) {
       console.error('[AdminController] Error fetching profiles for announcement:', fetchErr);
       res.status(500).json({ error: 'Failed to fetch profiles' });
@@ -194,7 +222,7 @@ export const publishAnnouncementNotification = async (req: AuthRequest, res: Res
     const insertPromises = profiles.map((p) => {
       return createCustomerNotification({
         userId: p.id,
-        userEmail: '',
+        userEmail: p.email || '',
         title,
         message,
         type: type || 'announcement'
@@ -203,10 +231,110 @@ export const publishAnnouncementNotification = async (req: AuthRequest, res: Res
 
     await Promise.all(insertPromises);
 
+    // 3. Send email to users if sendEmail is true or announcement type is maintenance
+    if (sendEmail) {
+      profiles.forEach(p => {
+        if (p.email) {
+          sendMaintenanceAnnouncementEmail({
+            userEmail: p.email,
+            announcementTitle: title,
+            announcementBody: message,
+            userId: p.id
+          }).catch(e => console.warn('[AdminController] Announcement email warning:', e));
+        }
+      });
+    }
+
     res.json({ success: true, count: profiles.length });
   } catch (error: any) {
     console.error('[AdminController] Announcement notification error:', error.message);
     res.status(500).json({ error: error.message || 'Failed to send announcement notifications.' });
+  }
+};
+
+export const getEmailSettingsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const settings = await getEmailSettings();
+    res.json({ success: true, settings });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const saveEmailSettingsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { settings } = req.body;
+    if (!settings) {
+      res.status(400).json({ error: 'Settings object is required' });
+      return;
+    }
+
+    await supabaseAdmin.from('settings').upsert({
+      id: 'email',
+      data: settings,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'id' });
+
+    res.json({ success: true, message: 'Email settings saved successfully' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const getEmailLogsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('email_notifications')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      if (error.code === 'PGRST205') {
+        res.json({ success: true, logs: [] });
+        return;
+      }
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    res.json({ success: true, logs: data || [] });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const sendTestEmailHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { toEmail } = req.body;
+    const recipient = toEmail || req.user?.email;
+
+    if (!recipient) {
+      res.status(400).json({ error: 'Target email address is required' });
+      return;
+    }
+
+    const result = await sendEmail({
+      to: recipient,
+      subject: '🔥 FIREVPNs Email System Test',
+      html: `
+        <h1 style="color: #38bdf8;">FIREVPNs Email Notification System</h1>
+        <p>This is a test email sent from your FIREVPNs Admin Panel.</p>
+        <p>If you are receiving this message, your Resend API configuration is <strong>100% active and working!</strong></p>
+      `,
+      eventType: 'test_email',
+      referenceId: `test_${Date.now()}`,
+      userId: req.user?.uid
+    });
+
+    if (!result.success) {
+      res.status(400).json({ error: result.error || 'Failed to send test email' });
+      return;
+    }
+
+    res.json({ success: true, message: `Test email sent successfully to ${recipient}` });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
   }
 };
 
