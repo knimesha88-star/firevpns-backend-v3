@@ -35,5 +35,10 @@ router.post('/email/settings', saveEmailSettingsHandler);
 router.get('/email/logs', getEmailLogsHandler);
 router.post('/email/test', sendTestEmailHandler);
 
+// Traffic Reset Policy routes
+import { getTrafficResetPolicyHandler, saveTrafficResetPolicyHandler } from '../controllers/vpnController.js';
+router.get('/traffic-reset-policy', getTrafficResetPolicyHandler);
+router.post('/traffic-reset-policy', saveTrafficResetPolicyHandler);
+
 export default router;
 

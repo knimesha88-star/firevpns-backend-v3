@@ -1,5 +1,7 @@
 import { supabase } from '../../lib/supabase.js';
-import { getCachedInbounds, getLiveInbound } from './xuiService.js';
+import { getCachedInbounds, getLiveInbound, getInbounds, resetClientTraffic } from './xuiService.js';
+import { createCustomerNotification } from './notificationService.js';
+import crypto from 'crypto';
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
   const dbStart = Date.now();
@@ -388,3 +390,640 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   return { configs: resultConfigs, dbTime };
 };
+
+export interface TrafficResetPolicy {
+  enabled: boolean;
+  cooldownHours: number;
+  maxResetsPerBillingPeriod: number;
+  allowTrialReset: boolean;
+}
+
+export const DEFAULT_RESET_POLICY: TrafficResetPolicy = {
+  enabled: true,
+  cooldownHours: 24,
+  maxResetsPerBillingPeriod: 1,
+  allowTrialReset: false
+};
+
+export interface TrafficResetLog {
+  id: string;
+  userId: string;
+  userEmail: string;
+  configUuid: string;
+  orderId?: string;
+  inboundId?: number;
+  clientEmail?: string;
+  resetTimestamp: string;
+  resetTimestampMs: number;
+  upBytesBefore: number;
+  downBytesBefore: number;
+  totalBytesBefore: number;
+  status: 'success' | 'failed';
+}
+
+export interface ResetTrafficStatus {
+  canReset: boolean;
+  reason?: string;
+  cooldownHours: number;
+  cooldownRemainingHours: number;
+  resetsUsedInPeriod: number;
+  maxResetsPerPeriod: number;
+  lastResetTimestamp: string | null;
+  nextAvailableReset: string | null;
+}
+
+export const getTrafficResetPolicy = async (): Promise<TrafficResetPolicy> => {
+  try {
+    const { data: doc } = await supabase.from('settings').select('*').eq('id', 'traffic_reset_policy').maybeSingle();
+    if (doc && doc.data) {
+      return {
+        enabled: doc.data.enabled !== false,
+        cooldownHours: Number(doc.data.cooldownHours) || DEFAULT_RESET_POLICY.cooldownHours,
+        maxResetsPerBillingPeriod: Number(doc.data.maxResetsPerBillingPeriod) || DEFAULT_RESET_POLICY.maxResetsPerBillingPeriod,
+        allowTrialReset: Boolean(doc.data.allowTrialReset)
+      };
+    }
+  } catch (err) {
+    console.warn('[vpnService] Error reading traffic_reset_policy:', err);
+  }
+  return DEFAULT_RESET_POLICY;
+};
+
+export const saveTrafficResetPolicy = async (policy: Partial<TrafficResetPolicy>): Promise<TrafficResetPolicy> => {
+  const current = await getTrafficResetPolicy();
+  const updated: TrafficResetPolicy = {
+    enabled: policy.enabled !== undefined ? Boolean(policy.enabled) : current.enabled,
+    cooldownHours: policy.cooldownHours !== undefined ? Math.max(1, Number(policy.cooldownHours)) : current.cooldownHours,
+    maxResetsPerBillingPeriod: policy.maxResetsPerBillingPeriod !== undefined ? Math.max(1, Number(policy.maxResetsPerBillingPeriod)) : current.maxResetsPerBillingPeriod,
+    allowTrialReset: policy.allowTrialReset !== undefined ? Boolean(policy.allowTrialReset) : current.allowTrialReset
+  };
+
+  await supabase.from('settings').upsert({
+    id: 'traffic_reset_policy',
+    data: updated,
+    updated_at: new Date().toISOString()
+  });
+
+  return updated;
+};
+
+export const getTrafficResetLogs = async (): Promise<TrafficResetLog[]> => {
+  try {
+    const { data: doc } = await supabase.from('settings').select('*').eq('id', 'traffic_reset_logs').maybeSingle();
+    if (doc && doc.data) {
+      if (Array.isArray(doc.data)) {
+        return doc.data as TrafficResetLog[];
+      }
+      if (Array.isArray(doc.data.logs)) {
+        return doc.data.logs as TrafficResetLog[];
+      }
+    }
+  } catch (err) {
+    console.warn('[vpnService] Error reading traffic_reset_logs:', err);
+  }
+  return [];
+};
+
+export const recordTrafficResetLog = async (log: TrafficResetLog): Promise<void> => {
+  try {
+    const existingLogs = await getTrafficResetLogs();
+    const updatedLogs = [log, ...existingLogs.slice(0, 499)];
+    await supabase.from('settings').upsert({
+      id: 'traffic_reset_logs',
+      data: { logs: updatedLogs },
+      updated_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.warn('[vpnService] Error saving traffic_reset_logs to settings:', err);
+  }
+
+  // Also attempt insert into traffic_resets table if it exists
+  try {
+    await supabase.from('traffic_resets').insert({
+      user_id: log.userId,
+      config_uuid: log.configUuid,
+      order_id: log.orderId || null,
+      inbound_id: log.inboundId || null,
+      client_email: log.clientEmail || null,
+      up_bytes_before: log.upBytesBefore,
+      down_bytes_before: log.downBytesBefore,
+      total_bytes_before: log.totalBytesBefore,
+      status: log.status,
+      created_at: log.resetTimestamp
+    });
+  } catch (e) {
+    // Non-fatal if table not created
+  }
+};
+
+/**
+ * Verify VPN configuration ownership strictly using Supabase
+ */
+export const verifyVpnOwnership = async (
+  userId: string,
+  userEmail: string,
+  configUuid: string
+): Promise<{
+  owned: boolean;
+  source: 'vpn_accounts' | 'orders' | 'vpn_configs' | null;
+  record: any;
+}> => {
+  const normUuid = (configUuid || '').trim().toLowerCase();
+  const normUid = (userId || '').trim();
+  const normEmail = (userEmail || '').trim().toLowerCase();
+
+  if (!normUuid) return { owned: false, source: null, record: null };
+
+  // 1. Check vpn_accounts table
+  try {
+    const { data: vpnAccs } = await supabase.from('vpn_accounts').select('*');
+    if (vpnAccs && Array.isArray(vpnAccs)) {
+      for (const acc of vpnAccs) {
+        const accUuid = String(acc.uuid || '').trim().toLowerCase();
+        if (accUuid === normUuid) {
+          const accUid = String(acc.user_id || '').trim();
+          const accEmail = String(acc.email || '').trim().toLowerCase();
+          if ((normUid && accUid === normUid) || (normEmail && accEmail === normEmail)) {
+            return { owned: true, source: 'vpn_accounts', record: acc };
+          }
+          // UUID exists in vpn_accounts but belongs to another user
+          return { owned: false, source: 'vpn_accounts', record: null };
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 2. Check orders table
+  try {
+    const { data: orders } = await supabase.from('orders').select('*');
+    if (orders && Array.isArray(orders)) {
+      for (const ord of orders) {
+        const clientUuid = String(ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
+        if (clientUuid === normUuid) {
+          const ordUid = String(ord.customer_id || ord.customerUid || ord.customerId || '').trim();
+          const ordEmail = String(ord.email || ord.customerEmail || '').trim().toLowerCase();
+          if ((normUid && ordUid === normUid) || (normEmail && ordEmail === normEmail)) {
+            return { owned: true, source: 'orders', record: ord };
+          }
+          // UUID exists in orders but belongs to another user
+          return { owned: false, source: 'orders', record: null };
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 3. Check vpn_configs table
+  try {
+    const { data: vpnCfgs } = await supabase.from('vpn_configs').select('*');
+    if (vpnCfgs && Array.isArray(vpnCfgs)) {
+      for (const cfg of vpnCfgs) {
+        const cfgUuid = String(cfg.uuid || '').trim().toLowerCase();
+        if (cfgUuid === normUuid) {
+          const cfgUid = String(cfg.customer_uid || cfg.user_id || cfg.userId || '').trim();
+          const cfgEmail = String(cfg.customer_email || cfg.user_email || cfg.email || '').trim().toLowerCase();
+          if ((normUid && cfgUid === normUid) || (normEmail && cfgEmail === normEmail)) {
+            return { owned: true, source: 'vpn_configs', record: cfg };
+          }
+          return { owned: false, source: 'vpn_configs', record: null };
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 4. Check 3X-UI panel clients directly as authoritative fallback
+  try {
+    const cached = await getCachedInbounds();
+    if (Array.isArray(cached)) {
+      for (const ib of cached) {
+        let settingsObj: any = {};
+        try {
+          if (ib.settings) settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+        } catch (e) {}
+        const clients = settingsObj.clients || [];
+        for (const c of clients) {
+          const cUuid = String(c.id || '').trim().toLowerCase();
+          const cEmail = String(c.email || '').trim().toLowerCase();
+          if (cUuid === normUuid) {
+            // Check if email matches customer email or user identifier
+            if (normEmail && (cEmail === normEmail || cEmail.includes(normEmail) || normEmail.includes(cEmail))) {
+              return {
+                owned: true,
+                source: '3xui' as any,
+                record: {
+                  uuid: c.id,
+                  email: c.email,
+                  inbound_id: ib.id,
+                  status: c.enable ? 'active' : 'disabled',
+                  expiry_date: c.expiryTime && c.expiryTime > 0 ? new Date(c.expiryTime).toISOString() : null,
+                  package_name: ib.remark || 'FIREVPN Package'
+                }
+              };
+            }
+            // UUID exists in 3X-UI but does not belong to this user
+            return { owned: false, source: '3xui' as any, record: null };
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  return { owned: false, source: null, record: null };
+};
+
+/**
+ * Check whether a customer can reset traffic right now, including cooldown and limit status
+ */
+export const getResetTrafficStatus = async (
+  userId: string,
+  userEmail: string,
+  configUuid: string
+): Promise<ResetTrafficStatus> => {
+  const policy = await getTrafficResetPolicy();
+
+  if (!policy.enabled) {
+    return {
+      canReset: false,
+      reason: 'Traffic reset feature is currently disabled by administrator',
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: 0,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: null,
+      nextAvailableReset: null
+    };
+  }
+
+  // 1. Verify ownership
+  const ownership = await verifyVpnOwnership(userId, userEmail, configUuid);
+  if (!ownership.owned) {
+    return {
+      canReset: false,
+      reason: 'Forbidden: You do not have ownership of this VPN configuration',
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: 0,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: null,
+      nextAvailableReset: null
+    };
+  }
+
+  const rec = ownership.record;
+  const isTrial = !!(rec.is_trial || String(rec.order_id || '').startsWith('TRIAL-'));
+  if (isTrial && !policy.allowTrialReset) {
+    return {
+      canReset: false,
+      reason: 'Traffic reset is not allowed for free trial configurations',
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: 0,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: null,
+      nextAvailableReset: null
+    };
+  }
+
+  const st = String(rec.status || '').toLowerCase();
+  if (st === 'expired' || st === 'disabled' || rec.enable === false) {
+    return {
+      canReset: false,
+      reason: 'Cannot reset traffic for an expired or disabled configuration. Please renew your plan.',
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: 0,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: null,
+      nextAvailableReset: null
+    };
+  }
+
+  const expDate = rec.expiry_date || rec.expires_at || rec.expiryDate;
+  if (expDate && new Date(expDate).getTime() <= Date.now()) {
+    return {
+      canReset: false,
+      reason: 'Cannot reset traffic for an expired configuration',
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: 0,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: null,
+      nextAvailableReset: null
+    };
+  }
+
+  // Check cooldown and frequency
+  const allLogs = await getTrafficResetLogs();
+  const normUuid = configUuid.trim().toLowerCase();
+  const userLogs = allLogs.filter(
+    l => (l.userId === userId || (userEmail && l.userEmail && l.userEmail.toLowerCase() === userEmail.toLowerCase())) &&
+         l.configUuid.toLowerCase() === normUuid &&
+         l.status === 'success'
+  );
+
+  const lastLog = userLogs[0];
+  const now = Date.now();
+  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+
+  let cooldownRemainingHours = 0;
+  let nextAvailableReset: string | null = null;
+
+  if (lastLog) {
+    const elapsedMs = now - lastLog.resetTimestampMs;
+    if (elapsedMs < cooldownMs) {
+      cooldownRemainingHours = Math.ceil((cooldownMs - elapsedMs) / (1000 * 60 * 60));
+      nextAvailableReset = new Date(lastLog.resetTimestampMs + cooldownMs).toISOString();
+      return {
+        canReset: false,
+        reason: `Cooldown active. Please wait ${cooldownRemainingHours} hour(s) before resetting again.`,
+        cooldownHours: policy.cooldownHours,
+        cooldownRemainingHours,
+        resetsUsedInPeriod: userLogs.length,
+        maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+        lastResetTimestamp: lastLog.resetTimestamp,
+        nextAvailableReset
+      };
+    }
+  }
+
+  // Check billing period resets (default 30-day window)
+  const periodWindowMs = 30 * 24 * 60 * 60 * 1000;
+  const resetsInPeriod = userLogs.filter(l => (now - l.resetTimestampMs) < periodWindowMs).length;
+
+  if (resetsInPeriod >= policy.maxResetsPerBillingPeriod) {
+    const oldestInPeriod = userLogs[resetsInPeriod - 1];
+    nextAvailableReset = oldestInPeriod ? new Date(oldestInPeriod.resetTimestampMs + periodWindowMs).toISOString() : null;
+    return {
+      canReset: false,
+      reason: `Maximum resets reached (${policy.maxResetsPerBillingPeriod}) for this billing period.`,
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: resetsInPeriod,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
+      nextAvailableReset
+    };
+  }
+
+  return {
+    canReset: true,
+    cooldownHours: policy.cooldownHours,
+    cooldownRemainingHours: 0,
+    resetsUsedInPeriod: resetsInPeriod,
+    maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+    lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
+    nextAvailableReset: null
+  };
+};
+
+/**
+ * Execute real customer self-service traffic reset in 3X-UI
+ */
+export const resetVpnTraffic = async (
+  userId: string,
+  userEmail: string,
+  configUuid: string
+): Promise<{
+  success: boolean;
+  message: string;
+  data: {
+    configUuid: string;
+    clientEmail: string;
+    inboundId: number;
+    previousUsedBytes: number;
+    currentUsedGB: number;
+    resetTimestamp: string;
+    cooldownHours: number;
+    nextAvailableReset: string;
+  };
+}> => {
+  const normUuid = (configUuid || '').trim().toLowerCase();
+  console.log(`[vpnService] Processing customer traffic reset request - User UID: '${userId}', Email: '${userEmail}', Config UUID: '${normUuid}'`);
+
+  if (!userId) {
+    const err: any = new Error('Unauthorized: Authentication required');
+    err.status = 401;
+    throw err;
+  }
+
+  if (!normUuid) {
+    const err: any = new Error('Invalid request: VPN configuration UUID is required');
+    err.status = 400;
+    throw err;
+  }
+
+  // 1. Check reset policy
+  const policy = await getTrafficResetPolicy();
+  if (!policy.enabled) {
+    const err: any = new Error('Traffic reset feature is currently disabled by administrator');
+    err.status = 403;
+    throw err;
+  }
+
+  // 2. Strict ownership verification against Supabase
+  const ownership = await verifyVpnOwnership(userId, userEmail, normUuid);
+  if (!ownership.owned) {
+    console.warn(`[Security Alert] User '${userId}' attempted to reset configuration '${normUuid}' which they do not own!`);
+    const err: any = new Error('Forbidden: You do not own this VPN configuration');
+    err.status = 403;
+    throw err;
+  }
+
+  const rec = ownership.record;
+  const isTrial = !!(rec.is_trial || String(rec.order_id || '').startsWith('TRIAL-'));
+  if (isTrial && !policy.allowTrialReset) {
+    const err: any = new Error('Traffic reset is not allowed for free trial configurations');
+    err.status = 400;
+    throw err;
+  }
+
+  // 3. Verify status: Must NOT be expired or disabled
+  const st = String(rec.status || '').toLowerCase();
+  if (st === 'expired' || st === 'disabled' || rec.enable === false) {
+    const err: any = new Error('Cannot reset traffic for an expired or disabled configuration. Please renew your plan.');
+    err.status = 400;
+    throw err;
+  }
+
+  const expDate = rec.expiry_date || rec.expires_at || rec.expiryDate;
+  if (expDate && new Date(expDate).getTime() <= Date.now()) {
+    const err: any = new Error('Cannot reset traffic for an expired configuration');
+    err.status = 400;
+    throw err;
+  }
+
+  // 4. Check cooldown & frequency rate limits
+  const allLogs = await getTrafficResetLogs();
+  const userLogs = allLogs.filter(
+    l => (l.userId === userId || (userEmail && l.userEmail && l.userEmail.toLowerCase() === userEmail.toLowerCase())) &&
+         l.configUuid.toLowerCase() === normUuid &&
+         l.status === 'success'
+  );
+
+  const lastLog = userLogs[0];
+  const now = Date.now();
+  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+
+  if (lastLog) {
+    const elapsedMs = now - lastLog.resetTimestampMs;
+    if (elapsedMs < cooldownMs) {
+      const hoursLeft = Math.ceil((cooldownMs - elapsedMs) / (1000 * 60 * 60));
+      const err: any = new Error(`Reset cooldown active. Please wait ${hoursLeft} hour(s) before resetting again.`);
+      err.status = 429;
+      throw err;
+    }
+  }
+
+  const periodWindowMs = 30 * 24 * 60 * 60 * 1000;
+  const resetsInPeriod = userLogs.filter(l => (now - l.resetTimestampMs) < periodWindowMs).length;
+  if (resetsInPeriod >= policy.maxResetsPerBillingPeriod) {
+    const err: any = new Error(`Maximum traffic resets (${policy.maxResetsPerBillingPeriod}) reached for this billing period.`);
+    err.status = 429;
+    throw err;
+  }
+
+  // 5. Look up live client & inbound on 3X-UI server
+  const inbounds = await getInbounds(false);
+  let matchedInbound: any = null;
+  let matchedClient: any = null;
+  let matchedStat: any = null;
+
+  for (const ib of inbounds) {
+    let settingsObj: any = {};
+    try {
+      if (ib.settings) {
+        settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+      }
+    } catch (e) {}
+    const clients = settingsObj.clients || [];
+    for (const c of clients) {
+      if (String(c.id || '').trim().toLowerCase() === normUuid) {
+        matchedInbound = ib;
+        matchedClient = c;
+        break;
+      }
+    }
+    if (matchedInbound) {
+      const stats = ib.clientStats || [];
+      matchedStat = stats.find((s: any) => 
+        (s.id && String(s.id).toLowerCase() === normUuid) ||
+        (s.email && matchedClient.email && String(s.email).toLowerCase() === String(matchedClient.email).toLowerCase())
+      );
+      break;
+    }
+  }
+
+  if (!matchedInbound || !matchedClient) {
+    const err: any = new Error('VPN configuration was not found on the active VPN server');
+    err.status = 404;
+    throw err;
+  }
+
+  if (matchedClient.enable === false) {
+    const err: any = new Error('Cannot reset traffic: Configuration is disabled on the VPN server');
+    err.status = 400;
+    throw err;
+  }
+
+  let clientExpMs = matchedClient.expiryTime || 0;
+  if (clientExpMs > 0 && clientExpMs < 10000000000) clientExpMs = clientExpMs * 1000;
+  if (clientExpMs > 0 && clientExpMs <= Date.now()) {
+    const err: any = new Error('Cannot reset traffic: Configuration has expired on the VPN server');
+    err.status = 400;
+    throw err;
+  }
+
+  const verifiedInboundId = Number(matchedInbound.id);
+  const verifiedClientEmail = String(matchedClient.email || userEmail || '').trim();
+  const upBytes = Number(matchedStat?.up || matchedClient.up || 0);
+  const downBytes = Number(matchedStat?.down || matchedClient.down || 0);
+  const totalBefore = upBytes + downBytes;
+
+  console.log(`[vpnService] Executing 3X-UI traffic reset for client '${verifiedClientEmail}' in inbound ${verifiedInboundId}...`);
+
+  // 6. Execute REAL reset in 3X-UI
+  try {
+    await resetClientTraffic(verifiedClientEmail, verifiedInboundId, normUuid);
+  } catch (xuiErr: any) {
+    console.error('[vpnService] 3X-UI reset failed:', xuiErr.message || xuiErr);
+    // Record failed reset attempt
+    await recordTrafficResetLog({
+      id: crypto.randomUUID(),
+      userId,
+      userEmail,
+      configUuid: normUuid,
+      orderId: String(rec.order_id || rec.id || ''),
+      inboundId: verifiedInboundId,
+      clientEmail: verifiedClientEmail,
+      resetTimestamp: new Date().toISOString(),
+      resetTimestampMs: now,
+      upBytesBefore: upBytes,
+      downBytesBefore: downBytes,
+      totalBytesBefore: totalBefore,
+      status: 'failed'
+    });
+    const err: any = new Error(`Failed to reset traffic counter on 3X-UI server: ${xuiErr.message || 'Server error'}`);
+    err.status = 502;
+    throw err;
+  }
+
+  // 7. Record successful reset
+  const resetTimestampStr = new Date().toISOString();
+  await recordTrafficResetLog({
+    id: crypto.randomUUID(),
+    userId,
+    userEmail,
+    configUuid: normUuid,
+    orderId: String(rec.order_id || rec.id || ''),
+    inboundId: verifiedInboundId,
+    clientEmail: verifiedClientEmail,
+    resetTimestamp: resetTimestampStr,
+    resetTimestampMs: now,
+    upBytesBefore: upBytes,
+    downBytesBefore: downBytes,
+    totalBytesBefore: totalBefore,
+    status: 'success'
+  });
+
+  // 8. Update vpn_accounts used_bytes to 0 without touching expiry, package limit, or price
+  try {
+    await supabase.from('vpn_accounts')
+      .update({ used_bytes: 0, updated_at: resetTimestampStr })
+      .eq('uuid', normUuid);
+  } catch (dbErr) {
+    console.warn('[vpnService] vpn_accounts used_bytes update warning:', dbErr);
+  }
+
+  // 9. Send in-app notification
+  try {
+    const configName = rec.remark || rec.package_name || 'FIREVPN Package';
+    await createCustomerNotification({
+      userId,
+      userEmail: userEmail || rec.email || 'customer@firevpn.com',
+      title: 'VPN Traffic Reset Successful',
+      message: `Your VPN configuration "${configName}" traffic counter has been reset to 0 MB. Your full data allowance is restored.`,
+      type: 'traffic_reset',
+      vpnName: configName,
+      vpnUuid: normUuid
+    });
+  } catch (notifErr) {
+    console.warn('[vpnService] Customer notification warning:', notifErr);
+  }
+
+  const nextAvailableResetDate = new Date(now + cooldownMs).toISOString();
+
+  return {
+    success: true,
+    message: 'Traffic counter successfully reset in 3X-UI. Your full package data allowance has been restored.',
+    data: {
+      configUuid: normUuid,
+      clientEmail: verifiedClientEmail,
+      inboundId: verifiedInboundId,
+      previousUsedBytes: totalBefore,
+      currentUsedGB: 0,
+      resetTimestamp: resetTimestampStr,
+      cooldownHours: policy.cooldownHours,
+      nextAvailableReset: nextAvailableResetDate
+    }
+  };
+};
+

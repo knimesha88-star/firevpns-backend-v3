@@ -174,12 +174,12 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
 
       const alreadyExists = existingNotifList.some((n: any) => {
         const matchType = n.type === targetType;
-        const matchName = (n.message && n.message.includes(vpnName)) || (n.title && n.title === targetTitle);
+        const matchName = Boolean(n.message && n.message.includes(vpnName));
         return matchType && matchName;
       });
 
       if (!alreadyExists) {
-        await createCustomerNotification({
+        const created = await createCustomerNotification({
           userId: targetUserId,
           userEmail: userEmail || '',
           title: targetTitle,
@@ -189,6 +189,9 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
           vpnName: vpnName,
           vpnUuid: vpnUuid
         });
+        if (created) {
+          existingNotifList.push(created);
+        }
 
         // Trigger Email Notification
         if (userEmail) {
@@ -221,14 +224,6 @@ export const getUserNotifications = async (userId?: string, userEmail?: string):
   try {
     await checkAndCreateExpiryNotifications(userId, userEmail);
 
-    const { data: allNotifs, error } = await supabaseAdmin.from('notifications').select('*').order('created_at', { ascending: false });
-    if (error || !allNotifs) {
-      if (error) {
-        console.error('[NotificationService] Error querying notifications table:', error.message || error);
-      }
-      return [];
-    }
-
     const uId = userId ? String(userId).trim() : '';
     let resolvedEmailUserId = '';
     if (userEmail) {
@@ -251,15 +246,25 @@ export const getUserNotifications = async (userId?: string, userEmail?: string):
     if (uId && uId !== 'N/A' && uId !== 'null' && uId !== 'undefined') targetUserIds.add(uId);
     if (resolvedEmailUserId && resolvedEmailUserId !== 'N/A' && resolvedEmailUserId !== 'null' && resolvedEmailUserId !== 'undefined') targetUserIds.add(resolvedEmailUserId);
 
-    console.log(`[NotificationService] Filtering all notifications for user IDs:`, Array.from(targetUserIds));
+    if (targetUserIds.size === 0) {
+      return [];
+    }
 
-    const filtered = allNotifs.filter((item: any) => {
-      const itemUserId = String(item.user_id || '').trim();
-      return targetUserIds.has(itemUserId);
-    });
+    const { data: allNotifs, error } = await supabaseAdmin
+      .from('notifications')
+      .select('id, user_id, title, message, type, is_read, created_at')
+      .in('user_id', Array.from(targetUserIds))
+      .order('created_at', { ascending: false });
 
-    console.log(`[NotificationService] Found ${filtered.length} notifications for user IDs: ${Array.from(targetUserIds).join(', ')}`);
-    return filtered;
+    if (error || !allNotifs) {
+      if (error) {
+        console.error('[NotificationService] Error querying notifications table:', error.message || error);
+      }
+      return [];
+    }
+
+    console.log(`[NotificationService] Found ${allNotifs.length} notifications for user IDs: ${Array.from(targetUserIds).join(', ')}`);
+    return allNotifs;
   } catch (err: any) {
     console.warn('[NotificationService] Error in getUserNotifications:', err.message || err);
     return [];

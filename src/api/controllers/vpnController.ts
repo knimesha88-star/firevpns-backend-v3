@@ -399,3 +399,83 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
   }
 };
 
+export const resetTraffic = async (req: AuthRequest, res: Response): Promise<void> => {
+  const reqStart = Date.now();
+  try {
+    const uid = req.user?.uid;
+    const email = req.user?.email || '';
+    const configUuid = req.body?.configUuid || req.body?.uuid || req.body?.configId;
+
+    console.log(`[POST /api/vpn/reset-traffic] Request from user UID: '${uid}', UUID: '${configUuid}'`);
+
+    if (!uid) {
+      res.status(401).json({ success: false, error: 'Unauthorized: Authentication required' });
+      return;
+    }
+
+    if (!configUuid) {
+      res.status(400).json({ success: false, error: 'Missing required field: configUuid' });
+      return;
+    }
+
+    const result = await vpnService.resetVpnTraffic(uid, email, configUuid);
+    const duration = Date.now() - reqStart;
+    console.log(`[POST /api/vpn/reset-traffic] Succeeded in ${duration}ms:`, result);
+    res.json(result);
+  } catch (error: any) {
+    const duration = Date.now() - reqStart;
+    const status = error.status || (error.message?.includes('Forbidden') ? 403 : error.message?.includes('cooldown') || error.message?.includes('maximum') ? 429 : error.message?.includes('not found') ? 404 : 400);
+    console.warn(`[POST /api/vpn/reset-traffic] Failed (${status}) after ${duration}ms:`, error.message);
+    res.status(status).json({
+      success: false,
+      error: error.message || 'Failed to reset VPN traffic'
+    });
+  }
+};
+
+export const getResetTrafficStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const uid = req.user?.uid;
+    const email = req.user?.email || '';
+    const configUuid = req.params?.uuid || req.query?.uuid;
+
+    if (!uid) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    if (!configUuid) {
+      res.status(400).json({ success: false, error: 'Missing UUID parameter' });
+      return;
+    }
+
+    const status = await vpnService.getResetTrafficStatus(uid, email, String(configUuid));
+    res.json({ success: true, ...status });
+  } catch (error: any) {
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message || 'Failed to retrieve reset traffic status'
+    });
+  }
+};
+
+export const getTrafficResetPolicyHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const policy = await vpnService.getTrafficResetPolicy();
+    res.json({ success: true, policy });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+export const saveTrafficResetPolicyHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const policy = req.body?.policy || req.body;
+    const updated = await vpnService.saveTrafficResetPolicy(policy);
+    res.json({ success: true, policy: updated });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+

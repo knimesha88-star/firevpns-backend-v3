@@ -2212,4 +2212,70 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
   }
 };
 
+/**
+ * Reset client traffic in 3X-UI for an active client
+ * Tries the primary 3X-UI client reset endpoint and inbounds reset endpoint.
+ */
+export const resetClientTraffic = async (
+  email: string,
+  inboundId?: number,
+  clientUuid?: string
+): Promise<{ success: boolean; message: string }> => {
+  console.log(`[xuiService] Resetting traffic in 3X-UI for client - Email: '${email}', Inbound: ${inboundId}, UUID: '${clientUuid}'`);
+
+  if (!email && !clientUuid) {
+    throw new Error('Client email or UUID is required to reset 3X-UI traffic');
+  }
+
+  const endpointsToTry: string[] = [];
+  if (email) {
+    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(email)}`);
+    if (inboundId && inboundId > 0) {
+      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/resetClientTraffic/${encodeURIComponent(email)}`);
+      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${inboundId}/${encodeURIComponent(email)}`);
+    }
+    endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${encodeURIComponent(email)}`);
+  }
+
+  if (clientUuid) {
+    if (inboundId && inboundId > 0) {
+      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/resetClientTraffic/${encodeURIComponent(clientUuid)}`);
+      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${inboundId}/${encodeURIComponent(clientUuid)}`);
+    }
+    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(clientUuid)}`);
+  }
+
+  let resetSuccess = false;
+  let lastError: any = null;
+  let responseMsg = '';
+
+  for (const ep of endpointsToTry) {
+    try {
+      console.log(`[xuiService] Invoking 3X-UI reset endpoint: ${ep}`);
+      const res: any = await requestApi(ep, 'POST');
+      resetSuccess = true;
+      responseMsg = res?.msg || 'Traffic has been reset.';
+      console.log(`[xuiService] Successfully reset traffic via ${ep}:`, res);
+      break;
+    } catch (err: any) {
+      console.warn(`[xuiService] Reset endpoint ${ep} failed:`, err?.response?.data || err.message);
+      lastError = err;
+    }
+  }
+
+  if (!resetSuccess) {
+    throw new Error(`Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`);
+  }
+
+  // Invalidate inbounds cache so that subsequent queries immediately retrieve updated 0 byte traffic stats
+  try {
+    await getInbounds(true);
+  } catch (refreshErr: any) {
+    console.warn('[xuiService] Inbounds cache refresh warning after reset:', refreshErr?.message || refreshErr);
+  }
+
+  return { success: true, message: responseMsg || 'Traffic counter successfully reset in 3X-UI' };
+};
+
+
 

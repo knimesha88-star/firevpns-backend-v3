@@ -1,4 +1,3 @@
-import { Resend } from 'resend';
 import { supabaseAdmin } from '../../lib/supabase.js';
 
 interface SendEmailParams {
@@ -52,13 +51,13 @@ export const getEmailSettings = async () => {
   };
 };
 
-const getResendClient = async () => {
+const getResendApiKey = async (): Promise<string | null> => {
   const settings = await getEmailSettings();
-  const apiKey = settings.apiKey || process.env.EMAIL_PROVIDER_API_KEY || process.env.RESEND_API_KEY;
+  const apiKey = settings.apiKey || process.env.RESEND_API_KEY || process.env.EMAIL_PROVIDER_API_KEY;
   if (!apiKey) {
     return null;
   }
-  return new Resend(apiKey);
+  return apiKey;
 };
 
 // HTML Layout Template generator with FIREVPNs Dark/Blue branding
@@ -306,8 +305,8 @@ export const sendEmail = async (params: SendEmailParams): Promise<{ success: boo
     }
   }
 
-  const resend = await getResendClient();
-  if (!resend) {
+  const apiKey = await getResendApiKey();
+  if (!apiKey) {
     console.warn(`[EmailService] Resend API key missing. Cannot send email to ${to} for event ${eventType}.`);
     await logEmailStatus({ userId, email: to, eventType, referenceId, subject, status: 'failed', errorMessage: 'Resend API key missing' });
     return { success: false, error: 'Email provider API key not configured' };
@@ -319,23 +318,34 @@ export const sendEmail = async (params: SendEmailParams): Promise<{ success: boo
 
   try {
     console.log(`[EmailService] Sending email [${eventType}] to ${to} via ${fromAddress}...`);
-    const result = await resend.emails.send({
-      from: senderFormatted,
-      to,
-      subject,
-      html,
-      text: text || subject
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: senderFormatted,
+        to: [to],
+        subject,
+        html,
+        text: text || subject
+      })
     });
 
-    if (result.error) {
-      console.error(`[EmailService] Resend provider error [${eventType}]:`, result.error);
-      await logEmailStatus({ userId, email: to, eventType, referenceId, subject, status: 'failed', errorMessage: JSON.stringify(result.error) });
-      return { success: false, error: result.error.message };
+    const resData: any = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const errMsg = resData?.message || resData?.name || `HTTP ${response.status} ${response.statusText}`;
+      console.error(`[EmailService] Resend API error [${eventType}]:`, resData || errMsg);
+      await logEmailStatus({ userId, email: to, eventType, referenceId, subject, status: 'failed', errorMessage: typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg) });
+      return { success: false, error: typeof errMsg === 'string' ? errMsg : 'Resend API request failed' };
     }
 
-    console.log(`[EmailService] Email sent successfully! Message ID: ${result.data?.id}`);
+    const messageId = resData?.id;
+    console.log(`[EmailService] Email sent successfully! Message ID: ${messageId}`);
     await logEmailStatus({ userId, email: to, eventType, referenceId, subject, status: 'sent' });
-    return { success: true, messageId: result.data?.id };
+    return { success: true, messageId };
   } catch (err: any) {
     console.error(`[EmailService] Exception during email dispatch [${eventType}]:`, err.message || err);
     await logEmailStatus({ userId, email: to, eventType, referenceId, subject, status: 'failed', errorMessage: err.message || String(err) });

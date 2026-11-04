@@ -26,8 +26,8 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       res.status(400).json({ error: 'No uid found' });
       return;
     }
-    await userService.updateUserProfile(uid, req.body);
-    res.json({ success: true });
+    const profile = await userService.updateUserProfile(uid, req.body);
+    res.json({ success: true, profile });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -61,7 +61,11 @@ export const readNotification = async (req: AuthRequest, res: Response): Promise
       res.status(400).json({ error: 'Notification ID required' });
       return;
     }
-    await notificationService.markNotificationAsRead(id);
+    const success = await notificationService.markNotificationAsRead(id);
+    if (!success) {
+      res.status(500).json({ error: 'Failed to update notification in database' });
+      return;
+    }
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
