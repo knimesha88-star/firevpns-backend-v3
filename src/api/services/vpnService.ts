@@ -432,21 +432,25 @@ export interface ResetTrafficStatus {
   nextAvailableReset: string | null;
 }
 
+let inMemoryTrafficResetPolicy: TrafficResetPolicy = { ...DEFAULT_RESET_POLICY };
+let inMemoryTrafficResetLogs: TrafficResetLog[] = [];
+
 export const getTrafficResetPolicy = async (): Promise<TrafficResetPolicy> => {
   try {
     const { data: doc } = await supabase.from('settings').select('*').eq('id', 'traffic_reset_policy').maybeSingle();
     if (doc && doc.data) {
-      return {
+      inMemoryTrafficResetPolicy = {
         enabled: doc.data.enabled !== false,
         cooldownHours: Number(doc.data.cooldownHours) || DEFAULT_RESET_POLICY.cooldownHours,
         maxResetsPerBillingPeriod: Number(doc.data.maxResetsPerBillingPeriod) || DEFAULT_RESET_POLICY.maxResetsPerBillingPeriod,
         allowTrialReset: Boolean(doc.data.allowTrialReset)
       };
+      return inMemoryTrafficResetPolicy;
     }
   } catch (err) {
     console.warn('[vpnService] Error reading traffic_reset_policy:', err);
   }
-  return DEFAULT_RESET_POLICY;
+  return inMemoryTrafficResetPolicy;
 };
 
 export const saveTrafficResetPolicy = async (policy: Partial<TrafficResetPolicy>): Promise<TrafficResetPolicy> => {
@@ -457,12 +461,17 @@ export const saveTrafficResetPolicy = async (policy: Partial<TrafficResetPolicy>
     maxResetsPerBillingPeriod: policy.maxResetsPerBillingPeriod !== undefined ? Math.max(1, Number(policy.maxResetsPerBillingPeriod)) : current.maxResetsPerBillingPeriod,
     allowTrialReset: policy.allowTrialReset !== undefined ? Boolean(policy.allowTrialReset) : current.allowTrialReset
   };
+  inMemoryTrafficResetPolicy = updated;
 
-  await supabase.from('settings').upsert({
-    id: 'traffic_reset_policy',
-    data: updated,
-    updated_at: new Date().toISOString()
-  });
+  try {
+    await supabase.from('settings').upsert({
+      id: 'traffic_reset_policy',
+      data: updated,
+      updated_at: new Date().toISOString()
+    });
+  } catch (e) {
+    console.warn('[vpnService] Note: Settings table upsert blocked or restricted by RLS; in-memory policy updated.');
+  }
 
   return updated;
 };
@@ -471,23 +480,37 @@ export const getTrafficResetLogs = async (): Promise<TrafficResetLog[]> => {
   try {
     const { data: doc } = await supabase.from('settings').select('*').eq('id', 'traffic_reset_logs').maybeSingle();
     if (doc && doc.data) {
-      if (Array.isArray(doc.data)) {
-        return doc.data as TrafficResetLog[];
+      const dbLogs: TrafficResetLog[] = Array.isArray(doc.data) ? doc.data : (Array.isArray(doc.data.logs) ? doc.data.logs : []);
+      const combined = [...inMemoryTrafficResetLogs];
+      for (const d of dbLogs) {
+        if (!combined.some(l => l.id === d.id)) {
+          combined.push(d);
+        }
       }
-      if (Array.isArray(doc.data.logs)) {
-        return doc.data.logs as TrafficResetLog[];
-      }
+      combined.sort((a, b) => b.resetTimestampMs - a.resetTimestampMs);
+      return combined;
     }
   } catch (err) {
-    console.warn('[vpnService] Error reading traffic_reset_logs:', err);
+    console.warn('[vpnService] Error reading traffic_reset_logs from Supabase:', err);
   }
-  return [];
+  return [...inMemoryTrafficResetLogs].sort((a, b) => b.resetTimestampMs - a.resetTimestampMs);
+};
+
+export const clearTrafficResetLogsForTest = (userId?: string) => {
+  if (userId) {
+    inMemoryTrafficResetLogs = inMemoryTrafficResetLogs.filter(l => l.userId !== userId);
+  } else {
+    inMemoryTrafficResetLogs = [];
+  }
 };
 
 export const recordTrafficResetLog = async (log: TrafficResetLog): Promise<void> => {
+  // Always update in-memory cache immediately
+  inMemoryTrafficResetLogs = [log, ...inMemoryTrafficResetLogs.filter(l => l.id !== log.id).slice(0, 499)];
+
   try {
     const existingLogs = await getTrafficResetLogs();
-    const updatedLogs = [log, ...existingLogs.slice(0, 499)];
+    const updatedLogs = [log, ...existingLogs.filter(l => l.id !== log.id).slice(0, 499)];
     await supabase.from('settings').upsert({
       id: 'traffic_reset_logs',
       data: { logs: updatedLogs },

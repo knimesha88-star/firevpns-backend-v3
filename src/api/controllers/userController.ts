@@ -61,7 +61,8 @@ export const readNotification = async (req: AuthRequest, res: Response): Promise
       res.status(400).json({ error: 'Notification ID required' });
       return;
     }
-    const success = await notificationService.markNotificationAsRead(id);
+    const userId = req.user?.uid || req.user?.id || '';
+    const success = await notificationService.markNotificationAsRead(id, userId);
     if (!success) {
       res.status(500).json({ error: 'Failed to update notification in database' });
       return;
@@ -71,6 +72,25 @@ export const readNotification = async (req: AuthRequest, res: Response): Promise
     res.status(500).json({ error: error.message });
   }
 };
+
+export const deleteAllNotifications = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.uid || req.user?.id || '';
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized: User not authenticated' });
+      return;
+    }
+    const success = await notificationService.deleteAllCustomerNotifications(userId);
+    if (!success) {
+      res.status(500).json({ error: 'Failed to delete notifications from database' });
+      return;
+    }
+    res.json({ success: true, message: 'All notifications deleted successfully' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 
 export const notifySupportTicket = async (req: AuthRequest, res: Response): Promise<void> => {
   try {

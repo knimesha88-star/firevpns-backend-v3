@@ -1,3 +1,4 @@
+
 import { supabaseAdmin } from '../../lib/supabase.js';
 import { sendExpiryReminderEmail, sendVpnExpiredEmail } from './emailService.js';
 
@@ -12,10 +13,21 @@ export interface CreateNotificationParams {
   vpnUuid?: string | null;
 }
 
-export const createCustomerNotification = async (params: CreateNotificationParams): Promise<any> => {
-  const { userId, userEmail, title, message, type = 'info', orderId, vpnName, vpnUuid } = params;
+export const createCustomerNotification = async (
+  params: CreateNotificationParams
+): Promise<any> => {
+  const {
+    userId,
+    userEmail,
+    title,
+    message,
+    type = 'info',
+    orderId,
+    vpnName,
+    vpnUuid
+  } = params;
 
-  console.log(`[NotificationService] [ENTER] createCustomerNotification called with:`, {
+  console.log('[NotificationService] Creating notification:', {
     userId,
     userEmail,
     title,
@@ -25,35 +37,54 @@ export const createCustomerNotification = async (params: CreateNotificationParam
     vpnUuid
   });
 
-  let resolvedUserId = (userId && String(userId).trim() !== 'N/A' && String(userId).trim() !== 'null' && String(userId).trim() !== 'undefined' && String(userId).trim() !== '') ? String(userId).trim() : null;
+  let resolvedUserId =
+    userId &&
+    !['N/A', 'null', 'undefined', ''].includes(String(userId).trim())
+      ? String(userId).trim()
+      : null;
+
   if (!resolvedUserId && userEmail) {
     try {
-      console.log(`[NotificationService] Attempting to resolve user ID for email: ${userEmail}`);
-      const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('email', userEmail)
+        .maybeSingle();
+
       if (profile?.id) {
         resolvedUserId = profile.id;
-        console.log(`[NotificationService] Resolved user ID from profiles: ${resolvedUserId}`);
       } else {
-        const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).not('customer_id', 'is', null).neq('customer_id', 'N/A').limit(1).maybeSingle();
+        const { data: orderUser } = await supabaseAdmin
+          .from('orders')
+          .select('customer_id')
+          .eq('email', userEmail)
+          .not('customer_id', 'is', null)
+          .neq('customer_id', 'N/A')
+          .limit(1)
+          .maybeSingle();
+
         if (orderUser?.customer_id) {
           resolvedUserId = orderUser.customer_id;
-          console.log(`[NotificationService] Resolved user ID from orders: ${resolvedUserId}`);
         }
       }
-    } catch (e: any) {
-      console.warn('[NotificationService] Error resolving userId from email:', e.message || e);
+    } catch (error: any) {
+      console.warn(
+        '[NotificationService] User ID resolution error:',
+        error.message || error
+      );
     }
   }
 
   let finalMessage = message;
+
   if (vpnName && !message.includes(vpnName)) {
     finalMessage = `${message} (VPN: ${vpnName})`;
   }
 
-  // NOTE: Based on database audit, only id, user_id, title, message, type, is_read, and created_at columns exist in public.notifications.
-  // We MUST exclude missing columns like user_email, email, read, order_id, updated_at to prevent PostgreSQL errors.
-  const payload: any = {
-    user_id: resolvedUserId || null,
+  // Existing public.notifications schema:
+  // id, user_id, title, message, type, is_read, created_at
+  const payload = {
+    user_id: resolvedUserId,
     title,
     message: finalMessage,
     type,
@@ -61,30 +92,47 @@ export const createCustomerNotification = async (params: CreateNotificationParam
     created_at: new Date().toISOString()
   };
 
-  console.log('[NotificationService] Inserting notification payload:', JSON.stringify(payload, null, 2));
-
   try {
-    const { data, error } = await supabaseAdmin.from('notifications').insert(payload).select().maybeSingle();
+    const { data, error } = await supabaseAdmin
+      .from('notifications')
+      .insert(payload)
+      .select()
+      .maybeSingle();
 
     if (error) {
-      console.error(`[NotificationService] Database error inserting notification for ${userEmail || resolvedUserId}:`, error.message || error);
+      console.error(
+        '[NotificationService] Insert error:',
+        error.message || error
+      );
       throw error;
     }
 
-    console.log(`[NotificationService] Successfully inserted notification! Result:`, data);
+    console.log('[NotificationService] Notification created:', data);
     return data;
-  } catch (err: any) {
-    console.error(`[NotificationService] Exception during notification insert for ${userEmail || resolvedUserId}:`, err.message || err);
-    throw err;
+  } catch (error: any) {
+    console.error(
+      '[NotificationService] Notification creation failed:',
+      error.message || error
+    );
+    throw error;
   }
 };
 
-export const checkAndCreateExpiryNotifications = async (userId?: string, userEmail?: string): Promise<void> => {
+export const checkAndCreateExpiryNotifications = async (
+  userId?: string,
+  userEmail?: string
+): Promise<void> => {
   if (!userId && !userEmail) return;
 
-  console.log(`[NotificationService] [ENTER] checkAndCreateExpiryNotifications for userId: ${userId}, userEmail: ${userEmail}`);
+  console.log(
+    `[NotificationService] Checking expiry notifications for: ${userId}`
+  );
+
   try {
-    let query = supabaseAdmin.from('vpn_configs').select('*');
+    let query = supabaseAdmin
+      .from('vpn_configs')
+      .select('*');
+
     if (userId) {
       query = query.eq('customer_uid', userId);
     } else {
@@ -92,38 +140,33 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
     }
 
     const { data: configs, error: configErr } = await query;
+
     if (configErr) {
-      console.warn('[NotificationService] Error querying vpn_configs:', configErr.message || configErr);
+      console.warn(
+        '[NotificationService] VPN config query error:',
+        configErr.message
+      );
       return;
     }
+
     if (!configs || configs.length === 0) return;
 
-    let targetUserId = userId;
-    if (!targetUserId && userEmail) {
-      try {
-        const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
-        if (profile?.id) {
-          targetUserId = profile.id;
-        } else {
-          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).limit(1).maybeSingle();
-          if (orderUser?.customer_id) {
-            targetUserId = orderUser.customer_id;
-          }
-        }
-      } catch (e: any) {
-        console.warn('[NotificationService] Error resolving user ID during checkAndCreateExpiryNotifications:', e.message || e);
-      }
-    }
+    const targetUserId = userId;
 
     if (!targetUserId) return;
 
+    // Check ALL existing notifications, including read ones.
+    // This prevents old expiry reminders from being recreated.
     const { data: existingNotifs, error: notifErr } = await supabaseAdmin
       .from('notifications')
-      .select('*')
+      .select('id, user_id, title, message, type, is_read, created_at')
       .eq('user_id', targetUserId);
 
     if (notifErr) {
-      console.warn('[NotificationService] Error querying existing notifications:', notifErr.message || notifErr);
+      console.warn(
+        '[NotificationService] Existing notification query error:',
+        notifErr.message
+      );
       return;
     }
 
@@ -131,10 +174,16 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
     const now = Date.now();
 
     for (const cfg of configs) {
-      const expVal = cfg.expiry_date || cfg.expiry_time || cfg.expiryDate || cfg.expiryTime;
+      const expVal =
+        cfg.expiry_date ||
+        cfg.expiry_time ||
+        cfg.expiryDate ||
+        cfg.expiryTime;
+
       if (!expVal) continue;
 
       let expMs: number | null = null;
+
       if (typeof expVal === 'number') {
         expMs = expVal < 10000000000 ? expVal * 1000 : expVal;
       } else {
@@ -144,8 +193,16 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
       if (!expMs || isNaN(expMs)) continue;
 
       const diffMs = expMs - now;
-      const daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-      const vpnName = cfg.package_name || cfg.configName || cfg.remark || 'FIREVPN Package';
+      const daysLeft = Math.ceil(
+        diffMs / (1000 * 60 * 60 * 24)
+      );
+
+      const vpnName =
+        cfg.package_name ||
+        cfg.configName ||
+        cfg.remark ||
+        'FIREVPN Package';
+
       const vpnUuid = cfg.uuid || cfg.id;
 
       let targetType = '';
@@ -155,137 +212,262 @@ export const checkAndCreateExpiryNotifications = async (userId?: string, userEma
       if (daysLeft === 3) {
         targetType = 'expiry_3d';
         targetTitle = 'VPN Expires in 3 Days';
-        targetMessage = `Your VPN configuration "${vpnName}" expires in 3 days. Renew now to avoid service interruption.`;
+        targetMessage =
+          `Your VPN configuration "${vpnName}" expires in 3 days. Renew now to avoid service interruption.`;
       } else if (daysLeft === 2) {
         targetType = 'expiry_2d';
         targetTitle = 'VPN Expires in 2 Days';
-        targetMessage = `Your VPN configuration "${vpnName}" expires in 2 days. Renew now to avoid service interruption.`;
+        targetMessage =
+          `Your VPN configuration "${vpnName}" expires in 2 days. Renew now to avoid service interruption.`;
       } else if (daysLeft === 1) {
         targetType = 'expiry_1d';
         targetTitle = 'VPN Expires Tomorrow';
-        targetMessage = `Urgent: Your VPN configuration "${vpnName}" expires tomorrow! Renew now to keep your connection active.`;
+        targetMessage =
+          `Urgent: Your VPN configuration "${vpnName}" expires tomorrow! Renew now to keep your connection active.`;
       } else if (daysLeft <= 0) {
         targetType = 'expiry_expired';
         targetTitle = 'VPN Expired';
-        targetMessage = `Your VPN configuration "${vpnName}" has expired. Renew now to restore high-speed access.`;
+        targetMessage =
+          `Your VPN configuration "${vpnName}" has expired. Renew now to restore high-speed access.`;
       }
 
       if (!targetType) continue;
 
+      // Preserve duplicate prevention, even if the old notification was read.
       const alreadyExists = existingNotifList.some((n: any) => {
         const matchType = n.type === targetType;
-        const matchName = Boolean(n.message && n.message.includes(vpnName));
+        const matchName = Boolean(
+          n.message && n.message.includes(vpnName)
+        );
+
         return matchType && matchName;
       });
 
-      if (!alreadyExists) {
-        const created = await createCustomerNotification({
-          userId: targetUserId,
-          userEmail: userEmail || '',
-          title: targetTitle,
-          message: targetMessage,
-          type: targetType,
-          orderId: cfg.order_id || null,
-          vpnName: vpnName,
-          vpnUuid: vpnUuid
-        });
-        if (created) {
-          existingNotifList.push(created);
-        }
+      if (alreadyExists) continue;
 
-        // Trigger Email Notification
-        if (userEmail) {
-          if (daysLeft > 0) {
-            sendExpiryReminderEmail({
-              userEmail: userEmail,
-              vpnAccountId: vpnUuid || cfg.id,
-              packageName: vpnName,
-              daysLeft: daysLeft,
-              userId: targetUserId
-            }).catch(e => console.warn('[NotificationService] Expiry reminder email warning:', e));
-          } else {
-            sendVpnExpiredEmail({
-              userEmail: userEmail,
-              vpnAccountId: vpnUuid || cfg.id,
-              packageName: vpnName,
-              userId: targetUserId
-            }).catch(e => console.warn('[NotificationService] VPN expired email warning:', e));
-          }
+      const created = await createCustomerNotification({
+        userId: targetUserId,
+        userEmail: userEmail || '',
+        title: targetTitle,
+        message: targetMessage,
+        type: targetType,
+        orderId: cfg.order_id || null,
+        vpnName,
+        vpnUuid
+      });
+
+      if (created) {
+        existingNotifList.push(created);
+      }
+
+      // Preserve existing expiry email notifications.
+      if (userEmail) {
+        if (daysLeft > 0) {
+          sendExpiryReminderEmail({
+            userEmail,
+            vpnAccountId: vpnUuid || cfg.id,
+            packageName: vpnName,
+            daysLeft,
+            userId: targetUserId
+          }).catch(error =>
+            console.warn(
+              '[NotificationService] Expiry email warning:',
+              error
+            )
+          );
+        } else {
+          sendVpnExpiredEmail({
+            userEmail,
+            vpnAccountId: vpnUuid || cfg.id,
+            packageName: vpnName,
+            userId: targetUserId
+          }).catch(error =>
+            console.warn(
+              '[NotificationService] Expired email warning:',
+              error
+            )
+          );
         }
       }
     }
-  } catch (err: any) {
-    console.warn('[NotificationService] Error syncing expiry notifications:', err.message || err);
+  } catch (error: any) {
+    console.warn(
+      '[NotificationService] Expiry notification sync error:',
+      error.message || error
+    );
   }
 };
 
-export const getUserNotifications = async (userId?: string, userEmail?: string): Promise<any[]> => {
-  console.log(`[NotificationService] [ENTER] getUserNotifications for userId: ${userId}, userEmail: ${userEmail}`);
+export const getUserNotifications = async (
+  userId?: string,
+  userEmail?: string
+): Promise<any[]> => {
+  console.log(
+    `[NotificationService] Getting unread notifications for: ${userId}`
+  );
+
   try {
     await checkAndCreateExpiryNotifications(userId, userEmail);
 
     const uId = userId ? String(userId).trim() : '';
+
     let resolvedEmailUserId = '';
+
     if (userEmail) {
       try {
-        const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('email', userEmail).maybeSingle();
+        const { data: profile } = await supabaseAdmin
+          .from('profiles')
+          .select('id')
+          .eq('email', userEmail)
+          .maybeSingle();
+
         if (profile?.id) {
           resolvedEmailUserId = profile.id;
         } else {
-          const { data: orderUser } = await supabaseAdmin.from('orders').select('customer_id').eq('email', userEmail).not('customer_id', 'is', null).neq('customer_id', 'N/A').limit(1).maybeSingle();
+          const { data: orderUser } = await supabaseAdmin
+            .from('orders')
+            .select('customer_id')
+            .eq('email', userEmail)
+            .not('customer_id', 'is', null)
+            .neq('customer_id', 'N/A')
+            .limit(1)
+            .maybeSingle();
+
           if (orderUser?.customer_id) {
             resolvedEmailUserId = orderUser.customer_id;
           }
         }
-      } catch (e: any) {
-        console.warn('[NotificationService] Error resolving user ID during getUserNotifications:', e.message || e);
+      } catch (error: any) {
+        console.warn(
+          '[NotificationService] Email user resolution error:',
+          error.message || error
+        );
       }
     }
 
     const targetUserIds = new Set<string>();
-    if (uId && uId !== 'N/A' && uId !== 'null' && uId !== 'undefined') targetUserIds.add(uId);
-    if (resolvedEmailUserId && resolvedEmailUserId !== 'N/A' && resolvedEmailUserId !== 'null' && resolvedEmailUserId !== 'undefined') targetUserIds.add(resolvedEmailUserId);
+
+    if (
+      uId &&
+      !['N/A', 'null', 'undefined'].includes(uId)
+    ) {
+      targetUserIds.add(uId);
+    }
+
+    if (
+      resolvedEmailUserId &&
+      !['N/A', 'null', 'undefined'].includes(resolvedEmailUserId)
+    ) {
+      targetUserIds.add(resolvedEmailUserId);
+    }
 
     if (targetUserIds.size === 0) {
       return [];
     }
 
-    const { data: allNotifs, error } = await supabaseAdmin
+    // IMPORTANT: Return only unread notifications.
+    const { data, error } = await supabaseAdmin
       .from('notifications')
-      .select('id, user_id, title, message, type, is_read, created_at')
+      .select(
+        'id, user_id, title, message, type, is_read, created_at'
+      )
       .in('user_id', Array.from(targetUserIds))
+      .eq('is_read', false)
       .order('created_at', { ascending: false });
 
-    if (error || !allNotifs) {
-      if (error) {
-        console.error('[NotificationService] Error querying notifications table:', error.message || error);
-      }
+    if (error) {
+      console.error(
+        '[NotificationService] Unread notification query error:',
+        error.message || error
+      );
       return [];
     }
 
-    console.log(`[NotificationService] Found ${allNotifs.length} notifications for user IDs: ${Array.from(targetUserIds).join(', ')}`);
-    return allNotifs;
-  } catch (err: any) {
-    console.warn('[NotificationService] Error in getUserNotifications:', err.message || err);
+    console.log(
+      `[NotificationService] Found ${data?.length || 0} unread notifications`
+    );
+
+    return data || [];
+  } catch (error: any) {
+    console.error(
+      '[NotificationService] getUserNotifications error:',
+      error.message || error
+    );
     return [];
   }
 };
 
-export const markNotificationAsRead = async (notificationId: string): Promise<boolean> => {
-  console.log(`[NotificationService] [ENTER] markNotificationAsRead for ID: ${notificationId}`);
-  try {
-    const { error } = await supabaseAdmin.from('notifications').update({
-      is_read: true
-    }).eq('id', notificationId);
+export const markNotificationAsRead = async (
+  notificationId: string,
+  userId?: string
+): Promise<boolean> => {
+  console.log(
+    `[NotificationService] Marking notification ${notificationId} as read${userId ? ` for user ${userId}` : ''}`
+  );
 
-    if (error) {
-      console.error(`[NotificationService] Database error marking notification ${notificationId} as read:`, error.message || error);
+  try {
+    if (!notificationId) {
       return false;
     }
-    console.log(`[NotificationService] Successfully marked notification ${notificationId} as read`);
-    return true;
-  } catch (err: any) {
-    console.warn('[NotificationService] Exception marking notification as read:', err.message || err);
+
+    let query = supabaseAdmin
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', notificationId)
+      .eq('is_read', false);
+
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+
+    const { data, error } = await query.select('id');
+
+    if (error) {
+      console.error(
+        '[NotificationService] Mark as read database error:',
+        error.message || error
+      );
+      return false;
+    }
+
+    return Boolean(data && data.length > 0);
+  } catch (error: any) {
+    console.error(
+      '[NotificationService] Mark as read exception:',
+      error.message || error
+    );
     return false;
   }
 };
+
+export const deleteAllCustomerNotifications = async (userId: string): Promise<boolean> => {
+  console.log(`[NotificationService] Deleting all notifications for user ${userId}`);
+
+  try {
+    if (!userId || ['N/A', 'null', 'undefined', ''].includes(String(userId).trim())) {
+      return false;
+    }
+
+    const { error } = await supabaseAdmin
+      .from('notifications')
+      .delete()
+      .eq('user_id', String(userId).trim());
+
+    if (error) {
+      console.error(
+        '[NotificationService] Delete all notifications database error:',
+        error.message || error
+      );
+      return false;
+    }
+
+    return true;
+  } catch (error: any) {
+    console.error(
+      '[NotificationService] Delete all notifications exception:',
+      error.message || error
+    );
+    return false;
+  }
+};
+

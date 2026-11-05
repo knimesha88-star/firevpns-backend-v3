@@ -1,5 +1,14 @@
 import { Router } from 'express';
-import { getProfile, updateProfile, getNotifications, readNotification, notifySupportTicket, notifySupportTicketReply, notifyLiveChat } from '../controllers/userController.js';
+import { 
+  getProfile, 
+  updateProfile, 
+  getNotifications, 
+  readNotification, 
+  deleteAllNotifications,
+  notifySupportTicket, 
+  notifySupportTicketReply, 
+  notifyLiveChat 
+} from '../controllers/userController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 
 const router = Router();
@@ -11,6 +20,7 @@ router.put('/profile', updateProfile);
 
 router.get('/notifications', getNotifications);
 router.post('/notifications/:id/read', readNotification);
+router.delete('/notifications', deleteAllNotifications);
 
 router.get('/downloads', (req, res) => {
 
