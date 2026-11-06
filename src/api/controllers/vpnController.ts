@@ -333,44 +333,52 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       provResult = { success: false, error: provErr.message || 'Provisioning exception' };
     }
 
-    // Ensure final activation updates only an order whose status is still provisioning. Never reactivate a cancelled order from a late provisioning response.
-    const { data: latestOrder } = await supabase.from('orders').select('status').eq('order_id', orderId).maybeSingle();
-    if (!latestOrder || latestOrder.status !== 'provisioning') {
-      console.warn(`[vpnController] Trial order ${orderId} status is '${latestOrder?.status || 'unknown'}', not provisioning. Aborting activation.`);
+    // Ensure robust verification of provisioning success (checking 3X-UI result, database vless_url, and vpn accounts/configs)
+    const { data: latestOrder } = await supabase
+      .from('orders')
+      .select('status, vless_url, client_uuid, id')
+      .eq('order_id', orderId)
+      .maybeSingle();
+
+    let { data: vpnAcc } = await supabase
+      .from('vpn_accounts')
+      .select('uuid, vless_url')
+      .eq('order_id', latestOrder?.id || '')
+      .maybeSingle();
+
+    if (!vpnAcc && latestOrder?.id) {
+      const { data: vpnCfg } = await supabase
+        .from('vpn_configs')
+        .select('uuid, vless_link')
+        .eq('order_id', latestOrder.id)
+        .maybeSingle();
+      if (vpnCfg) {
+        vpnAcc = { uuid: vpnCfg.uuid, vless_url: vpnCfg.vless_link };
+      }
+    }
+
+    const hasVless = Boolean(provResult?.vlessUrl || latestOrder?.vless_url || vpnAcc?.vless_url);
+    const isSuccessState = hasVless || provResult?.success || (latestOrder && ['completed', 'active'].includes(latestOrder.status));
+
+    if (!isSuccessState) {
+      console.warn(`[vpnController] Trial order ${orderId} provisioning failed or was cancelled. Status: ${latestOrder?.status}`);
+      await supabase.from('orders').update({ status: 'cancelled', payment_status: 'Failed' }).eq('order_id', orderId);
       res.status(400).json({
         success: false,
-        error: 'Provisioning timed out or order was cancelled. Please try again.',
+        error: provResult?.error || 'Provisioning timed out or order was cancelled. Please try again.',
         file,
         line
       });
       return;
     }
 
-    if (!provResult || !provResult.success) {
-      console.warn(`[vpnController] Provisioning failed for trial order ${orderId}, marking order as cancelled to release trial reservation while preserving history.`);
-      await supabase.from('orders').update({ status: 'cancelled', payment_status: 'Failed' }).eq('order_id', orderId).eq('status', 'provisioning');
-
-      res.status(400).json({
-        success: false,
-        error: provResult?.error || 'Free Trial auto-provisioning failed. Please try again.',
-        file,
-        line
-      });
-      return;
-    }
-
-    // Mark order completed conditionally if status is still provisioning
-    const { data: completedOrder, error: completeErr } = await supabase.from('orders').update({
+    // Ensure order is successfully marked completed/paid with vless_url
+    const finalVlessUrl = provResult?.vlessUrl || latestOrder?.vless_url || vpnAcc?.vless_url;
+    await supabase.from('orders').update({
       status: 'completed',
       payment_status: 'Paid',
-      vless_url: provResult.vlessUrl
-    }).eq('order_id', orderId).eq('status', 'provisioning').select('order_id').maybeSingle();
-
-    if (completeErr || !completedOrder) {
-      console.warn(`[vpnController] Failed to complete trial order ${orderId} because status changed from provisioning.`);
-      res.status(400).json({ success: false, error: 'Order was cancelled or modified during provisioning.' });
-      return;
-    }
+      vless_url: finalVlessUrl
+    }).eq('order_id', orderId);
 
     // 5. Create customer notification in DB
     try {
