@@ -271,10 +271,25 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // 3.5. Set explicit provisioning lease timestamp in payment_method JSONB and conditionally transition status from 'pending' to 'provisioning'
-    const { data: currentOrder } = await supabase.from('orders').select('payment_method, status').eq('order_id', orderId).maybeSingle();
-    if (currentOrder?.status !== 'pending') {
-      res.status(400).json({ success: false, error: 'Order is no longer pending.' });
+    // 3.5. Set explicit provisioning lease timestamp in payment_method JSONB and atomically transition status from 'pending' to 'provisioning'
+    console.log(`[vpnController] Fetching newly created trial order ${orderId} for customer ${uid}`);
+    const { data: currentOrder, error: fetchErr } = await supabase
+      .from('orders')
+      .select('payment_method, status, customer_id')
+      .eq('order_id', orderId)
+      .maybeSingle();
+
+    console.log(`[vpnController] Current order lookup result for ${orderId}:`, { currentOrder, fetchErr });
+
+    if (fetchErr || !currentOrder) {
+      console.error(`[vpnController] Failed to fetch trial order ${orderId} (Customer: ${uid}) | DB Error:`, fetchErr);
+      res.status(400).json({ success: false, error: `Order state transition failed: Order not found (DB Error: ${fetchErr?.message || 'Not found'})` });
+      return;
+    }
+
+    if (currentOrder.status !== 'pending') {
+      console.warn(`[vpnController] Order ${orderId} expected 'pending' status but found '${currentOrder.status}'`);
+      res.status(400).json({ success: false, error: `Order is no longer pending (Current status: ${currentOrder.status})` });
       return;
     }
 
@@ -284,14 +299,27 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     } catch {}
     currentPm.provisioning_started_at = new Date().toISOString();
 
-    const { data: updatedProvisioningOrder, error: provTransErr } = await supabase.from('orders').update({
-      status: 'provisioning',
-      payment_method: JSON.stringify(currentPm)
-    }).eq('order_id', orderId).eq('status', 'pending').select('order_id').maybeSingle();
+    console.log(`[vpnController] Attempting atomic state transition for order ${orderId} (Customer: ${uid}) from 'pending' to 'provisioning'`);
+    const { data: updatedProvisioningOrder, error: provTransErr } = await supabase
+      .from('orders')
+      .update({
+        status: 'provisioning',
+        payment_method: JSON.stringify(currentPm)
+      })
+      .eq('order_id', orderId)
+      .eq('customer_id', uid)
+      .eq('status', 'pending')
+      .select('order_id, status')
+      .maybeSingle();
+
+    console.log(`[vpnController] Atomic update result for ${orderId}:`, { updatedProvisioningOrder, provTransErr });
 
     if (provTransErr || !updatedProvisioningOrder) {
-      console.warn(`[vpnController] Failed to transition order ${orderId} to provisioning due to race condition or cleanup.`);
-      res.status(400).json({ success: false, error: 'Order state transition failed or order was cleaned up.' });
+      console.error(`[vpnController] State transition FAILED for order ${orderId} (Customer: ${uid}) | Attempted: pending -> provisioning | DB Error:`, provTransErr);
+      res.status(400).json({
+        success: false,
+        error: `Order state transition failed or order was cleaned up. (Details: ${provTransErr?.message || 'Atomic update matched 0 rows'})`
+      });
       return;
     }
 
