@@ -75,6 +75,23 @@ export const createCustomerNotification = async (
     }
   }
 
+  if (resolvedUserId && orderId) {
+    try {
+      const { data: existing } = await supabaseAdmin
+        .from('notifications')
+        .select('id')
+        .eq('user_id', resolvedUserId)
+        .eq('type', type)
+        .ilike('message', `%${orderId}%`)
+        .maybeSingle();
+
+      if (existing) {
+        console.log(`[NotificationService] Notification for order ${orderId} (type: ${type}) already exists. Skipping duplicate.`);
+        return existing;
+      }
+    } catch {}
+  }
+
   let finalMessage = message;
 
   if (vpnName && !message.includes(vpnName)) {

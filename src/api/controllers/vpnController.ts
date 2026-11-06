@@ -377,8 +377,8 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       await createCustomerNotification({
         userId: uid,
         userEmail: email,
-        title: 'Free Trial Activated Successfully',
-        message: `Your 1-Day Free Trial for ${matchedTemplate.package_name || 'VPN Package'} has been activated successfully! Configuration is now available in My VPN.`,
+        title: 'Free Trial Activated!',
+        message: 'Your free trial is now active. You can now connect to your VPN. Enjoy your 1 GB allowance for 1 day.',
         type: 'trial_approved',
         orderId: orderId,
         vpnName: matchedTemplate.package_name
