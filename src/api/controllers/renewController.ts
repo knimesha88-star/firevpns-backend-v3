@@ -415,6 +415,57 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
 export const createOrderNotification = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const data = req.body || {};
+
+    // Server-side independent price & discount validation to prevent client-side tampering
+    const { calculateVerifiedOrderPrice } = await import('../services/discountService.js');
+    const verifiedPrice = await calculateVerifiedOrderPrice({
+      packageId: data.packageId,
+      packageName: data.plan,
+      category: data.category,
+      packageType: data.packageType,
+      duration: data.duration,
+    });
+
+    const verifiedAmount = verifiedPrice.finalPrice;
+
+    // If orderDocId or orderId is present in Supabase, ensure the stored order record reflects the server-verified price & discount
+    if (data.orderDocId || data.orderId) {
+      try {
+        const orderLookupCol = data.orderDocId ? 'id' : 'order_id';
+        const orderLookupVal = data.orderDocId || data.orderId;
+        const { data: existingOrder } = await supabase
+          .from('orders')
+          .select('id, amount, payment_method')
+          .eq(orderLookupCol, orderLookupVal)
+          .maybeSingle();
+
+        if (existingOrder) {
+          let extra: any = {};
+          if (typeof existingOrder.payment_method === 'string' && existingOrder.payment_method.startsWith('{')) {
+            try {
+              extra = JSON.parse(existingOrder.payment_method);
+            } catch (_e) {
+              extra = {};
+            }
+          }
+          extra.original_price = verifiedPrice.originalPrice;
+          extra.discount_amount = verifiedPrice.discountAmount;
+          extra.final_price = verifiedPrice.finalPrice;
+          extra.discount_id = verifiedPrice.appliedDiscount?.id || null;
+          extra.discount_name = verifiedPrice.appliedDiscount?.name || null;
+
+          await supabase
+            .from('orders')
+            .update({
+              amount: verifiedAmount,
+              payment_method: JSON.stringify(extra),
+            })
+            .eq('id', existingOrder.id);
+        }
+      } catch (syncErr) {
+        console.warn('[RenewController] Order price verification sync warning:', syncErr);
+      }
+    }
     
     const notificationData = {
       orderId: data.orderId || 'N/A',
@@ -423,7 +474,10 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       server: data.server || 'N/A',
       duration: data.duration || 'N/A',
       packageType: data.packageType || 'N/A',
-      amount: data.amount !== undefined && data.amount !== null ? data.amount : '0',
+      amount: verifiedAmount,
+      originalPrice: verifiedPrice.originalPrice,
+      discountAmount: verifiedPrice.discountAmount,
+      finalPrice: verifiedPrice.finalPrice,
       transactionRef: data.transactionRef || 'N/A',
       paymentDate: data.paymentDate || 'N/A',
       notes: data.notes || '',

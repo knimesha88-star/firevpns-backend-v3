@@ -173,6 +173,20 @@ export const checkAndCreateExpiryNotifications = async (
     const existingNotifList = existingNotifs || [];
     const now = Date.now();
 
+    // Check if user has previously deleted notifications so we do not recreate deleted expiry alerts
+    let userDeletedAt = 0;
+    try {
+      const { data: delDoc } = await supabaseAdmin
+        .from('settings')
+        .select('data')
+        .eq('id', 'deleted_notifications_state')
+        .maybeSingle();
+      const map = delDoc?.data?.users || {};
+      if (targetUserId && map[targetUserId]?.deletedAt) {
+        userDeletedAt = Number(map[targetUserId].deletedAt) || 0;
+      }
+    } catch {}
+
     for (const cfg of configs) {
       const expVal =
         cfg.expiry_date ||
@@ -191,6 +205,12 @@ export const checkAndCreateExpiryNotifications = async (
       }
 
       if (!expMs || isNaN(expMs)) continue;
+
+      // Do not recreate expiry notifications for configs that were already expired/expiring before the user deleted all notifications
+      const cfgUpdatedMs = cfg.updated_at ? new Date(cfg.updated_at).getTime() : (cfg.created_at ? new Date(cfg.created_at).getTime() : 0);
+      if (userDeletedAt > 0 && (!cfgUpdatedMs || cfgUpdatedMs <= userDeletedAt)) {
+        continue;
+      }
 
       const diffMs = expMs - now;
       const daysLeft = Math.ceil(
@@ -444,14 +464,15 @@ export const deleteAllCustomerNotifications = async (userId: string): Promise<bo
   console.log(`[NotificationService] Deleting all notifications for user ${userId}`);
 
   try {
-    if (!userId || ['N/A', 'null', 'undefined', ''].includes(String(userId).trim())) {
+    const cleanUserId = userId ? String(userId).trim() : '';
+    if (!cleanUserId || ['N/A', 'null', 'undefined', ''].includes(cleanUserId)) {
       return false;
     }
 
     const { error } = await supabaseAdmin
       .from('notifications')
       .delete()
-      .eq('user_id', String(userId).trim());
+      .eq('user_id', cleanUserId);
 
     if (error) {
       console.error(
@@ -459,6 +480,24 @@ export const deleteAllCustomerNotifications = async (userId: string): Promise<bo
         error.message || error
       );
       return false;
+    }
+
+    // Record deletion timestamp so automatic expiry synchronization does not recreate deleted notifications
+    try {
+      const { data: existingDoc } = await supabaseAdmin
+        .from('settings')
+        .select('data')
+        .eq('id', 'deleted_notifications_state')
+        .maybeSingle();
+      const currentUsers = existingDoc?.data?.users || {};
+      currentUsers[cleanUserId] = { deletedAt: Date.now() };
+      await supabaseAdmin.from('settings').upsert({
+        id: 'deleted_notifications_state',
+        data: { users: currentUsers },
+        updated_at: new Date().toISOString()
+      });
+    } catch (stateErr) {
+      console.warn('[NotificationService] Could not persist deleted_notifications_state:', stateErr);
     }
 
     return true;

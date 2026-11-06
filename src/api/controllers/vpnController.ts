@@ -478,4 +478,146 @@ export const saveTrafficResetPolicyHandler = async (req: AuthRequest, res: Respo
   }
 };
 
+export const trackOrder = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const uid = req.user?.uid;
+    const email = (req.user?.email || '').toLowerCase().trim();
+    const role = req.user?.role || 'customer';
+    const orderIdParam = String(req.params?.orderId || req.query?.orderId || '').trim();
+
+    if (!uid && !email) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    if (!orderIdParam) {
+      res.status(400).json({ success: false, error: 'Order ID is required' });
+      return;
+    }
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderIdParam);
+
+    let orderRecord: any = null;
+    if (isUuid) {
+      const { data } = await supabase
+        .from('orders')
+        .select('*')
+        .or(`id.eq.${orderIdParam},order_id.eq.${orderIdParam}`)
+        .maybeSingle();
+      orderRecord = data;
+    } else {
+      const { data } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('order_id', orderIdParam)
+        .maybeSingle();
+      orderRecord = data;
+    }
+
+    if (!orderRecord) {
+      res.status(404).json({ success: false, error: 'Order not found' });
+      return;
+    }
+
+    const ownerUid = String(orderRecord.customer_id || '').trim();
+    const ownerEmail = String(orderRecord.email || '').toLowerCase().trim();
+    const isOwner =
+      role === 'admin' ||
+      (uid && ownerUid === uid) ||
+      (email && ownerEmail === email);
+
+    if (!isOwner) {
+      res.status(403).json({ success: false, error: 'Forbidden: You do not have access to this order' });
+      return;
+    }
+
+    // Also fetch associated VPN configuration if provisioned
+    let vpnConfig: any = null;
+    try {
+      const { data: cfgByOrder } = await supabase
+        .from('vpn_configs')
+        .select('*')
+        .eq('order_id', orderRecord.id)
+        .maybeSingle();
+
+      if (cfgByOrder) {
+        vpnConfig = cfgByOrder;
+      } else if (orderRecord.client_uuid) {
+        const { data: cfgByUuid } = await supabase
+          .from('vpn_configs')
+          .select('*')
+          .eq('uuid', orderRecord.client_uuid)
+          .maybeSingle();
+        vpnConfig = cfgByUuid;
+      }
+    } catch {}
+
+    let extra: any = {};
+    if (orderRecord.payment_method && typeof orderRecord.payment_method === 'string' && orderRecord.payment_method.startsWith('{')) {
+      try {
+        extra = JSON.parse(orderRecord.payment_method);
+      } catch {}
+    }
+
+    const rawStatus = String(orderRecord.status || '').toLowerCase();
+    const rawProv = String(orderRecord.provisioning_status || '').toLowerCase();
+    const rawPay = String(orderRecord.payment_status || '').toLowerCase();
+    const hasVpnCredentials = Boolean(
+      orderRecord.vless_url ||
+      orderRecord.client_uuid ||
+      vpnConfig?.vless_link ||
+      vpnConfig?.vless_url ||
+      vpnConfig?.uuid
+    );
+
+    let normalizedStage: 'Pending' | 'Verified' | 'Provisioning' | 'Active' | 'Rejected' | 'Failed' = 'Pending';
+    if (rawStatus === 'rejected' || rawPay === 'cancelled' || rawPay === 'rejected' || orderRecord.reject_reason) {
+      normalizedStage = 'Rejected';
+    } else if (rawProv === 'failed' || rawPay === 'failed') {
+      normalizedStage = 'Failed';
+    } else if (
+      rawStatus === 'completed' ||
+      rawStatus === 'active' ||
+      rawProv === 'completed' ||
+      rawProv === 'active' ||
+      hasVpnCredentials
+    ) {
+      normalizedStage = 'Active';
+    } else if (rawProv === 'provisioning' || rawProv === 'creating' || rawStatus === 'provisioning') {
+      normalizedStage = 'Provisioning';
+    } else if (rawPay === 'paid' || rawPay === 'approved') {
+      normalizedStage = 'Verified';
+    } else {
+      normalizedStage = 'Pending';
+    }
+
+    res.json({
+      success: true,
+      order: {
+        ...orderRecord,
+        orderId: orderRecord.order_id || orderRecord.id,
+        customerId: orderRecord.customer_id,
+        plan: extra.plan || orderRecord.package_name,
+        packageType: extra.packageType || 'Unlimited',
+        server: vpnConfig?.server_name || extra.server || 'Singapore',
+        duration: extra.duration || '1 Month',
+        payment_status: orderRecord.payment_status || 'Pending Verification',
+        provisioning_status: normalizedStage,
+        createdAt: orderRecord.created_at,
+        activatedAt: orderRecord.activated_at || vpnConfig?.activated_at || null,
+        expiryDate: orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null,
+        inboundId: vpnConfig?.inbound_id || null,
+        clientUuid: orderRecord.client_uuid || vpnConfig?.uuid || null,
+        vlessUrl: orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || null,
+        subscriptionUrl: orderRecord.subscription_url || vpnConfig?.subscription_url || null,
+        dataLimit: vpnConfig?.data_limit || extra.dataLimit || null,
+        reject_reason: orderRecord.reject_reason || null
+      }
+    });
+  } catch (error: any) {
+    console.error('[vpnController] Error in trackOrder:', error);
+    res.status(500).json({ success: false, error: error.message || 'Internal Server Error' });
+  }
+};
+
 

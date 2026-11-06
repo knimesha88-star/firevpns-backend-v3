@@ -40,5 +40,22 @@ import { getTrafficResetPolicyHandler, saveTrafficResetPolicyHandler } from '../
 router.get('/traffic-reset-policy', getTrafficResetPolicyHandler);
 router.post('/traffic-reset-policy', saveTrafficResetPolicyHandler);
 
+// Discount Management routes
+import {
+  getAdminDiscountsHandler,
+  createAdminDiscountHandler,
+  updateAdminDiscountHandler,
+  toggleAdminDiscountHandler,
+  deleteAdminDiscountHandler,
+} from '../controllers/discountController.js';
+router.get('/discounts', getAdminDiscountsHandler);
+router.post('/discounts', createAdminDiscountHandler);
+router.put('/discounts/:id', updateAdminDiscountHandler);
+router.put('/discounts/:id/status', toggleAdminDiscountHandler);
+router.post('/discounts/:id/status', toggleAdminDiscountHandler);
+router.patch('/discounts/:id/status', toggleAdminDiscountHandler);
+router.delete('/discounts/:id', deleteAdminDiscountHandler);
+
 export default router;
+
 
