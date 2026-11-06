@@ -214,10 +214,10 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
             const xuiClient = await xuiService.getClientByEmail(stale.email || email);
             if (xuiClient) {
               // Client exists in 3X-UI! Complete the order instead of cancelling.
-              await supabase.from('orders').update({ status: 'completed', payment_status: 'paid' }).eq('order_id', stale.order_id);
+              await supabase.from('orders').update({ status: 'completed', payment_status: 'Paid' }).eq('order_id', stale.order_id);
             } else {
               // Client does NOT exist in 3X-UI. Safe to cancel/fail to release reservation.
-              await supabase.from('orders').update({ status: 'cancelled', payment_status: 'failed' }).eq('order_id', stale.order_id);
+              await supabase.from('orders').update({ status: 'cancelled', payment_status: 'Failed' }).eq('order_id', stale.order_id);
             }
           }
         }
@@ -348,7 +348,7 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
 
     if (!provResult || !provResult.success) {
       console.warn(`[vpnController] Provisioning failed for trial order ${orderId}, marking order as cancelled to release trial reservation while preserving history.`);
-      await supabase.from('orders').update({ status: 'cancelled', payment_status: 'failed' }).eq('order_id', orderId).eq('status', 'provisioning');
+      await supabase.from('orders').update({ status: 'cancelled', payment_status: 'Failed' }).eq('order_id', orderId).eq('status', 'provisioning');
 
       res.status(400).json({
         success: false,
@@ -362,7 +362,7 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     // Mark order completed conditionally if status is still provisioning
     const { data: completedOrder, error: completeErr } = await supabase.from('orders').update({
       status: 'completed',
-      payment_status: 'paid',
+      payment_status: 'Paid',
       vless_url: provResult.vlessUrl
     }).eq('order_id', orderId).eq('status', 'provisioning').select('order_id').maybeSingle();
 
