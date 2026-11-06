@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as vpnService from '../services/vpnService.js';
+import * as xuiService from '../services/xuiService.js';
 import { supabase } from '../../lib/supabase.js';
 import { sendTrialRequestNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
@@ -143,82 +144,6 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    line = 119;
-    // 1. Check if user already submitted a trial request for this package/template
-    console.log('[vpnController] Fetching user orders to validate duplicate trial claims');
-    const { data: userOrders, error: fetchOrdersErr } = await supabase.from('orders').select('*');
-    if (fetchOrdersErr) {
-      console.error('[vpnController] Database error while fetching orders:', fetchOrdersErr);
-      res.status(500).json({
-        success: false,
-        error: `Database Fetch Error: ${fetchOrdersErr.message || 'Failed to fetch orders'}`,
-        databaseError: fetchOrdersErr,
-        file,
-        line
-      });
-      return;
-    }
-
-    line = 122;
-    const allOrders: any[] = userOrders || [];
-    const existingTrial = allOrders.find((data) => {
-      const docUid = String(data.customer_id || data.customerUid || data.customerId || '').trim();
-      const docEmail = String(data.email || data.customerEmail || '').toLowerCase().trim();
-      const matchesUser = (uid && docUid === uid) || (email && docEmail === email.toLowerCase().trim());
-
-      if (!matchesUser) return false;
-
-      let pmJson: any = {};
-      try {
-        pmJson = typeof data.payment_method === 'string' ? JSON.parse(data.payment_method) : (data.payment_method || {});
-      } catch (e) {}
-
-      const isTrial = !!(
-        pmJson.is_trial || 
-        pmJson.isTrial || 
-        pmJson.paymentMethod === 'Free Trial' || 
-        String(data.order_id || data.id || '').startsWith('TRIAL-')
-      );
-
-      if (!isTrial) return false;
-
-      const pName = String(data.package_name || pmJson.packageName || pmJson.package_name || pmJson.plan || '').trim().toLowerCase();
-      const tId = String(data.template_id || pmJson.template_id || pmJson.templateId || '').trim().toLowerCase();
-
-      const reqPName = String(packageName || '').trim().toLowerCase();
-      const reqTId = String(templateId || '').trim().toLowerCase();
-
-      return (reqPName && pName === reqPName) || (reqTId && tId === reqTId) || (reqPName && tId === reqPName);
-    });
-
-    line = 152;
-    if (existingTrial) {
-      const status = String(existingTrial.status || '').toLowerCase();
-      const payStatus = String(existingTrial.payment_status || '').toLowerCase();
-      if (status === 'pending' || payStatus === 'pending trial approval' || payStatus === 'pending verification' || payStatus === 'pending') {
-        const errText = 'Request Pending: You already have a pending trial request for this package. Please wait for administrator approval.';
-        console.warn(`[vpnController] ${errText} at ${file}:${line}`);
-        res.status(400).json({
-          success: false,
-          error: errText,
-          file,
-          line
-        });
-        return;
-      }
-      if (status !== 'rejected') {
-        const errText = 'Trial Already Used: You have already claimed or been approved for a free trial for this package.';
-        console.warn(`[vpnController] ${errText} at ${file}:${line}`);
-        res.status(400).json({
-          success: false,
-          error: errText,
-          file,
-          line
-        });
-        return;
-      }
-    }
-
     line = 172;
     // 2. Fetch templates to match the selected package
     console.log('[vpnController] Fetching provision templates');
@@ -264,7 +189,44 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     }
 
     line = 195;
-    // 3. Create the pending trial request (Order status = 'pending')
+    // 2.5. Before requesting a new trial, check any existing expired provisioning orders for this user and verify via 3X-UI
+    try {
+      const { data: staleOrders } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('customer_id', uid)
+        .eq('status', 'provisioning');
+
+      if (staleOrders && staleOrders.length > 0) {
+        const now = Date.now();
+        for (const stale of staleOrders) {
+          let pm: any = {};
+          try {
+            pm = typeof stale.payment_method === 'string' ? JSON.parse(stale.payment_method) : (stale.payment_method || {});
+          } catch {}
+
+          const startedAt = pm.provisioning_started_at ? new Date(pm.provisioning_started_at).getTime() : new Date(stale.created_at).getTime();
+          const isExpired = (now - startedAt) > (30 * 60 * 1000); // 30 minutes
+
+          if (isExpired) {
+            // Requirement 4: Before releasing an expired provisioning reservation, verify the corresponding client in 3X-UI using the existing backend service.
+            // Requirement 3: Never treat a non-empty vless_url alone as proof that a VPN client exists in 3X-UI.
+            const xuiClient = await xuiService.getClientByEmail(stale.email || email);
+            if (xuiClient) {
+              // Client exists in 3X-UI! Complete the order instead of cancelling.
+              await supabase.from('orders').update({ status: 'completed', payment_status: 'paid' }).eq('order_id', stale.order_id);
+            } else {
+              // Client does NOT exist in 3X-UI. Safe to cancel/fail to release reservation.
+              await supabase.from('orders').update({ status: 'cancelled', payment_status: 'failed' }).eq('order_id', stale.order_id);
+            }
+          }
+        }
+      }
+    } catch (recoveryErr) {
+      console.warn('[vpnController] Stale provisioning recovery check warning:', recoveryErr);
+    }
+
+    // 3. Atomically check 2-trial limit and insert trial order via Supabase RPC function
     const orderId = `TRIAL-${Math.floor(100000 + Math.random() * 900000)}`;
     const trimmedConfigName = (configurationName || `Trial-${matchedTemplate.package_name}`).trim();
     const finalCustomerName = (customerName || (email ? email.split('@')[0] : 'Customer')).trim();
@@ -288,63 +250,108 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       requestedAt: new Date().toISOString()
     });
 
-    const orderPayload: any = {
-      order_id: orderId,
-      customer_id: uid,
-      email: email,
-      package_name: matchedTemplate.package_name,
-      amount: 0,
-      payment_method: notesJson,
-      payment_status: 'Pending',
-      status: 'pending',
-      created_at: new Date().toISOString()
-    };
+    console.log('[vpnController] Calling atomic claim_free_trial RPC function for order:', orderId);
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('claim_free_trial', {
+      p_customer_id: uid,
+      p_order_id: orderId,
+      p_email: email,
+      p_package_name: matchedTemplate.package_name,
+      p_payment_method: JSON.parse(notesJson)
+    });
 
-    console.log('[vpnController] Creating pending trial request payload in database:', JSON.stringify(orderPayload, null, 2));
-
-    line = 233;
-    let { data: resData, error: insertErr } = await supabase
-      .from('orders')
-      .insert(orderPayload)
-      .select()
-      .maybeSingle();
-
-    if (insertErr && (insertErr.message?.includes('payment_status') || insertErr.code === '23514')) {
-      console.warn('[vpnController] Insert with payment_status Pending failed, retrying with Pending Verification:', insertErr);
-      const { data: resData2, error: retryErr } = await supabase
-        .from('orders')
-        .insert({ ...orderPayload, payment_status: 'Pending Verification' })
-        .select()
-        .maybeSingle();
-      if (!retryErr) {
-        insertErr = null;
-        resData = resData2;
-      } else {
-        insertErr = retryErr;
-      }
-    }
-
-    if (insertErr) {
-      console.error('[vpnController] Database Trial insert error:', insertErr);
-      res.status(500).json({
+    if (rpcErr || !rpcData || !rpcData.success) {
+      const errText = rpcData?.error || rpcErr?.message || 'You have used all 2 free trials available for your account.';
+      console.warn(`[vpnController] Atomic trial claim rejected at ${file}:${line}:`, errText);
+      res.status(400).json({
         success: false,
-        error: `Database Insert Error: ${insertErr.message || 'Constraint violation'}`,
-        databaseError: insertErr,
+        error: errText,
         file,
         line
       });
       return;
     }
 
-    line = 260;
-    // 4. Create customer notification in DB
+    // 3.5. Set explicit provisioning lease timestamp in payment_method JSONB and conditionally transition status from 'pending' to 'provisioning'
+    const { data: currentOrder } = await supabase.from('orders').select('payment_method, status').eq('order_id', orderId).maybeSingle();
+    if (currentOrder?.status !== 'pending') {
+      res.status(400).json({ success: false, error: 'Order is no longer pending.' });
+      return;
+    }
+
+    let currentPm: any = {};
+    try {
+      currentPm = typeof currentOrder?.payment_method === 'string' ? JSON.parse(currentOrder.payment_method) : (currentOrder?.payment_method || {});
+    } catch {}
+    currentPm.provisioning_started_at = new Date().toISOString();
+
+    const { data: updatedProvisioningOrder, error: provTransErr } = await supabase.from('orders').update({
+      status: 'provisioning',
+      payment_method: JSON.stringify(currentPm)
+    }).eq('order_id', orderId).eq('status', 'pending').select('order_id').maybeSingle();
+
+    if (provTransErr || !updatedProvisioningOrder) {
+      console.warn(`[vpnController] Failed to transition order ${orderId} to provisioning due to race condition or cleanup.`);
+      res.status(400).json({ success: false, error: 'Order state transition failed or order was cleaned up.' });
+      return;
+    }
+
+    // 4. Automatically provision through 3X-UI integration
+    console.log(`[vpnController] Auto-provisioning trial order ${orderId} via 3X-UI`);
+    let provResult: any = null;
+    try {
+      provResult = await xuiService.provisionOrderClient(orderId);
+    } catch (provErr: any) {
+      console.error(`[vpnController] Free trial auto-provisioning exception for order ${orderId}:`, provErr);
+      provResult = { success: false, error: provErr.message || 'Provisioning exception' };
+    }
+
+    // Ensure final activation updates only an order whose status is still provisioning. Never reactivate a cancelled order from a late provisioning response.
+    const { data: latestOrder } = await supabase.from('orders').select('status').eq('order_id', orderId).maybeSingle();
+    if (!latestOrder || latestOrder.status !== 'provisioning') {
+      console.warn(`[vpnController] Trial order ${orderId} status is '${latestOrder?.status || 'unknown'}', not provisioning. Aborting activation.`);
+      res.status(400).json({
+        success: false,
+        error: 'Provisioning timed out or order was cancelled. Please try again.',
+        file,
+        line
+      });
+      return;
+    }
+
+    if (!provResult || !provResult.success) {
+      console.warn(`[vpnController] Provisioning failed for trial order ${orderId}, marking order as cancelled to release trial reservation while preserving history.`);
+      await supabase.from('orders').update({ status: 'cancelled', payment_status: 'failed' }).eq('order_id', orderId).eq('status', 'provisioning');
+
+      res.status(400).json({
+        success: false,
+        error: provResult?.error || 'Free Trial auto-provisioning failed. Please try again.',
+        file,
+        line
+      });
+      return;
+    }
+
+    // Mark order completed conditionally if status is still provisioning
+    const { data: completedOrder, error: completeErr } = await supabase.from('orders').update({
+      status: 'completed',
+      payment_status: 'paid',
+      vless_url: provResult.vlessUrl
+    }).eq('order_id', orderId).eq('status', 'provisioning').select('order_id').maybeSingle();
+
+    if (completeErr || !completedOrder) {
+      console.warn(`[vpnController] Failed to complete trial order ${orderId} because status changed from provisioning.`);
+      res.status(400).json({ success: false, error: 'Order was cancelled or modified during provisioning.' });
+      return;
+    }
+
+    // 5. Create customer notification in DB
     try {
       await createCustomerNotification({
         userId: uid,
         userEmail: email,
-        title: 'Free Trial Submitted',
-        message: `Your 1-Day Free Trial request for ${matchedTemplate.package_name || 'VPN Package'} has been submitted and is pending administrator approval.`,
-        type: 'trial_submitted',
+        title: 'Free Trial Activated Successfully',
+        message: `Your 1-Day Free Trial for ${matchedTemplate.package_name || 'VPN Package'} has been activated successfully! Configuration is now available in My VPN.`,
+        type: 'trial_approved',
         orderId: orderId,
         vpnName: matchedTemplate.package_name
       });
@@ -352,39 +359,38 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       console.error('[vpnController] Customer notification creation error:', notifErr);
     }
 
-    line = 274;
-    // 5. Send Telegram notification to Administrator
-    let telegramRes: any = null;
+    // 6. Send Telegram notification to Administrator
     try {
-      telegramRes = await sendTrialRequestNotification({
+      await sendTrialRequestNotification({
         customerName: finalCustomerName,
         email: email,
         packageName: matchedTemplate.package_name,
         templateName: matchedTemplate.package_name || matchedTemplate.name,
-        trialLimits: '1 GB / 1 Day (24 Hours)',
+        trialLimits: '1 GB / 1 Day (24 Hours) [Auto-Activated]',
         requestTime: new Date().toLocaleString('en-US', { timeZone: 'Asia/Colombo' }),
         requestId: orderId
       });
     } catch (tgErr: any) {
       console.error('[vpnController] Telegram notification error:', tgErr);
-      res.status(502).json({
-        success: false,
-        error: `Telegram Notification Error: ${tgErr.message || 'Failed to send admin alert'}`,
-        telegramError: tgErr.message || tgErr,
-        file,
-        line
-      });
-      return;
     }
 
+    const { count: successfulCount } = await supabase
+      .from('orders')
+      .select('*', { count: 'exact', head: true })
+      .eq('customer_id', uid)
+      .in('status', ['completed', 'active']);
+
+    const remainingTrials = Math.max(0, 2 - (successfulCount || 1));
+
     // Success response
-    console.log('[vpnController] Free Trial submission completed successfully. Request ID:', orderId);
+    console.log('[vpnController] Free Trial auto-activation completed successfully. Order ID:', orderId);
     res.json({
       success: true,
       orderId: orderId,
-      status: 'pending',
-      telegramResponse: telegramRes,
-      message: 'Your 1 GB • 1 Day Free Trial request has been submitted successfully and is pending administrator approval!'
+      status: 'completed',
+      vlessUrl: provResult.vlessUrl,
+      remainingTrials: remainingTrials,
+      message: `Free Trial Activated Successfully! You have ${remainingTrials} of 2 trials remaining.`
     });
 
   } catch (error: any) {
