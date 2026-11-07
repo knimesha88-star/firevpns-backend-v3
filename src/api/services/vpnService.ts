@@ -156,9 +156,15 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   if (userInboundIds.length > 0) {
     try {
       console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds directly from 3X-UI...`);
-      const liveResults = await Promise.all(
-        userInboundIds.map(id => getLiveInbound(Number(id)))
-      );
+      const liveResults = await Promise.race([
+        Promise.all(userInboundIds.map(id => getLiveInbound(Number(id)))),
+        new Promise<null[]>((resolve) =>
+          setTimeout(() => {
+            console.warn('[Live Traffic Engine] Live inbound fetch timed out after 5s; using cached inbounds.');
+            resolve([]);
+          }, 5000)
+        )
+      ]);
       liveResults.forEach(ib => {
         if (ib && ib.id) {
           inboundsMap.set(Number(ib.id), ib);

@@ -324,6 +324,7 @@ export const sendEmail = async (params: SendEmailParams): Promise<{ success: boo
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
+      signal: AbortSignal.timeout(8000),
       body: JSON.stringify({
         from: senderFormatted,
         to: [to],

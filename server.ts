@@ -15,15 +15,48 @@ import { errorMiddleware } from './src/api/middleware/errorMiddleware.js';
 
 dotenv.config();
 
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Server] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught Exception:', err);
+});
+
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
+app.get(['/api/health', '/health'], (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: Math.round(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.use('/api', (req, res, next) => {
+  const isLongRunning =
+    req.path.includes('claim-trial') ||
+    req.path.includes('approve');
+  const timeoutMs = isLongRunning ? 70000 : 25000;
+
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error(`[API Timeout] ${req.method} ${req.originalUrl} timed out after ${timeoutMs}ms`);
+      res.status(504).json({
+        success: false,
+        error: `Request timed out after ${Math.round(timeoutMs / 1000)} seconds`
+      });
+    }
+  }, timeoutMs);
+
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+  next();
 });
 
 app.use('/api/auth', authRoutes);

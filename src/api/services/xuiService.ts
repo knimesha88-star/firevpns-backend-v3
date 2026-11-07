@@ -72,7 +72,18 @@ export interface XuiInbound {
   sniffing: string;
 }
 
-const getXuiConfig = async (): Promise<XuiConfig> => {
+let cachedXuiConfig: { config: XuiConfig; expiresAt: number } | null = null;
+const XUI_CONFIG_TTL_MS = 60 * 1000;
+
+let cachedXuiAuth: { panelUrl: string; headers: Record<string, string>; expiresAt: number } | null = null;
+const XUI_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes (3X-UI session cookie lasts 6 hours)
+
+const getXuiConfig = async (forceRefresh = false): Promise<XuiConfig> => {
+  const now = Date.now();
+  if (!forceRefresh && cachedXuiConfig && cachedXuiConfig.expiresAt > now) {
+    return cachedXuiConfig.config;
+  }
+
   const { data: doc, error } = await supabase.from('settings').select('*').eq('id', 'xui').maybeSingle();
   if (error || !doc) {
     throw new Error('3X-UI settings not configured');
@@ -80,13 +91,16 @@ const getXuiConfig = async (): Promise<XuiConfig> => {
   
   const data = doc.data || {};
   
-  return {
+  const config: XuiConfig = {
     panelUrl: data.panelUrl || '',
     username: data.username || 'admin',
     password: data.password || data.apiToken || '',
     apiToken: data.apiToken || '',
     panelName: data.panelName || ''
-  } as XuiConfig;
+  };
+
+  cachedXuiConfig = { config, expiresAt: now + XUI_CONFIG_TTL_MS };
+  return config;
 };
 
 const parseUrl = (urlStr: string) => {
@@ -132,23 +146,33 @@ const logAxiosError = (error: any) => {
   console.error(`Endpoint path: ${error.config?.url || 'N/A'}`);
   if (error.response) {
     console.error(`HTTP status: ${error.response?.status} ${error.response?.statusText || ''}`);
-    console.error(`Response body:`, error.response?.data);
   } else {
     console.error("No HTTP response received from 3X-UI");
   }
-  console.error(`Stack trace: ${error.stack}`);
 };
 
-const createAxiosInstance = (baseUrl: string) => {
+const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
+
+const createAxiosInstance = (baseUrl: string, timeoutMs: number = 10000) => {
   return axios.create({
     baseURL: baseUrl,
-    timeout: 15000,
-    httpsAgent: new https.Agent({ rejectUnauthorized: false }), // In case of self-signed certs
+    timeout: timeoutMs,
+    httpsAgent: sharedHttpsAgent,
     validateStatus: (status) => status < 500
   });
 };
 
-const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, string>> => {
+const getXuiAuthHeaders = async (config: XuiConfig, forceRefresh = false): Promise<Record<string, string>> => {
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    cachedXuiAuth &&
+    cachedXuiAuth.panelUrl === config.panelUrl &&
+    cachedXuiAuth.expiresAt > now
+  ) {
+    return { ...cachedXuiAuth.headers };
+  }
+
   const username = config.username || 'admin';
   const password = config.password || config.apiToken;
   
@@ -157,7 +181,7 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
   }
 
   const { baseUrl } = parseUrl(config.panelUrl);
-  const client = createAxiosInstance(baseUrl);
+  const client = createAxiosInstance(baseUrl, 6000);
 
   const headers: Record<string, string> = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -196,10 +220,10 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
   }
   headers['Authorization'] = `Bearer ${password}`;
 
-  // Fetch CSRF token if available
+  // Fetch CSRF token if available (short 4s timeout)
   try {
     const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, '/csrf-token');
-    const csrfRes = await client.get(csrfPath, { headers });
+    const csrfRes = await client.get(csrfPath, { headers, timeout: 4000 });
     if (csrfRes.data?.obj) {
       headers['X-CSRF-Token'] = csrfRes.data.obj;
     }
@@ -211,42 +235,43 @@ const getXuiAuthHeaders = async (config: XuiConfig): Promise<Record<string, stri
     // Non-fatal if csrf endpoint fails
   }
 
+  if (cookieHeader) {
+    cachedXuiAuth = {
+      panelUrl: config.panelUrl,
+      headers: { ...headers },
+      expiresAt: now + XUI_AUTH_TTL_MS
+    };
+  }
+
   return headers;
 };
 
 export const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: any): Promise<T> => {
-  console.log(`[xuiService] [FUNCTION ENTERED] requestApi - Endpoint: ${endpoint}, Method: ${method}`);
   const config = await getXuiConfig();
-  const headers = await getXuiAuthHeaders(config);
+  let headers = await getXuiAuthHeaders(config);
 
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-  const client = createAxiosInstance(baseUrl);
+  const client = createAxiosInstance(baseUrl, 10000);
 
-  console.log(`[xuiService] [DEBUG] Preparing ${method} request`);
-  console.log(`[xuiService] [DEBUG] Endpoint: ${endpoint}`);
-  console.log(`[xuiService] [DEBUG] Full URL: ${fullUrl}`);
-  console.log(`[xuiService] [DEBUG] Method: ${method}`);
-  console.log(`[xuiService] [DEBUG] Payload: ${data ? JSON.stringify(data) : 'None'}`);
-  console.log(`[xuiService] [3X-UI API REQUEST] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | Payload:`, data ? JSON.stringify(data) : 'None');
-  
   try {
-    const axiosConfig = {
+    let response = await client.request({
       url: fullPath,
       method,
       data,
       headers
-    };
-    console.log(`[xuiService] [API TRANSPORT DEBUG] Exact request URL before axios sends: ${fullUrl}`);
-    console.log(`[xuiService] [API TRANSPORT DEBUG] final axios config.baseURL: ${client.defaults.baseURL}`);
-    console.log(`[xuiService] [API TRANSPORT DEBUG] final axios config.url: ${axiosConfig.url}`);
+    });
 
-    const response = await client.request(axiosConfig);
-
-    console.log(`[requestApi Debug] HTTP Status: ${response.status}`);
-    console.log(`[requestApi Debug] HTTP Headers:`, JSON.stringify(response.headers));
-    console.log(`[requestApi Debug] Raw response.data:`, JSON.stringify(response.data));
-
-    console.log(`[xuiService] [3X-UI API RESPONSE] Full request URL: ${fullUrl} | HTTP method: ${method} | Endpoint path: ${fullPath} | HTTP status: ${response.status} ${response.statusText} | Response body:`, JSON.stringify(response.data));
+    // If session cookie expired or returned 401/403/redirect, refresh auth once
+    if (response.status === 401 || response.status === 403 || response.status === 302 || response.status === 307) {
+      cachedXuiAuth = null;
+      headers = await getXuiAuthHeaders(config, true);
+      response = await client.request({
+        url: fullPath,
+        method,
+        data,
+        headers
+      });
+    }
 
     if (response.status !== 200) {
       throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
@@ -256,17 +281,9 @@ export const requestApi = async <T>(endpoint: string, method: 'GET' | 'POST' = '
       throw new Error(`3X-UI API Error: ${response.data.msg}`);
     }
 
-    console.log(`[xuiService] [3X-UI API SUCCESS] Success response for ${endpoint}`);
     return response.data.obj;
   } catch (error: any) {
-    console.error(`[xuiService] [API TRANSPORT ERROR] Axios error on ${fullUrl}`);
-    console.error(`[xuiService] [API TRANSPORT ERROR] config.baseURL: ${error.config?.baseURL}`);
-    console.error(`[xuiService] [API TRANSPORT ERROR] config.url: ${error.config?.url}`);
-    
-    if (error.response) {
-      console.error(`[xuiService] [API TRANSPORT ERROR] HTTP Status: ${error.response.status}`);
-      console.error(`[xuiService] [API TRANSPORT ERROR] HTTP Response Body:`, JSON.stringify(error.response.data));
-    }
+    console.error(`[xuiService] [API TRANSPORT ERROR] Axios error on ${fullUrl}: ${error.message}`);
     logAxiosError(error);
     throw error;
   }

@@ -9,6 +9,7 @@ import {
   trackOrder
 } from '../controllers/vpnController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
+import { turnstileMiddleware } from '../middleware/turnstileMiddleware.js';
 import {
   getPublicActiveDiscountsHandler,
   validateOrderPriceHandler,
@@ -24,7 +25,7 @@ router.use(authMiddleware);
 
 router.get('/my-configs', getMyConfigs);
 router.get('/claimed-trials', getClaimedTrials);
-router.post('/claim-trial', claimTrial);
+router.post('/claim-trial', turnstileMiddleware, claimTrial);
 
 // Track Order Provisioning Status
 router.get('/track-order/:orderId', trackOrder);

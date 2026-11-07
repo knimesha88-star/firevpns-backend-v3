@@ -2,6 +2,9 @@ import { Response, NextFunction } from 'express';
 import { supabase } from '../../lib/supabase.js';
 import { AuthRequest } from '../../types/interfaces.js';
 
+const verifiedTokenCache = new Map<string, { user: any; expiresAt: number }>();
+const TOKEN_CACHE_TTL_MS = 60 * 1000;
+
 export const authMiddleware = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers.authorization || (req.headers as any).Authorization || req.header('Authorization');
 
@@ -11,19 +14,39 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
   }
 
   const token = authHeader.split(' ')[1];
+  const now = Date.now();
+  const cached = verifiedTokenCache.get(token);
+  if (cached && cached.expiresAt > now) {
+    req.user = cached.user;
+    next();
+    return;
+  }
 
   try {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    const authResult = await Promise.race([
+      supabase.auth.getUser(token),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Supabase auth.getUser timed out after 5s')), 5000)
+      ),
+    ]);
+    const { data: { user }, error } = authResult;
     if (error || !user) {
       throw error || new Error('User not found');
     }
 
-    req.user = {
+    const userObj = {
       uid: user.id,
       email: user.email,
       role: user.user_metadata?.role || 'customer',
       ...user,
     };
+
+    if (verifiedTokenCache.size > 500) {
+      verifiedTokenCache.clear();
+    }
+    verifiedTokenCache.set(token, { user: userObj, expiresAt: now + TOKEN_CACHE_TTL_MS });
+
+    req.user = userObj;
     next();
   } catch (error: any) {
     // Decodes the JWT payload safely without verification as fallback

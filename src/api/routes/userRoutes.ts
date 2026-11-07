@@ -10,8 +10,12 @@ import {
   notifyLiveChat 
 } from '../controllers/userController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
+import { turnstileMiddleware } from '../middleware/turnstileMiddleware.js';
 
 const router = Router();
+
+// Public support submission endpoint protected by Cloudflare Turnstile
+router.post('/support/public', turnstileMiddleware, notifySupportTicket);
 
 router.use(authMiddleware);
 
@@ -40,7 +44,7 @@ router.get('/support', (req, res) => {
   });
 });
 
-router.post('/support/notify', notifySupportTicket);
+router.post('/support/notify', turnstileMiddleware, notifySupportTicket);
 router.post('/support/reply', notifySupportTicketReply);
 router.post('/livechat/notify', notifyLiveChat);
 
