@@ -7,10 +7,11 @@ import { createCustomerNotification } from '../services/notificationService.js';
 import { sendOrderRejectedNotification } from '../services/telegramService.js';
 import {
   getEmailSettings,
+  invalidateEmailSettingsCache,
   sendPaymentRejectedEmail,
   sendTrialRejectedEmail,
   sendMaintenanceAnnouncementEmail,
-  sendEmail
+  sendSingleTestEmail
 } from '../services/emailService.js';
 
 export const getStats = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -156,10 +157,12 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
 
       // Send email notification non-blockingly
       if (order.email) {
+        const canonicalOrderId = order.order_id || order.id;
         if (isTrial) {
           sendTrialRejectedEmail({
             userEmail: order.email,
-            orderId: order.id,
+            trialId: canonicalOrderId,
+            orderId: canonicalOrderId,
             packageName: order.package_name || 'Free Trial',
             reason: reason,
             userId: order.customer_id
@@ -167,7 +170,7 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
         } else {
           sendPaymentRejectedEmail({
             userEmail: order.email,
-            orderId: order.order_id || order.id,
+            orderId: canonicalOrderId,
             packageName: order.package_name || 'VPN Plan',
             reason: reason,
             userId: order.customer_id
@@ -255,7 +258,13 @@ export const publishAnnouncementNotification = async (req: AuthRequest, res: Res
 export const getEmailSettingsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const settings = await getEmailSettings();
-    res.json({ success: true, settings });
+    res.json({
+      success: true,
+      settings: {
+        ...settings,
+        apiKey: '' // Never expose secret API key to browser
+      }
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -269,11 +278,26 @@ export const saveEmailSettingsHandler = async (req: AuthRequest, res: Response):
       return;
     }
 
+    const { data: existingRow } = await supabaseAdmin
+      .from('settings')
+      .select('data')
+      .eq('id', 'email')
+      .maybeSingle();
+
+    const sanitizedSettings = {
+      ...settings,
+      apiKey: settings.apiKey && String(settings.apiKey).trim()
+        ? String(settings.apiKey).trim()
+        : (existingRow?.data?.apiKey || '')
+    };
+
     await supabaseAdmin.from('settings').upsert({
       id: 'email',
-      data: settings,
+      data: sanitizedSettings,
       updated_at: new Date().toISOString()
     }, { onConflict: 'id' });
+
+    invalidateEmailSettingsCache();
 
     res.json({ success: true, message: 'Email settings saved successfully' });
   } catch (error: any) {
@@ -307,35 +331,39 @@ export const getEmailLogsHandler = async (req: AuthRequest, res: Response): Prom
 export const sendTestEmailHandler = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { toEmail } = req.body;
-    const recipient = toEmail || req.user?.email;
+    const recipient = String(toEmail || process.env.TEST_EMAIL_RECIPIENT || req.user?.email || '').trim();
 
-    if (!recipient) {
-      res.status(400).json({ error: 'Target email address is required' });
+    if (!recipient || !recipient.includes('@')) {
+      res.status(400).json({ error: 'A valid single test recipient email address is required' });
       return;
     }
 
-    const result = await sendEmail({
+    const result = await sendSingleTestEmail(recipient, req.user?.uid);
+
+    if (!result.success || !result.accepted) {
+      res.status(400).json({
+        success: false,
+        accepted: false,
+        from: result.from,
+        to: recipient,
+        statusCode: result.statusCode,
+        error: result.error || 'Failed to send test email via Resend'
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      accepted: true,
+      messageId: result.messageId,
+      from: result.from,
       to: recipient,
-      subject: '🔥 FIREVPNs Email System Test',
-      html: `
-        <h1 style="color: #38bdf8;">FIREVPNs Email Notification System</h1>
-        <p>This is a test email sent from your FIREVPNs Admin Panel.</p>
-        <p>If you are receiving this message, your Resend API configuration is <strong>100% active and working!</strong></p>
-      `,
-      eventType: 'test_email',
-      referenceId: `test_${Date.now()}`,
-      userId: req.user?.uid
+      message: `Test email accepted by Resend for ${recipient} (ID: ${result.messageId})`
     });
-
-    if (!result.success) {
-      res.status(400).json({ error: result.error || 'Failed to send test email' });
-      return;
-    }
-
-    res.json({ success: true, message: `Test email sent successfully to ${recipient}` });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 

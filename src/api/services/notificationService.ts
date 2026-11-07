@@ -299,12 +299,14 @@ export const checkAndCreateExpiryNotifications = async (
 
       // Preserve existing expiry email notifications.
       if (userEmail) {
+        const expiryIso = new Date(expMs).toISOString();
         if (daysLeft > 0) {
           sendExpiryReminderEmail({
             userEmail,
             vpnAccountId: vpnUuid || cfg.id,
             packageName: vpnName,
             daysLeft,
+            expiryDate: expiryIso,
             userId: targetUserId
           }).catch(error =>
             console.warn(
@@ -317,6 +319,7 @@ export const checkAndCreateExpiryNotifications = async (
             userEmail,
             vpnAccountId: vpnUuid || cfg.id,
             packageName: vpnName,
+            expiryDate: expiryIso,
             userId: targetUserId
           }).catch(error =>
             console.warn(
@@ -332,6 +335,57 @@ export const checkAndCreateExpiryNotifications = async (
       '[NotificationService] Expiry notification sync error:',
       error.message || error
     );
+  }
+};
+
+let lastScheduledExpiryCheckAt = 0;
+
+export const runScheduledExpiryEmailCheck = async (): Promise<void> => {
+  const now = Date.now();
+  // Run at most once every 30 minutes to avoid redundant scans
+  if (now - lastScheduledExpiryCheckAt < 30 * 60 * 1000) {
+    return;
+  }
+  lastScheduledExpiryCheckAt = now;
+
+  try {
+    const { data: configs } = await supabaseAdmin
+      .from('vpn_configs')
+      .select('customer_uid')
+      .not('customer_uid', 'is', null);
+
+    if (!configs || configs.length === 0) return;
+
+    const uniqueUserIds = Array.from(
+      new Set(
+        configs
+          .map((c: any) => String(c.customer_uid || '').trim())
+          .filter((id: string) => id && !['N/A', 'null', 'undefined'].includes(id))
+      )
+    );
+
+    if (uniqueUserIds.length === 0) return;
+
+    const { data: profiles } = await supabaseAdmin
+      .from('profiles')
+      .select('id, email')
+      .in('id', uniqueUserIds);
+
+    const emailMap = new Map<string, string>();
+    (profiles || []).forEach((p: any) => {
+      if (p.id && p.email) {
+        emailMap.set(String(p.id), String(p.email));
+      }
+    });
+
+    for (const uId of uniqueUserIds) {
+      const email = emailMap.get(uId) || '';
+      if (email) {
+        await checkAndCreateExpiryNotifications(uId, email);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[NotificationService] Scheduled expiry email check warning:', err?.message || err);
   }
 };
 

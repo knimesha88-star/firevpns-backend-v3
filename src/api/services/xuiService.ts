@@ -1,8 +1,8 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
-import { createCustomerNotification } from './notificationService.js';
-import { sendPaymentApprovedEmail, sendTrialApprovedEmail } from './emailService.js';
+import { createCustomerNotification, runScheduledExpiryEmailCheck } from './notificationService.js';
+import { sendPaymentApprovedEmail, sendTrialApprovedEmail, sendVpnExpiredEmail } from './emailService.js';
 
 import crypto from 'crypto';
 
@@ -1574,11 +1574,13 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
     // Trigger Email Notification (non-blocking)
     if (order.email) {
+      const canonicalOrderId = order.order_id || order.id;
       if (isTrialOrder) {
         sendTrialApprovedEmail({
           userEmail: order.email,
-          trialId: order.id,
-          orderId: order.order_id || order.id,
+          customerName: extra.customerName || undefined,
+          trialId: canonicalOrderId,
+          orderId: canonicalOrderId,
           packageName,
           vlessUrl,
           expiryDate: new Date(expiryMs).toISOString(),
@@ -1878,6 +1880,26 @@ export const cleanupExpiredTrials = async (inboundsList?: XuiInbound[]): Promise
             } catch (notifCreateErr: any) {
               console.error(`[Trial Expiry Scheduler] Error creating notification:`, notifCreateErr.message || notifCreateErr);
             }
+
+            // Also send expiration email non-blockingly
+            (async () => {
+              let resolvedEmail = targetEmail;
+              if (!resolvedEmail && targetUserId) {
+                const { data: prof } = await dbClient.from('profiles').select('email').eq('id', targetUserId).maybeSingle();
+                resolvedEmail = prof?.email || '';
+              }
+              if (resolvedEmail && resolvedEmail.includes('@')) {
+                await sendVpnExpiredEmail({
+                  userEmail: resolvedEmail,
+                  vpnAccountId: trial.uuid || trial.id,
+                  packageName: trial.packageName,
+                  expiryDate: trial.expiryMs ? new Date(trial.expiryMs).toISOString() : undefined,
+                  userId: targetUserId
+                });
+              }
+            })().catch(emailErr => {
+              console.warn('[Trial Expiry Scheduler] Trial expired email warning:', emailErr?.message || emailErr);
+            });
           }
         }
 
@@ -1986,6 +2008,11 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
       const syncResult = await syncDeleted3XUiClients(inbounds);
       deletedCount = syncResult.deletedCount;
     }
+
+    // 3. Run scheduled VPN expiry reminder & expiration email check (non-blocking)
+    runScheduledExpiryEmailCheck().catch(expErr => {
+      console.warn('[Background Sync] Scheduled expiry email check warning:', expErr?.message || expErr);
+    });
 
     lastSyncAt = Date.now();
     const durationSec = ((Date.now() - syncStartTime) / 1000).toFixed(1);

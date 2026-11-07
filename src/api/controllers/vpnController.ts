@@ -5,6 +5,7 @@ import * as xuiService from '../services/xuiService.js';
 import { supabase } from '../../lib/supabase.js';
 import { sendTrialRequestNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
+import { sendTrialApprovedEmail } from '../services/emailService.js';
 
 export const getMyConfigs = async (req: AuthRequest, res: Response): Promise<void> => {
   const reqStart = Date.now();
@@ -397,6 +398,20 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     } catch (notifErr: any) {
       console.error('[vpnController] Customer notification creation error:', notifErr);
     }
+
+    // 5.5 Ensure Free Trial Approved & VPN Activation email is sent (non-blocking, deduplicated by orderId)
+    sendTrialApprovedEmail({
+      userEmail: email,
+      customerName: finalCustomerName,
+      trialId: orderId,
+      orderId: orderId,
+      packageName: matchedTemplate.package_name,
+      vlessUrl: finalVlessUrl,
+      expiryDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      userId: uid
+    }).catch((emailErr: any) => {
+      console.warn('[vpnController] Free trial approved email warning:', emailErr?.message || emailErr);
+    });
 
     // 6. Send Telegram notification to Administrator
     try {

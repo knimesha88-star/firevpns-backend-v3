@@ -12,6 +12,7 @@ import threeXuiRoutes from './src/api/routes/threeXuiRoutes.js';
 import renewRoutes from './src/api/routes/renewRoutes.js';
 import vpnRoutes from './src/api/routes/vpnRoutes.js';
 import { errorMiddleware } from './src/api/middleware/errorMiddleware.js';
+import { triggerBackgroundSyncIfNeeded } from './src/api/services/xuiService.js';
 
 dotenv.config();
 
@@ -73,4 +74,25 @@ app.use(errorMiddleware);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend server running on port ${PORT}`);
+
+  const globalRef = global as any;
+  if (!globalRef.__bgSyncSchedulerInitialized) {
+    globalRef.__bgSyncSchedulerInitialized = true;
+    setTimeout(() => {
+      try {
+        triggerBackgroundSyncIfNeeded('Server Start', true);
+      } catch (err) {
+        console.error('[Scheduler] Initial background sync error:', err);
+      }
+    }, 5000);
+
+    setInterval(() => {
+      try {
+        triggerBackgroundSyncIfNeeded('Scheduled', false);
+      } catch (err) {
+        console.error('[Scheduler] Scheduled background sync error:', err);
+      }
+    }, 60000);
+  }
 });
+

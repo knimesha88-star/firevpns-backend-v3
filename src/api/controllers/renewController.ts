@@ -6,6 +6,9 @@ import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotif
 import { createCustomerNotification } from '../services/notificationService.js';
 import {
   sendOrderReceivedEmail,
+  sendPaymentApprovedEmail,
+  sendPaymentRejectedEmail,
+  sendRenewalRequestReceivedEmail,
   sendRenewalApprovedEmail,
   sendRenewalRejectedEmail
 } from '../services/emailService.js';
@@ -39,6 +42,22 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       });
     } catch (notifErr: any) {
       console.error('[RenewController] CRITICAL: Error creating Payment Submitted notification in createRenewRequest:', notifErr.message || notifErr);
+    }
+
+    // Send Renewal Request Submitted Email non-blockingly
+    if (customerEmail && customerEmail.includes('@')) {
+      sendRenewalRequestReceivedEmail({
+        userEmail: customerEmail,
+        renewalId: data.renewalId || data.id || undefined,
+        receiptNumber: notificationData.receiptNumber || undefined,
+        vpnAccountId: data.vpn_account_id || data.uuid || undefined,
+        packageName: notificationData.planName || 'FIREVPN Package',
+        durationMonths: Number(notificationData.durationMonths) || 1,
+        amount: Number(notificationData.amount) || 0,
+        userId: req.user?.uid || data.userId
+      }).catch((emailErr) => {
+        console.warn('[RenewController] Renewal request received email warning:', emailErr?.message || emailErr);
+      });
     }
 
     // Send Telegram Notification safely without crashing or rejecting request
@@ -309,6 +328,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     if (email) {
       sendRenewalApprovedEmail({
         userEmail: email,
+        customerName: data.user_name || parsedNotes?.user_name || undefined,
         renewalId: requestId,
         packageName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
         expiryDate: new_expiryIso,
@@ -394,6 +414,7 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
     if (email) {
       sendRenewalRejectedEmail({
         userEmail: email,
+        customerName: data.user_name || undefined,
         renewalId: requestId,
         packageName: data.plan_name || data.planName || 'VPN Plan',
         reason: reason,
@@ -473,7 +494,7 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       plan: data.plan || 'N/A',
       server: data.server || 'N/A',
       duration: data.duration || 'N/A',
-      packageType: data.packageType || 'N/A',
+      packageType: data.packageType || 'SIM Unlimited',
       amount: verifiedAmount,
       originalPrice: verifiedPrice.originalPrice,
       discountAmount: verifiedPrice.discountAmount,
@@ -547,6 +568,19 @@ export const notifyOrderApprove = async (req: AuthRequest, res: Response): Promi
       status: '🟢 COMPLETED'
     };
 
+    if (notificationData.customerEmail && notificationData.customerEmail !== 'N/A' && notificationData.orderId !== 'N/A') {
+      sendPaymentApprovedEmail({
+        userEmail: notificationData.customerEmail,
+        orderId: notificationData.orderId,
+        packageName: notificationData.packageName,
+        vlessUrl: data.vlessUrl || undefined,
+        expiryDate: data.expiryDate || undefined,
+        userId: data.userId || undefined
+      }).catch((err) => {
+        console.warn('[RenewController] Order approve email warning:', err?.message || err);
+      });
+    }
+
     sendOrderApprovedNotification(notificationData).catch((err) => {
       console.error('[RenewController] Telegram order approve notification error:', err?.message || err);
     });
@@ -570,6 +604,18 @@ export const notifyOrderReject = async (req: AuthRequest, res: Response): Promis
       reason: data.reason || 'Payment not received'
     };
 
+    if (notificationData.customerEmail && notificationData.customerEmail !== 'N/A') {
+      sendPaymentRejectedEmail({
+        userEmail: notificationData.customerEmail,
+        orderId: data.orderId || `order_${notificationData.customerEmail}`,
+        packageName: data.packageName || data.package || data.plan || 'VPN Plan',
+        reason: notificationData.reason,
+        userId: data.userId || undefined
+      }).catch((err) => {
+        console.warn('[RenewController] Order reject email warning:', err?.message || err);
+      });
+    }
+
     sendOrderRejectedNotification(notificationData).catch((err) => {
       console.error('[RenewController] Telegram order reject notification error:', err?.message || err);
     });
@@ -583,3 +629,4 @@ export const notifyOrderReject = async (req: AuthRequest, res: Response): Promis
     res.status(500).json({ error: error.message });
   }
 };
+
