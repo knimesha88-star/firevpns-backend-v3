@@ -6,159 +6,60 @@ import {
   getAllAvailablePackages,
   createDiscount,
   updateDiscount,
+  toggleDiscountStatus,
   deleteDiscount,
+  computeDiscountStatus,
   calculateVerifiedOrderPrice,
+  getLivePlanPricing,
+  saveLivePlanPricing,
+  invalidatePricingCache,
 } from '../services/discountService.js';
 
-function extractBearerToken(req: Request): string | undefined {
-  const authHeader = req.headers.authorization || (req.headers as any)?.Authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    return authHeader.slice(7).trim();
+function extractToken(req: Request): string | undefined {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.split('Bearer ')[1].trim();
   }
   return undefined;
 }
 
-export const getAdminDiscountsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const token = extractBearerToken(req);
-    const [discounts, packages] = await Promise.all([
-      getAllDiscounts(token),
-      getAllAvailablePackages(),
-    ]);
-    res.json({
-      success: true,
-      discounts,
-      packages,
-    });
-  } catch (err: any) {
-    console.error('[DiscountController] Error fetching admin discounts:', err);
-    res.status(500).json({ error: err.message || 'Failed to load discounts.' });
-  }
-};
-
-export const createAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const token = extractBearerToken(req);
-    const { name, discount_amount, package_ids, start_date, end_date, is_active } = req.body || {};
-    const created = await createDiscount(
-      {
-        name,
-        discount_amount: Number(discount_amount),
-        package_ids: Array.isArray(package_ids) ? package_ids : [],
-        start_date,
-        end_date,
-        is_active: is_active !== undefined ? Boolean(is_active) : true,
-      },
-      token
-    );
-    res.status(201).json({
-      success: true,
-      discount: created,
-    });
-  } catch (err: any) {
-    console.warn('[DiscountController] Validation/creation error:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to create discount.' });
-  }
-};
-
-export const updateAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const token = extractBearerToken(req);
-    const { id } = req.params;
-    if (!id) {
-      res.status(400).json({ error: 'Discount ID is required.' });
-      return;
-    }
-    const { name, discount_amount, package_ids, start_date, end_date, is_active } = req.body || {};
-    const updated = await updateDiscount(
-      id,
-      {
-        ...(name !== undefined ? { name } : {}),
-        ...(discount_amount !== undefined ? { discount_amount: Number(discount_amount) } : {}),
-        ...(package_ids !== undefined ? { package_ids } : {}),
-        ...(start_date !== undefined ? { start_date } : {}),
-        ...(end_date !== undefined ? { end_date } : {}),
-        ...(is_active !== undefined ? { is_active: Boolean(is_active) } : {}),
-      },
-      token
-    );
-    res.json({
-      success: true,
-      discount: updated,
-    });
-  } catch (err: any) {
-    console.warn('[DiscountController] Update error:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to update discount.' });
-  }
-};
-
-export const toggleAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const token = extractBearerToken(req);
-    const { id } = req.params;
-    if (!id) {
-      res.status(400).json({ error: 'Discount ID is required.' });
-      return;
-    }
-    const { is_active } = req.body || {};
-    if (typeof is_active !== 'boolean') {
-      res.status(400).json({ error: 'is_active boolean is required.' });
-      return;
-    }
-    const updated = await updateDiscount(id, { is_active }, token);
-    res.json({
-      success: true,
-      discount: updated,
-    });
-  } catch (err: any) {
-    console.warn('[DiscountController] Toggle error:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to update discount status.' });
-  }
-};
-
-export const deleteAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const token = extractBearerToken(req);
-    const { id } = req.params;
-    if (!id) {
-      res.status(400).json({ error: 'Discount ID is required.' });
-      return;
-    }
-    await deleteDiscount(id, token);
-    res.json({
-      success: true,
-      message: 'Discount deleted successfully.',
-    });
-  } catch (err: any) {
-    console.warn('[DiscountController] Delete error:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to delete discount.' });
-  }
-};
-
+/**
+ * GET /api/vpn/discounts/active
+ * Public endpoint returning currently active discounts, available packages, and live package pricing for the Store UI.
+ */
 export const getPublicActiveDiscountsHandler = async (_req: Request, res: Response): Promise<void> => {
   try {
-    const discounts = await getActiveDiscounts(new Date());
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const [activeDiscounts, packages, plans] = await Promise.all([
+      getActiveDiscounts(),
+      getAllAvailablePackages(undefined, true),
+      getLivePlanPricing(true),
+    ]);
     res.json({
-      success: true,
-      discounts,
+      discounts: activeDiscounts,
+      packages,
+      plans,
       serverTime: new Date().toISOString(),
     });
-  } catch (err: any) {
-    console.error('[DiscountController] Error fetching active discounts:', err);
-    res.status(500).json({ error: err.message || 'Failed to fetch active discounts.' });
+  } catch (error: any) {
+    console.error('[DiscountController] Error fetching active discounts:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch active discounts' });
   }
 };
 
+/**
+ * POST /api/vpn/validate-order-price
+ * Server-side price & discount calculation and validation before order creation.
+ */
 export const validateOrderPriceHandler = async (req: Request, res: Response): Promise<void> => {
   try {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const {
       packageId,
       packageName,
       category,
       packageType,
       duration,
-      submittedOriginalPrice,
-      submittedDiscountAmount,
       submittedFinalPrice,
     } = req.body || {};
 
@@ -170,55 +71,245 @@ export const validateOrderPriceHandler = async (req: Request, res: Response): Pr
       duration,
     });
 
-    // Check if the client attempted to tamper with discount amount or final price
-    if (
-      submittedDiscountAmount !== undefined &&
-      submittedDiscountAmount !== null &&
-      Number(submittedDiscountAmount) !== verified.discountAmount
-    ) {
-      res.status(400).json({
-        success: false,
-        tampered: true,
-        error: `Invalid discount amount (LKR ${submittedDiscountAmount}). Server verified discount for this package is LKR ${verified.discountAmount}.`,
-        verified,
-      });
-      return;
-    }
-
-    if (
-      submittedFinalPrice !== undefined &&
-      submittedFinalPrice !== null &&
-      Number(submittedFinalPrice) !== verified.finalPrice
-    ) {
-      res.status(400).json({
-        success: false,
-        tampered: true,
-        error: `Invalid order total (LKR ${submittedFinalPrice}). Server verified final price for this package is LKR ${verified.finalPrice}.`,
-        verified,
-      });
-      return;
-    }
-
-    if (
-      submittedOriginalPrice !== undefined &&
-      submittedOriginalPrice !== null &&
-      Number(submittedOriginalPrice) !== verified.originalPrice
-    ) {
-      res.status(400).json({
-        success: false,
-        tampered: true,
-        error: `Invalid original package price (LKR ${submittedOriginalPrice}). Server verified original price is LKR ${verified.originalPrice}.`,
-        verified,
-      });
-      return;
+    if (submittedFinalPrice !== undefined && submittedFinalPrice !== null) {
+      const clientPrice = Math.round(Number(submittedFinalPrice));
+      if (!Number.isFinite(clientPrice) || clientPrice <= 0 || clientPrice !== verified.finalPrice) {
+        res.status(400).json({
+          valid: false,
+          priceChanged: true,
+          error: `The price for this package has been updated to LKR ${verified.finalPrice}. Please review the updated total and confirm your order again.`,
+          submittedFinalPrice: clientPrice,
+          verified,
+        });
+        return;
+      }
     }
 
     res.json({
-      success: true,
+      valid: true,
+      priceChanged: false,
       verified,
     });
-  } catch (err: any) {
-    console.error('[DiscountController] Error validating order price:', err);
-    res.status(500).json({ error: err.message || 'Failed to validate order price.' });
+  } catch (error: any) {
+    console.error('[DiscountController] Error validating order price:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Failed to validate order price' });
+  }
+};
+
+/**
+ * GET /api/admin/discounts
+ * Admin endpoint returning all discounts with computed status, available packages, and live plan pricing.
+ */
+export const getAdminDiscountsHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const token = extractToken(req);
+    const [discounts, packages, plans] = await Promise.all([
+      getAllDiscounts(token),
+      getAllAvailablePackages(token, true),
+      getLivePlanPricing(true, token),
+    ]);
+
+    const nowMs = Date.now();
+    const enriched = discounts.map((d) => ({
+      ...d,
+      status: computeDiscountStatus(d, nowMs),
+    }));
+
+    res.json({
+      discounts: enriched,
+      packages,
+      plans,
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error fetching admin discounts:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch discounts' });
+  }
+};
+
+/**
+ * POST /api/admin/pricing
+ * Admin endpoint to save package prices in Supabase `settings` (id = 'app') and invalidate pricing cache.
+ */
+export const saveAdminPricingHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const token = extractToken(req);
+    const { sim100, simUnlimited, routerUnlimited, packagePrices, plans } = req.body || {};
+
+    const updatedPlans = await saveLivePlanPricing(
+      {
+        sim100: sim100 ?? plans?.sim100,
+        simUnlimited: simUnlimited ?? plans?.simUnlimited,
+        routerUnlimited: routerUnlimited ?? plans?.routerUnlimited,
+        packagePrices: packagePrices ?? plans?.packagePrices,
+      },
+      token
+    );
+
+    const packages = await getAllAvailablePackages(token, true);
+
+    res.json({
+      success: true,
+      plans: updatedPlans,
+      packages,
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error saving admin pricing:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'Failed to save package prices' });
+  }
+};
+
+/**
+ * POST /api/admin/pricing/invalidate
+ * Admin endpoint to immediately invalidate backend cached pricing after settings update.
+ */
+export const invalidateAdminPricingHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const token = extractToken(req);
+    invalidatePricingCache();
+    const [plans, packages] = await Promise.all([
+      getLivePlanPricing(true, token),
+      getAllAvailablePackages(token, true),
+    ]);
+    res.json({
+      success: true,
+      plans,
+      packages,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to refresh pricing cache' });
+  }
+};
+
+/**
+ * POST /api/admin/discounts
+ */
+export const createAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const token = extractToken(req);
+    const created = await createDiscount(
+      {
+        name: req.body?.name,
+        description: req.body?.description,
+        discount_type: req.body?.discount_type,
+        discount_amount: Number(req.body?.discount_amount),
+        discount_percentage:
+          req.body?.discount_percentage !== undefined ? Number(req.body?.discount_percentage) : null,
+        package_ids: Array.isArray(req.body?.package_ids) ? req.body.package_ids : [],
+        start_date: req.body?.start_date || null,
+        end_date: req.body?.end_date || null,
+        is_active: req.body?.is_active ?? true,
+        banner_text: req.body?.banner_text || null,
+        badge_text: req.body?.badge_text || null,
+      },
+      token
+    );
+
+    res.status(201).json({
+      success: true,
+      discount: {
+        ...created,
+        status: computeDiscountStatus(created),
+      },
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error creating discount:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'Failed to create discount' });
+  }
+};
+
+/**
+ * PUT /api/admin/discounts/:id
+ */
+export const updateAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      res.status(400).json({ error: 'Discount ID is required' });
+      return;
+    }
+
+    const token = extractToken(req);
+    const updated = await updateDiscount(
+      id,
+      {
+        name: req.body?.name,
+        description: req.body?.description,
+        discount_type: req.body?.discount_type,
+        discount_amount: Number(req.body?.discount_amount),
+        discount_percentage:
+          req.body?.discount_percentage !== undefined ? Number(req.body?.discount_percentage) : null,
+        package_ids: Array.isArray(req.body?.package_ids) ? req.body.package_ids : [],
+        start_date: req.body?.start_date || null,
+        end_date: req.body?.end_date || null,
+        is_active: req.body?.is_active ?? true,
+        banner_text: req.body?.banner_text || null,
+        badge_text: req.body?.badge_text || null,
+      },
+      token
+    );
+
+    res.json({
+      success: true,
+      discount: {
+        ...updated,
+        status: computeDiscountStatus(updated),
+      },
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error updating discount:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'Failed to update discount' });
+  }
+};
+
+/**
+ * PATCH / PUT / POST /api/admin/discounts/:id/status
+ */
+export const toggleAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      res.status(400).json({ error: 'Discount ID is required' });
+      return;
+    }
+
+    const token = extractToken(req);
+    const isActive = Boolean(req.body?.is_active);
+    const updated = await toggleDiscountStatus(id, isActive, token);
+
+    res.json({
+      success: true,
+      discount: {
+        ...updated,
+        status: computeDiscountStatus(updated),
+      },
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error toggling discount status:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'Failed to update discount status' });
+  }
+};
+
+/**
+ * DELETE /api/admin/discounts/:id
+ */
+export const deleteAdminDiscountHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      res.status(400).json({ error: 'Discount ID is required' });
+      return;
+    }
+
+    const token = extractToken(req);
+    await deleteDiscount(id, token);
+
+    res.json({
+      success: true,
+      message: 'Discount deleted successfully',
+    });
+  } catch (error: any) {
+    console.error('[DiscountController] Error deleting discount:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'Failed to delete discount' });
   }
 };

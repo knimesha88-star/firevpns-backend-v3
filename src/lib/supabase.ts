@@ -28,3 +28,5 @@ export const getSupabaseClient = (_token?: string) => {
   return supabaseAdmin;
 };
 
+export const getAuthenticatedSupabase = getSupabaseClient;
+

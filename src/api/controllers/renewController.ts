@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
-import { supabase } from '../../lib/supabase.js';
+import { supabase, supabaseAdmin } from '../../lib/supabase.js';
 import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
 import {
@@ -452,9 +452,10 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
     // If orderDocId or orderId is present in Supabase, ensure the stored order record reflects the server-verified price & discount
     if (data.orderDocId || data.orderId) {
       try {
+        const dbClient = supabaseAdmin || supabase;
         const orderLookupCol = data.orderDocId ? 'id' : 'order_id';
         const orderLookupVal = data.orderDocId || data.orderId;
-        const { data: existingOrder } = await supabase
+        const { data: existingOrder } = await dbClient
           .from('orders')
           .select('id, amount, payment_method')
           .eq(orderLookupCol, orderLookupVal)
@@ -471,11 +472,12 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
           }
           extra.original_price = verifiedPrice.originalPrice;
           extra.discount_amount = verifiedPrice.discountAmount;
+          extra.discount_percentage = verifiedPrice.discountPercentage;
           extra.final_price = verifiedPrice.finalPrice;
           extra.discount_id = verifiedPrice.appliedDiscount?.id || null;
           extra.discount_name = verifiedPrice.appliedDiscount?.name || null;
 
-          await supabase
+          await dbClient
             .from('orders')
             .update({
               amount: verifiedAmount,
