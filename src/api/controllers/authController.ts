@@ -11,12 +11,14 @@ export const verifySession = async (req: AuthRequest, res: Response): Promise<vo
 };
 
 export const getTurnstilePublicConfig = (_req: Request, res: Response): void => {
-  const siteKey = (process.env.VITE_TURNSTILE_SITE_KEY || process.env.TURNSTILE_SITE_KEY || '').trim();
+  const rawSiteKey = process.env.VITE_TURNSTILE_SITE_KEY || process.env.TURNSTILE_SITE_KEY || '';
+  const siteKey = rawSiteKey.replace(/^['"]+|['"]+$/g, '').trim();
   const allowedHostnames = getAllowedHostnames();
   res.json({
     success: true,
     siteKey,
     allowedHostname: allowedHostnames[0] || 'firevpnsvip.qzz.io',
+    allowedHostnames,
   });
 };
 

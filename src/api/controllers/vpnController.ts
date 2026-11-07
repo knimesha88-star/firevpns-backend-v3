@@ -108,7 +108,10 @@ export const getClaimedTrials = async (req: AuthRequest, res: Response): Promise
 };
 
 export const claimTrial = async (req: AuthRequest, res: Response): Promise<void> => {
-  const reqPayload = req.body;
+  const reqPayload = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+  if ('turnstileToken' in reqPayload) reqPayload.turnstileToken = '[REDACTED]';
+  if ('captchaToken' in reqPayload) reqPayload.captchaToken = '[REDACTED]';
+  if ('cf-turnstile-response' in reqPayload) reqPayload['cf-turnstile-response'] = '[REDACTED]';
   const file = 'backend/src/api/controllers/vpnController.ts';
   let line = 102;
   console.log('[vpnController] Incoming claimTrial request payload:', JSON.stringify(reqPayload, null, 2));

@@ -22,6 +22,9 @@ export const turnstileMiddleware = async (
   const result = await verifyTurnstileToken(token, clientIp);
 
   if (!result.valid) {
+    console.warn(
+      `[TurnstileMiddleware] Blocked ${req.method} ${req.originalUrl} -> status=${result.statusCode}, code=${result.code || 'TURNSTILE_VERIFICATION_FAILED'}, hostname=${result.hostname || '(none)'}`
+    );
     res.status(result.statusCode).json({
       success: false,
       error: result.error || 'Security verification (CAPTCHA) failed.',

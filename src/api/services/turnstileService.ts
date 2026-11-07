@@ -6,7 +6,7 @@ const SITEVERIFY_TIMEOUT_MS = 8000;
 const TOKEN_MAX_AGE_MS = 5 * 60 * 1000; // Cloudflare Turnstile tokens expire after 300 seconds (5 minutes)
 const CONSUMED_TOKEN_TTL_MS = 10 * 60 * 1000; // Keep consumed token hashes for 10 minutes to prevent replay
 
-// In-memory replay protection (stores SHA-256 hashes of tokens, never raw secrets)
+// In-memory replay protection (stores SHA-256 hashes of tokens, never raw secrets or raw tokens)
 const consumedTokenHashes = new Map<string, number>();
 const inFlightTokenHashes = new Set<string>();
 
@@ -24,7 +24,23 @@ export interface TurnstileVerificationResult {
 export interface VerifyTurnstileOptions {
   secretKey?: string;
   allowedHostnames?: string[];
+  expectedAction?: string | string[];
   siteverifyUrl?: string;
+}
+
+function sanitizeEnvValue(raw?: string | null): string {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw.replace(/^['"]+|['"]+$/g, '').trim();
+}
+
+function normalizeHostname(raw: string): string {
+  return raw
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace(/:\d+$/, '');
 }
 
 function hashToken(token: string): string {
@@ -44,12 +60,12 @@ function cleanupExpiredTokenHashes(): void {
 
 export function getAllowedHostnames(overrideHostnames?: string[]): string[] {
   if (overrideHostnames && overrideHostnames.length > 0) {
-    return overrideHostnames.map((h) => h.trim().toLowerCase()).filter(Boolean);
+    return overrideHostnames.map(normalizeHostname).filter(Boolean);
   }
-  const raw = process.env.TURNSTILE_ALLOWED_HOSTNAME || 'firevpnsvip.qzz.io';
+  const raw = sanitizeEnvValue(process.env.TURNSTILE_ALLOWED_HOSTNAME) || 'firevpnsvip.qzz.io';
   const parsed = raw
     .split(',')
-    .map((h) => h.trim().toLowerCase())
+    .map(normalizeHostname)
     .filter(Boolean);
 
   return parsed.length > 0 ? parsed : ['firevpnsvip.qzz.io'];
@@ -97,6 +113,7 @@ export async function verifyTurnstileToken(
 ): Promise<TurnstileVerificationResult> {
   // 1. Validate token presence and format
   if (typeof token !== 'string' || token.trim().length === 0) {
+    console.warn('[Turnstile] Verification rejected: missing token in request.');
     return {
       valid: false,
       statusCode: 400,
@@ -107,6 +124,7 @@ export async function verifyTurnstileToken(
 
   const trimmedToken = token.trim();
   if (trimmedToken.length > 4096) {
+    console.warn(`[Turnstile] Verification rejected: token length (${trimmedToken.length}) exceeds maximum limit.`);
     return {
       valid: false,
       statusCode: 400,
@@ -117,11 +135,13 @@ export async function verifyTurnstileToken(
 
   cleanupExpiredTokenHashes();
   const tokenHash = hashToken(trimmedToken);
+  const shortFingerprint = tokenHash.slice(0, 10);
   const now = Date.now();
 
   // 2. Reject reused or concurrently re-submitted tokens immediately (never verify a token twice)
   const existingExpiry = consumedTokenHashes.get(tokenHash);
   if ((existingExpiry && existingExpiry > now) || inFlightTokenHashes.has(tokenHash)) {
+    console.warn(`[Turnstile] Verification rejected: token reuse detected (fingerprint=${shortFingerprint}).`);
     return {
       valid: false,
       statusCode: 400,
@@ -131,7 +151,7 @@ export async function verifyTurnstileToken(
   }
 
   // 3. Check secret key configuration (fail closed if missing)
-  const secretKey = (options?.secretKey ?? process.env.TURNSTILE_SECRET_KEY ?? '').trim();
+  const secretKey = sanitizeEnvValue(options?.secretKey ?? process.env.TURNSTILE_SECRET_KEY);
   if (!secretKey) {
     console.error('[Turnstile] Verification failed closed: TURNSTILE_SECRET_KEY is not configured on the server.');
     return {
@@ -148,7 +168,7 @@ export async function verifyTurnstileToken(
     const formData = new URLSearchParams();
     formData.append('secret', secretKey);
     formData.append('response', trimmedToken);
-    if (remoteIp) {
+    if (remoteIp && !remoteIp.startsWith('127.') && remoteIp !== '::1') {
       formData.append('remoteip', remoteIp);
     }
     formData.append('idempotency_key', crypto.randomUUID());
@@ -164,7 +184,7 @@ export async function verifyTurnstileToken(
     });
 
     if (!response.ok) {
-      console.error(`[Turnstile] Cloudflare Siteverify returned HTTP ${response.status}`);
+      console.error(`[Turnstile] Cloudflare Siteverify returned HTTP ${response.status} (fingerprint=${shortFingerprint})`);
       return {
         valid: false,
         statusCode: 503,
@@ -175,7 +195,7 @@ export async function verifyTurnstileToken(
 
     const data: any = await response.json().catch(() => null);
     if (!data || typeof data !== 'object') {
-      console.error('[Turnstile] Cloudflare Siteverify returned invalid JSON');
+      console.error(`[Turnstile] Cloudflare Siteverify returned invalid JSON (fingerprint=${shortFingerprint})`);
       return {
         valid: false,
         statusCode: 503,
@@ -185,6 +205,13 @@ export async function verifyTurnstileToken(
     }
 
     const errorCodes: string[] = Array.isArray(data['error-codes']) ? data['error-codes'] : [];
+    const allowedHostnames = getAllowedHostnames(options?.allowedHostnames);
+    const verifiedHostname = normalizeHostname(String(data.hostname || ''));
+    const verifiedAction = typeof data.action === 'string' ? data.action.trim() : '';
+
+    console.info(
+      `[Turnstile] Siteverify response (fingerprint=${shortFingerprint}): success=${Boolean(data.success)}, hostname="${verifiedHostname || '(none)'}", expectedHostnames=[${allowedHostnames.join(', ')}], action="${verifiedAction || '(none)'}", errorCodes=[${errorCodes.join(', ')}]`
+    );
 
     if (data.success !== true) {
       // Mark token hash as consumed so invalid/expired tokens are never sent to Siteverify a second time
@@ -234,12 +261,9 @@ export async function verifyTurnstileToken(
     consumedTokenHashes.set(tokenHash, Date.now() + CONSUMED_TOKEN_TTL_MS);
 
     // 4. Verify hostname matches firevpnsvip.qzz.io (or configured TURNSTILE_ALLOWED_HOSTNAME)
-    const allowedHostnames = getAllowedHostnames(options?.allowedHostnames);
-    const verifiedHostname = String(data.hostname || '').trim().toLowerCase();
-
     if (!verifiedHostname || !allowedHostnames.includes(verifiedHostname)) {
       console.warn(
-        `[Turnstile] Hostname mismatch: token hostname '${verifiedHostname || '(empty)'}' not in allowed list [${allowedHostnames.join(', ')}]`
+        `[Turnstile] Hostname mismatch (fingerprint=${shortFingerprint}): token hostname '${verifiedHostname || '(empty)'}' not in allowed list [${allowedHostnames.join(', ')}]`
       );
       return {
         valid: false,
@@ -250,7 +274,27 @@ export async function verifyTurnstileToken(
       };
     }
 
-    // 5. Verify challenge timestamp age (reject expired tokens > 5 minutes old)
+    // 5. Verify action if expectedAction was specified and token includes an action
+    if (options?.expectedAction && verifiedAction) {
+      const allowedActions = Array.isArray(options.expectedAction)
+        ? options.expectedAction
+        : [options.expectedAction];
+      if (!allowedActions.includes(verifiedAction)) {
+        console.warn(
+          `[Turnstile] Action mismatch (fingerprint=${shortFingerprint}): token action '${verifiedAction}' not in [${allowedActions.join(', ')}]`
+        );
+        return {
+          valid: false,
+          statusCode: 400,
+          error: 'Security verification failed: invalid challenge action.',
+          code: 'TURNSTILE_ACTION_MISMATCH',
+          hostname: verifiedHostname,
+          action: verifiedAction,
+        };
+      }
+    }
+
+    // 6. Verify challenge timestamp age (reject expired tokens > 5 minutes old)
     if (data.challenge_ts) {
       const challengeTimeMs = new Date(data.challenge_ts).getTime();
       if (!isNaN(challengeTimeMs) && Date.now() - challengeTimeMs > TOKEN_MAX_AGE_MS) {
@@ -270,7 +314,7 @@ export async function verifyTurnstileToken(
       statusCode: 200,
       hostname: verifiedHostname,
       challengeTs: data.challenge_ts,
-      action: data.action,
+      action: verifiedAction || undefined,
     };
   } catch (err: any) {
     // Fail closed if Siteverify is unreachable or times out
