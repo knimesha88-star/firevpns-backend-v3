@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { approveRenewRequest, rejectRenewRequest, createRenewRequest, createOrderNotification, notifyOrderApprove, notifyOrderReject } from '../controllers/renewController.js';
+import { approveRenewRequest, rejectRenewRequest, createRenewRequest, validateRenewPrice, createOrderNotification, notifyOrderApprove, notifyOrderReject } from '../controllers/renewController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { adminMiddleware } from '../middleware/adminMiddleware.js';
 
@@ -7,6 +7,9 @@ const router = Router();
 
 // Protect renewal endpoints with authentication
 router.use(authMiddleware);
+
+// Endpoint for customers to authoritatively validate renewal duration & Special Offer pricing
+router.post('/validate-price', validateRenewPrice);
 
 // Endpoint for customers to submit / notify new renewal request
 router.post('/request', createRenewRequest);

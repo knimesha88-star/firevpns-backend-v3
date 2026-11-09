@@ -461,6 +461,52 @@ export const buildPaymentApprovedTemplate = (data: {
   });
 };
 
+export const buildOrderCompletedTemplate = (data: {
+  customerName?: string;
+  orderId: string;
+  packageName: string;
+  vlessUrl?: string;
+  expiryDate?: string;
+}): RenderedEmailTemplate => {
+  const subject = 'Your FIREVPNs Order Is Completed!';
+  const formattedExpiry = data.expiryDate
+    ? new Date(data.expiryDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+    : 'N/A';
+
+  return renderBrandedEmail({
+    subject,
+    preheader: `Your ${data.packageName} VPN configuration is ready and active.`,
+    badgeText: 'Order Completed',
+    badgeVariant: 'success',
+    heading: 'Your Order Is Completed!',
+    greetingName: data.customerName,
+    introParagraphs: [
+      `Your subscription order for <strong>${escapeHtml(data.packageName)}</strong> (Order #${escapeHtml(data.orderId)}) has been successfully completed and your VPN configuration is ready.`
+    ],
+    infoRows: [
+      { label: 'Order ID:', value: `#${data.orderId}` },
+      { label: 'Package:', value: data.packageName },
+      { label: 'Status:', value: 'Completed & Active', tone: 'success' },
+      { label: 'Expiry Date:', value: formattedExpiry }
+    ],
+    codeBlock: data.vlessUrl
+      ? {
+          title: 'Your VLESS Connection Link',
+          description: 'Import this link directly into v2rayNG, v2rayN, Shadowrocket, or Streisand:',
+          code: data.vlessUrl
+        }
+      : undefined,
+    outroParagraphs: [
+      'Please open your customer dashboard to view your complete VPN configuration, QR codes, and connection instructions.',
+      '<strong>Need Help?</strong><br>If you experience any issues with your order, payment verification, or VPN configuration, please contact our support team. We are happy to help you.<br><br><strong>WhatsApp / Phone Support:</strong> <a href="tel:0769225099">0769225099</a> · <a href="https://wa.me/94769225099" target="_blank">Chat on WhatsApp</a>'
+    ],
+    cta: {
+      label: 'Open Customer Dashboard',
+      url: `${BRAND_PORTAL_URL}/dashboard`
+    }
+  });
+};
+
 export const buildPaymentRejectedTemplate = (data: {
   customerName?: string;
   orderId: string;

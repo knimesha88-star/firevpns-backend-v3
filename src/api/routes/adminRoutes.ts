@@ -60,7 +60,30 @@ router.delete('/discounts/:id', deleteAdminDiscountHandler);
 router.post('/pricing', saveAdminPricingHandler);
 router.post('/pricing/invalidate', invalidateAdminPricingHandler);
 
+// Special Offers Management routes (Admin only)
+import {
+  getAdminSpecialOffersHandler,
+  createAdminSpecialOfferHandler,
+  updateAdminSpecialOfferHandler,
+  toggleAdminSpecialOfferHandler,
+  deleteAdminSpecialOfferHandler,
+} from '../controllers/specialOfferController.js';
+import { getPaymentSlipSignedUrlHandler } from '../controllers/paymentSlipController.js';
+router.get('/special-offers', getAdminSpecialOffersHandler);
+router.post('/special-offers', createAdminSpecialOfferHandler);
+router.put('/special-offers/:id', updateAdminSpecialOfferHandler);
+router.put('/special-offers/:id/status', toggleAdminSpecialOfferHandler);
+router.post('/special-offers/:id/status', toggleAdminSpecialOfferHandler);
+router.patch('/special-offers/:id/status', toggleAdminSpecialOfferHandler);
+router.delete('/special-offers/:id', deleteAdminSpecialOfferHandler);
+
+// Admin Payment Slips Signed URL routes
+router.get('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
+router.post('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
+
 export default router;
+
+
 
 
 

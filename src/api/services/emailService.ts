@@ -5,6 +5,7 @@ import {
   buildCustomerRegistrationTemplate,
   buildOrderReceivedTemplate,
   buildPaymentApprovedTemplate,
+  buildOrderCompletedTemplate,
   buildPaymentRejectedTemplate,
   buildRenewalRequestReceivedTemplate,
   buildRenewalApprovedTemplate,
@@ -25,6 +26,7 @@ export {
   buildCustomerRegistrationTemplate,
   buildOrderReceivedTemplate,
   buildPaymentApprovedTemplate,
+  buildOrderCompletedTemplate,
   buildPaymentRejectedTemplate,
   buildRenewalRequestReceivedTemplate,
   buildRenewalApprovedTemplate,
@@ -117,6 +119,7 @@ const getDefaultEventsConfig = () => ({
   customer_registered: true,
   order_received: true,
   payment_approved: true,
+  order_completed: true,
   payment_rejected: true,
   renewal_requested: true,
   renewal_approved: true,
@@ -497,6 +500,28 @@ export const sendPaymentApprovedEmail = async (data: {
     html: rendered.html,
     text: rendered.text,
     eventType: 'payment_approved',
+    referenceId: data.orderId,
+    userId: data.userId
+  });
+};
+
+// 2.5 Order Completed Email
+export const sendOrderCompletedEmail = async (data: {
+  userEmail: string;
+  customerName?: string;
+  orderId: string;
+  packageName: string;
+  vlessUrl?: string;
+  expiryDate?: string;
+  userId?: string;
+}) => {
+  const rendered = buildOrderCompletedTemplate(data);
+  return sendEmail({
+    to: data.userEmail,
+    subject: rendered.subject,
+    html: rendered.html,
+    text: rendered.text,
+    eventType: 'order_completed',
     referenceId: data.orderId,
     userId: data.userId
   });

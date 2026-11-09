@@ -30,6 +30,9 @@ export interface StorePackageDefinition {
   packageType: 'SIM 100GB' | 'SIM Unlimited' | 'Router Unlimited';
   tierKey: 'sim100' | 'simUnlimited' | 'routerUnlimited';
   basePrice: number;
+  templateId?: string;
+  aliases?: string[];
+  enabled?: boolean;
 }
 
 export interface PlanPricingConfig {
@@ -47,20 +50,364 @@ export const DEFAULT_PLAN_PRICING: PlanPricingConfig = {
 };
 
 export const DEFAULT_STORE_PACKAGES: StorePackageDefinition[] = [
-  { id: 'dialog_router', name: 'DIALOG ROUTER PACKAGE', category: 'ROUTER', packageType: 'Router Unlimited', tierKey: 'routerUnlimited', basePrice: 600 },
-  { id: 'hutch_zoom', name: 'HUTCH ZOOM PACKAGE', category: 'SIM', packageType: 'SIM 100GB', tierKey: 'sim100', basePrice: 200 },
-  { id: 'dialog_zoom_224', name: 'DIALOG ZOOM 224', category: 'SIM', packageType: 'SIM 100GB', tierKey: 'sim100', basePrice: 200 },
-  { id: 'airtel_tiktok', name: 'AIRTEL TIKTOK PACKAGE', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
-  { id: 'airtel_zoom', name: 'AIRTEL ZOOM 225', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
-  { id: 'hutch_tu_299', name: 'HUTCH TU 299', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
-  { id: 'hutch_gaming', name: 'HUTCH GAMING PACKAGE', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
-  { id: 'dialog_tiktok', name: 'DIALOG TIKTOK', category: 'SIM', packageType: 'SIM 100GB', tierKey: 'sim100', basePrice: 200 },
-  { id: 'dialog_social', name: 'DIALOG SOCIAL MEDIA', category: 'SIM', packageType: 'SIM 100GB', tierKey: 'sim100', basePrice: 200 },
-  { id: 'slt_zoom', name: 'SLT FIBER ZOOM', category: 'ROUTER', packageType: 'Router Unlimited', tierKey: 'routerUnlimited', basePrice: 600 },
-  { id: 'slt_netflix', name: 'SLT FIBER NETFLIX', category: 'ROUTER', packageType: 'Router Unlimited', tierKey: 'routerUnlimited', basePrice: 600 },
-  { id: 'mobitel_zoom', name: 'MOBITEL ZOOM 224', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
-  { id: 'hutch_social', name: 'HUTCH SOCIAL MEDIA', category: 'SIM', packageType: 'SIM Unlimited', tierKey: 'simUnlimited', basePrice: 400 },
+  // SIM 100GB Packages
+  {
+    id: 'hutch_zoom',
+    name: 'HUTCH ZOOM',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 200,
+    templateId: '4ad3ae7e-5568-475b-8423-5275319bc76e',
+    aliases: [
+      'hutch_zoom',
+      'hutch zoom',
+      'hutch zoom package',
+      'hutch_zoom_package',
+      '4ad3ae7e-5568-475b-8423-5275319bc76e',
+    ],
+  },
+  {
+    id: 'dialog_tiktok',
+    name: 'DIALOG TIKTOK',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 200,
+    templateId: '056e852b-a813-4655-95de-eac6899c606a',
+    aliases: [
+      'dialog_tiktok',
+      'dialog tiktok',
+      'dialog tiktok package',
+      'dialog_tiktok_package',
+      '056e852b-a813-4655-95de-eac6899c606a',
+    ],
+  },
+  {
+    id: 'dialog_zoom_224',
+    name: 'DIALOG ZOOM 224',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 200,
+    templateId: '3085ff4c-3c00-4cf0-946c-d04245a29f21',
+    aliases: [
+      'dialog_zoom_224',
+      'dialog zoom 224',
+      'dialog zoom 224 package',
+      'dialog_zoom_224_package',
+      '3085ff4c-3c00-4cf0-946c-d04245a29f21',
+    ],
+  },
+  {
+    id: 'dialog_social',
+    name: 'DIALOG SOCIAL',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 200,
+    templateId: 'a5f6bd79-7e70-4bf9-bc61-2ae4d8dc90bb',
+    aliases: [
+      'dialog_social',
+      'dialog social',
+      'dialog social media',
+      'dialog_social_media',
+      'dialog social package',
+      'a5f6bd79-7e70-4bf9-bc61-2ae4d8dc90bb',
+    ],
+  },
+  // SIM Unlimited Packages
+  {
+    id: 'mobitel_zoom',
+    name: 'MOBITEL ZOOM',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    templateId: 'b642373f-a4a1-4cb6-8a9b-b64eda3bba6d',
+    aliases: [
+      'mobitel_zoom',
+      'mobitel zoom',
+      'mobitel zoom 224',
+      'mobitel_zoom_224',
+      'mobitel zoom package',
+      'b642373f-a4a1-4cb6-8a9b-b64eda3bba6d',
+    ],
+  },
+  {
+    id: 'airtel_tiktok',
+    name: 'AIRTEL TIKTOK',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    templateId: 'fe0dc35d-d565-48a3-9b80-a51487e71602',
+    aliases: [
+      'airtel_tiktok',
+      'airtel tiktok',
+      'airtel tiktok package',
+      'airtel_tiktok_package',
+      'fe0dc35d-d565-48a3-9b80-a51487e71602',
+    ],
+  },
+  {
+    id: 'airtel_youtube',
+    name: 'AIRTEL YOUTUBE',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    templateId: 'c99a78da-38c1-4170-8dd8-1a08e2a07603',
+    aliases: [
+      'airtel_youtube',
+      'airtel youtube',
+      'airtel youtube package',
+      'airtel_youtube_package',
+      'c99a78da-38c1-4170-8dd8-1a08e2a07603',
+    ],
+  },
+  {
+    id: 'airtel_zoom',
+    name: 'AIRTEL ZOOM',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    templateId: 'dc98d60e-6d25-452c-8115-611acd0621ce',
+    aliases: [
+      'airtel_zoom',
+      'airtel zoom',
+      'airtel zoom 225',
+      'airtel_zoom_225',
+      'airtel zoom package',
+      'dc98d60e-6d25-452c-8115-611acd0621ce',
+    ],
+  },
+  {
+    id: 'hutch_tu_299',
+    name: 'HUTCH TU 299',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    aliases: ['hutch_tu_299', 'hutch tu 299', 'hutch tu 299 package'],
+  },
+  {
+    id: 'hutch_gaming',
+    name: 'HUTCH GAMING PACKAGE',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    aliases: ['hutch_gaming', 'hutch gaming', 'hutch gaming package', 'hutch_gaming_package'],
+  },
+  {
+    id: 'hutch_social',
+    name: 'HUTCH SOCIAL MEDIA',
+    category: 'SIM',
+    packageType: 'SIM Unlimited',
+    tierKey: 'simUnlimited',
+    basePrice: 400,
+    aliases: ['hutch_social', 'hutch social', 'hutch social media', 'hutch_social_media'],
+  },
+  // Router Unlimited Packages
+  {
+    id: 'dialog_zoom',
+    name: 'DIALOG ZOOM',
+    category: 'ROUTER',
+    packageType: 'Router Unlimited',
+    tierKey: 'routerUnlimited',
+    basePrice: 600,
+    templateId: '6545fdc3-f703-4173-b1d0-3dc3672ee12f',
+    aliases: [
+      'dialog_zoom',
+      'dialog zoom',
+      'dialog_router',
+      'dialog router',
+      'dialog router package',
+      'dialog_router_package',
+      'dialog zoom router',
+      '6545fdc3-f703-4173-b1d0-3dc3672ee12f',
+    ],
+  },
+  {
+    id: 'slt_fiber_zoom',
+    name: 'SLT FIBER ZOOM',
+    category: 'ROUTER',
+    packageType: 'Router Unlimited',
+    tierKey: 'routerUnlimited',
+    basePrice: 600,
+    templateId: 'd27e7c88-0c74-4c99-b15a-07bd57a17bc1',
+    aliases: [
+      'slt_fiber_zoom',
+      'slt fiber zoom',
+      'slt fiber zoom package',
+      'slt_fiber_zoom_package',
+      'd27e7c88-0c74-4c99-b15a-07bd57a17bc1',
+    ],
+  },
+  {
+    id: 'slt_fiber_netflix',
+    name: 'SLT FIBER NETFLIX',
+    category: 'ROUTER',
+    packageType: 'Router Unlimited',
+    tierKey: 'routerUnlimited',
+    basePrice: 600,
+    templateId: '88775c59-c659-4c1b-8e3a-f5959f5afd16',
+    aliases: [
+      'slt_fiber_netflix',
+      'slt_netflix',
+      'slt fiber netflix',
+      'slt netflix',
+      'slt fiber netflix package',
+      '88775c59-c659-4c1b-8e3a-f5959f5afd16',
+    ],
+  },
+  {
+    id: 'slt_zoom',
+    name: 'SLT ZOOM',
+    category: 'ROUTER',
+    packageType: 'Router Unlimited',
+    tierKey: 'routerUnlimited',
+    basePrice: 600,
+    templateId: 'ffb81e1f-9d7c-430e-a63f-ba8f2b43f53a',
+    aliases: [
+      'slt_zoom',
+      'slt zoom',
+      'slt zoom package',
+      'slt_zoom_package',
+      'ffb81e1f-9d7c-430e-a63f-ba8f2b43f53a',
+    ],
+  },
 ];
+
+// Dynamic runtime registry for newly created provision_templates
+const dynamicPackageRegistry = new Map<string, StorePackageDefinition>();
+
+export function normalizePackageSlug(input?: string | null): string {
+  if (!input) return '';
+  return String(input)
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+
+export function stripPackageSuffix(slug: string): string {
+  return slug.replace(/_(package|media)$/i, '');
+}
+
+export function findCanonicalPackage(
+  idOrName?: string | null,
+  customPackages?: StorePackageDefinition[]
+): StorePackageDefinition | undefined {
+  if (!idOrName) return undefined;
+  const raw = String(idOrName).trim().toLowerCase();
+  if (!raw || raw === '*' || raw === 'all' || raw === 'all_packages') return undefined;
+
+  const slug = normalizePackageSlug(raw);
+  const strippedSlug = stripPackageSuffix(slug);
+
+  const searchList: StorePackageDefinition[] = [
+    ...DEFAULT_STORE_PACKAGES,
+    ...Array.from(dynamicPackageRegistry.values()),
+    ...(customPackages || []),
+  ];
+
+  // 1. Direct match on id, templateId, name, or explicit aliases
+  for (const pkg of searchList) {
+    if (pkg.id.toLowerCase() === raw || pkg.id.toLowerCase() === slug) return pkg;
+    if (pkg.templateId && pkg.templateId.toLowerCase() === raw) return pkg;
+    if (pkg.name.toLowerCase() === raw || normalizePackageSlug(pkg.name) === slug) return pkg;
+    if (
+      pkg.aliases?.some(
+        (a) => a.toLowerCase() === raw || normalizePackageSlug(a) === slug
+      )
+    ) {
+      return pkg;
+    }
+  }
+
+  // 2. Stripped suffix match (e.g. "hutch_zoom_package" -> "hutch_zoom")
+  if (strippedSlug) {
+    for (const pkg of searchList) {
+      if (
+        pkg.id.toLowerCase() === strippedSlug ||
+        stripPackageSuffix(normalizePackageSlug(pkg.name)) === strippedSlug
+      ) {
+        return pkg;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export function resolveCanonicalPackageId(idOrName?: string | null): string {
+  if (!idOrName) return '';
+  const raw = String(idOrName).trim();
+  const lower = raw.toLowerCase();
+  if (lower === '*' || lower === 'all' || lower === 'all_packages') return '*';
+
+  const matched = findCanonicalPackage(raw);
+  if (matched) return matched.id;
+  return raw;
+}
+
+export function getAllIdentifiersForPackage(
+  packageId?: string | null,
+  packageName?: string | null,
+  extraIds?: (string | null | undefined)[]
+): Set<string> {
+  const identifiers = new Set<string>();
+
+  const addCandidate = (val?: string | null) => {
+    if (!val) return;
+    const raw = String(val).trim().toLowerCase();
+    if (!raw) return;
+    identifiers.add(raw);
+    const slug = normalizePackageSlug(raw);
+    if (slug) {
+      identifiers.add(slug);
+      identifiers.add(slug.replace(/_/g, ' '));
+      const stripped = stripPackageSuffix(slug);
+      if (stripped) {
+        identifiers.add(stripped);
+        identifiers.add(stripped.replace(/_/g, ' '));
+      }
+    }
+    const matched = findCanonicalPackage(raw);
+    if (matched) {
+      identifiers.add(matched.id.toLowerCase());
+      identifiers.add(matched.name.toLowerCase());
+      identifiers.add(normalizePackageSlug(matched.name));
+      if (matched.templateId) {
+        identifiers.add(matched.templateId.toLowerCase());
+      }
+      if (matched.aliases) {
+        for (const alias of matched.aliases) {
+          identifiers.add(alias.toLowerCase());
+          identifiers.add(normalizePackageSlug(alias));
+        }
+      }
+    }
+  };
+
+  addCandidate(packageId);
+  addCandidate(packageName);
+  if (Array.isArray(extraIds)) {
+    for (const extra of extraIds) {
+      addCandidate(extra);
+    }
+  }
+
+  return identifiers;
+}
+
+export function registerDynamicPackage(pkg: StorePackageDefinition): void {
+  dynamicPackageRegistry.set(pkg.id, pkg);
+}
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DISCOUNTS_FILE = path.join(DATA_DIR, 'discounts.json');
@@ -68,7 +415,7 @@ const SETTINGS_FALLBACK_ID = 'discounts_management';
 const APP_SETTINGS_ID = 'app';
 
 let cachedPlanPricing: { config: PlanPricingConfig; fetchedAt: number } | null = null;
-const PRICING_CACHE_TTL_MS = 2000; // 2 seconds max cache to keep Store & Checkout responsive while always fresh
+const PRICING_CACHE_TTL_MS = 1500;
 
 export function invalidatePricingCache(): void {
   cachedPlanPricing = null;
@@ -99,7 +446,7 @@ export async function getLivePlanPricing(forceRefresh = false, authToken?: strin
 
     if (!error && data?.data) {
       const rawPlans = data.data.plans || {};
-      const rawPackagePrices = data.data.packagePrices || {};
+      const rawPackagePrices = data.data.packagePrices || rawPlans.packagePrices || {};
 
       const sim100 = Number(rawPlans.sim100);
       const simUnlimited = Number(rawPlans.simUnlimited);
@@ -110,7 +457,12 @@ export async function getLivePlanPricing(forceRefresh = false, authToken?: strin
         for (const [k, v] of Object.entries(rawPackagePrices)) {
           const num = Number(v);
           if (Number.isFinite(num) && num > 0) {
-            packagePrices[String(k).trim()] = Math.round(num);
+            const cleanKey = String(k).trim();
+            packagePrices[cleanKey] = Math.round(num);
+            const canonicalId = resolveCanonicalPackageId(cleanKey);
+            if (canonicalId && canonicalId !== '*') {
+              packagePrices[canonicalId] = Math.round(num);
+            }
           }
         }
       }
@@ -171,10 +523,18 @@ export async function saveLivePlanPricing(
   if (updates.packagePrices && typeof updates.packagePrices === 'object') {
     for (const [k, v] of Object.entries(updates.packagePrices)) {
       const num = Number(v);
+      const cleanKey = String(k).trim();
+      const canonicalId = resolveCanonicalPackageId(cleanKey);
       if (Number.isFinite(num) && num > 0) {
-        mergedPackagePrices[String(k).trim()] = Math.round(num);
+        mergedPackagePrices[cleanKey] = Math.round(num);
+        if (canonicalId && canonicalId !== '*') {
+          mergedPackagePrices[canonicalId] = Math.round(num);
+        }
       } else {
-        delete mergedPackagePrices[String(k).trim()];
+        delete mergedPackagePrices[cleanKey];
+        if (canonicalId && canonicalId !== '*') {
+          delete mergedPackagePrices[canonicalId];
+        }
       }
     }
   }
@@ -210,8 +570,15 @@ export async function saveLivePlanPricing(
 }
 
 function getTierBasePrice(tierKey: 'sim100' | 'simUnlimited' | 'routerUnlimited', pricing: PlanPricingConfig, pkgId?: string): number {
-  if (pkgId && pricing.packagePrices && Number(pricing.packagePrices[pkgId]) > 0) {
-    return Math.round(Number(pricing.packagePrices[pkgId]));
+  if (pkgId && pricing.packagePrices) {
+    const direct = Number(pricing.packagePrices[pkgId]);
+    if (Number.isFinite(direct) && direct > 0) {
+      return Math.round(direct);
+    }
+    const canonical = resolveCanonicalPackageId(pkgId);
+    if (canonical && Number(pricing.packagePrices[canonical]) > 0) {
+      return Math.round(Number(pricing.packagePrices[canonical]));
+    }
   }
   if (tierKey === 'routerUnlimited') return pricing.routerUnlimited;
   if (tierKey === 'simUnlimited') return pricing.simUnlimited;
@@ -284,25 +651,55 @@ async function writeSettingsFallbackDiscounts(records: DiscountRecord[], authTok
   }
 }
 
-export function normalizeDiscountRow(row: any): DiscountRecord {
-  let pkgIds: string[] = [];
-  if (Array.isArray(row.package_ids)) {
-    pkgIds = row.package_ids.map((id: any) => String(id).trim()).filter(Boolean);
-  } else if (typeof row.package_ids === 'string') {
-    try {
-      const parsed = JSON.parse(row.package_ids);
-      if (Array.isArray(parsed)) {
-        pkgIds = parsed.map((id: any) => String(id).trim()).filter(Boolean);
+export function normalizeDiscountPackageIds(rawInput: any, fallbackSingleId?: any): string[] {
+  let rawIds: string[] = [];
+  if (Array.isArray(rawInput)) {
+    rawIds = rawInput.map((id: any) => String(id).trim()).filter(Boolean);
+  } else if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          rawIds = parsed.map((id: any) => String(id).trim()).filter(Boolean);
+        }
+      } catch {
+        rawIds = trimmed.split(',').map((s) => s.trim()).filter(Boolean);
       }
-    } catch {
-      pkgIds = row.package_ids
-        .split(',')
-        .map((s: string) => s.trim())
-        .filter(Boolean);
+    } else if (trimmed) {
+      rawIds = trimmed.split(',').map((s) => s.trim()).filter(Boolean);
     }
-  } else if (row.package_id) {
-    pkgIds = [String(row.package_id).trim()];
+  } else if (fallbackSingleId) {
+    rawIds = [String(fallbackSingleId).trim()].filter(Boolean);
   }
+
+  if (rawIds.some((id) => ['*', 'all', 'all_packages'].includes(id.trim().toLowerCase()))) {
+    return ['*'];
+  }
+
+  const lowerSet = new Set(rawIds.map((id) => id.toLowerCase()));
+  // Handle historical ambiguity where 'slt_zoom' was the ID for 'SLT FIBER ZOOM' and 'ffb81e1f-...' was 'SLT ZOOM'
+  const hasLegacySltZoomAndTemplateUuid =
+    lowerSet.has('slt_zoom') && lowerSet.has('ffb81e1f-9d7c-430e-a63f-ba8f2b43f53a');
+
+  const normalizedSet = new Set<string>();
+  for (const id of rawIds) {
+    if (hasLegacySltZoomAndTemplateUuid && id.toLowerCase() === 'slt_zoom') {
+      normalizedSet.add('slt_fiber_zoom');
+      normalizedSet.add('slt_zoom');
+      continue;
+    }
+    const canonical = resolveCanonicalPackageId(id);
+    if (canonical) {
+      normalizedSet.add(canonical);
+    }
+  }
+
+  return Array.from(normalizedSet);
+}
+
+export function normalizeDiscountRow(row: any): DiscountRecord {
+  const pkgIds = normalizeDiscountPackageIds(row.package_ids, row.package_id);
 
   const rawType = String(row.discount_type || 'fixed').toLowerCase().trim();
   const discountType: DiscountType = rawType === 'percentage' || rawType === 'percent' ? 'percentage' : 'fixed';
@@ -365,29 +762,31 @@ export function isAllPackagesDiscount(discount: DiscountRecord): boolean {
 export function discountAppliesToPackage(
   discount: DiscountRecord,
   packageId?: string | null,
-  packageName?: string | null
+  packageName?: string | null,
+  extraIds?: (string | null | undefined)[]
 ): boolean {
+  if (!discount || !Array.isArray(discount.package_ids) || discount.package_ids.length === 0) {
+    return false;
+  }
   if (isAllPackagesDiscount(discount)) {
     return true;
   }
 
-  const targetIds: string[] = [];
-  if (packageId) targetIds.push(String(packageId).trim().toLowerCase());
+  const targetIdentifiers = getAllIdentifiersForPackage(packageId, packageName, extraIds);
+  if (targetIdentifiers.size === 0) return false;
 
-  if (packageName) {
-    const cleanName = String(packageName).trim().toLowerCase();
-    targetIds.push(cleanName);
-    const matchedPkg = DEFAULT_STORE_PACKAGES.find(
-      (p) => p.name.toLowerCase() === cleanName || p.id.toLowerCase() === cleanName
-    );
-    if (matchedPkg) {
-      targetIds.push(matchedPkg.id.toLowerCase());
+  const normalizedDiscountIds = normalizeDiscountPackageIds(discount.package_ids);
+
+  for (const rawDiscountPkgId of [...discount.package_ids, ...normalizedDiscountIds]) {
+    const discountIdentifiers = getAllIdentifiersForPackage(rawDiscountPkgId, rawDiscountPkgId);
+    for (const dId of discountIdentifiers) {
+      if (targetIdentifiers.has(dId)) {
+        return true;
+      }
     }
   }
 
-  if (targetIds.length === 0) return false;
-
-  return discount.package_ids.some((id) => targetIds.includes(String(id).trim().toLowerCase()));
+  return false;
 }
 
 export async function getAllAvailablePackages(authToken?: string, forceRefreshPricing = false): Promise<StorePackageDefinition[]> {
@@ -398,31 +797,89 @@ export async function getAllAvailablePackages(authToken?: string, forceRefreshPr
     packagesMap.set(pkg.id, {
       ...pkg,
       basePrice: getTierBasePrice(pkg.tierKey, pricing, pkg.id),
+      enabled: true,
     });
   }
 
   try {
     const client = getDbClient(authToken);
-    const { data, error } = await client.from('provision_templates').select('id, package_name, category');
+    const { data, error } = await client.from('provision_templates').select('*');
     if (!error && Array.isArray(data)) {
       for (const row of data) {
-        const rawName = String(row.package_name || '').trim();
+        const rawName = String(row.package_name || row.name || '').trim();
         if (!rawName) continue;
-        const matchedExisting = Array.from(packagesMap.values()).find(
-          (p) => p.name.toLowerCase() === rawName.toLowerCase() || p.id.toLowerCase() === String(row.id).toLowerCase()
-        );
-        if (!matchedExisting) {
-          const cat = String(row.category || 'SIM').toUpperCase() === 'ROUTER' ? 'ROUTER' : 'SIM';
-          const tierKey = cat === 'ROUTER' ? 'routerUnlimited' : 'simUnlimited';
-          const pkgId = String(row.id);
-          packagesMap.set(pkgId, {
+        const rowId = String(row.id || '').trim();
+        const isEnabled = row.enabled !== false && row.is_active !== false;
+
+        const matchedCanonical =
+          findCanonicalPackage(rowId) || findCanonicalPackage(rawName);
+
+        if (matchedCanonical && packagesMap.has(matchedCanonical.id)) {
+          const existing = packagesMap.get(matchedCanonical.id)!;
+          const mergedAliases = Array.from(
+            new Set([
+              ...(existing.aliases || []),
+              rowId.toLowerCase(),
+              rawName.toLowerCase(),
+              normalizePackageSlug(rawName),
+            ])
+          );
+          if (!isEnabled) {
+            // Exclude disabled packages from active customer packages list
+            packagesMap.delete(matchedCanonical.id);
+          } else {
+            const updatedPkg: StorePackageDefinition = {
+              ...existing,
+              templateId: rowId || existing.templateId,
+              aliases: mergedAliases,
+              enabled: true,
+            };
+            packagesMap.set(matchedCanonical.id, updatedPkg);
+            registerDynamicPackage(updatedPkg);
+          }
+        } else if (isEnabled) {
+          const catRaw = String(row.category || '').toUpperCase().trim();
+          const isRouter =
+            catRaw === 'ROUTER' ||
+            rawName.toLowerCase().includes('slt') ||
+            rawName.toLowerCase().includes('fiber') ||
+            rawName.toLowerCase().includes('router');
+          const is100GB = rawName.toLowerCase().includes('100gb') || rawName.toLowerCase().includes('100 gb');
+          const cat: 'SIM' | 'ROUTER' = isRouter ? 'ROUTER' : 'SIM';
+          const tierKey: 'sim100' | 'simUnlimited' | 'routerUnlimited' = isRouter
+            ? 'routerUnlimited'
+            : is100GB
+            ? 'sim100'
+            : 'simUnlimited';
+          const packageType: 'SIM 100GB' | 'SIM Unlimited' | 'Router Unlimited' = isRouter
+            ? 'Router Unlimited'
+            : is100GB
+            ? 'SIM 100GB'
+            : 'SIM Unlimited';
+          const pkgId = rowId || normalizePackageSlug(rawName);
+          const customPrice = Number(row.price);
+          const basePrice =
+            Number.isFinite(customPrice) && customPrice > 0
+              ? Math.round(customPrice)
+              : getTierBasePrice(tierKey, pricing, pkgId);
+
+          const newPkg: StorePackageDefinition = {
             id: pkgId,
-            name: rawName,
+            name: rawName.toUpperCase(),
             category: cat,
-            packageType: cat === 'ROUTER' ? 'Router Unlimited' : 'SIM Unlimited',
+            packageType,
             tierKey,
-            basePrice: getTierBasePrice(tierKey, pricing, pkgId),
-          });
+            basePrice,
+            templateId: rowId || undefined,
+            aliases: [
+              pkgId.toLowerCase(),
+              rawName.toLowerCase(),
+              normalizePackageSlug(rawName),
+            ],
+            enabled: true,
+          };
+          packagesMap.set(pkgId, newPkg);
+          registerDynamicPackage(newPkg);
         }
       }
     }
@@ -478,6 +935,7 @@ export async function getActiveDiscounts(): Promise<DiscountRecord[]> {
 async function persistAllDiscounts(records: DiscountRecord[], authToken?: string): Promise<void> {
   writeLocalDiscounts(records);
   await writeSettingsFallbackDiscounts(records, authToken);
+  invalidatePricingCache();
 }
 
 export interface DiscountInputPayload {
@@ -526,15 +984,14 @@ export async function validateDiscountPayload(
     };
   }
 
-  const rawPackageIds = Array.isArray(payload.package_ids)
-    ? Array.from(new Set(payload.package_ids.map((id) => String(id).trim()).filter(Boolean)))
-    : [];
+  const availablePackages = await getAllAvailablePackages(authToken, true);
+  const rawPackageIds = normalizeDiscountPackageIds(payload.package_ids);
 
   if (rawPackageIds.length === 0) {
     return { valid: false, error: 'Please select at least one target package (or All Packages) for this discount.' };
   }
 
-  const isAllTarget = rawPackageIds.some((id) => id === '*' || id.toLowerCase() === 'all');
+  const isAllTarget = rawPackageIds.includes('*');
   const packageIds = isAllTarget ? ['*'] : rawPackageIds;
 
   let startMs: number | null = null;
@@ -558,10 +1015,14 @@ export async function validateDiscountPayload(
     return { valid: false, error: 'End date must be after start date.' };
   }
 
-  const availablePackages = await getAllAvailablePackages(authToken, true);
   const packagesToValidate = isAllTarget
     ? availablePackages
-    : availablePackages.filter((p) => packageIds.includes(p.id));
+    : availablePackages.filter((p) =>
+        packageIds.some((pid) => {
+          const pkgIds = getAllIdentifiersForPackage(p.id, p.name, [p.templateId, ...(p.aliases || [])]);
+          return pkgIds.has(pid.toLowerCase());
+        })
+      );
 
   for (const pkg of packagesToValidate) {
     if (discountType === 'fixed' && amount >= pkg.basePrice) {
@@ -602,12 +1063,13 @@ export async function validateDiscountPayload(
         if (existingStatus === 'Expired' || existingStatus === 'Disabled') continue;
 
         const existingIsAll = isAllPackagesDiscount(existing);
-        const hasOverlap =
-          isAllTarget ||
-          existingIsAll ||
-          packageIds.some((pkgId) => existing.package_ids.includes(pkgId));
+        const overlappingPkgId = isAllTarget
+          ? existing.package_ids[0]
+          : existingIsAll
+          ? packageIds[0]
+          : packageIds.find((pkgId) => discountAppliesToPackage(existing, pkgId, pkgId));
 
-        if (!hasOverlap) continue;
+        if (!overlappingPkgId) continue;
 
         const candStart = startMs ?? -Infinity;
         const candEnd = endMs ?? Infinity;
@@ -615,15 +1077,12 @@ export async function validateDiscountPayload(
         const existEnd = existing.end_date ? new Date(existing.end_date).getTime() : Infinity;
 
         if (candStart <= existEnd && existStart <= candEnd) {
-          const overlapPkgId = isAllTarget
-            ? existing.package_ids[0]
-            : existingIsAll
-            ? packageIds[0]
-            : packageIds.find((id) => existing.package_ids.includes(id));
           const pkgName =
-            overlapPkgId === '*'
+            overlappingPkgId === '*'
               ? 'All Packages'
-              : availablePackages.find((p) => p.id === overlapPkgId)?.name || overlapPkgId || 'selected package';
+              : availablePackages.find((p) => p.id === overlappingPkgId)?.name ||
+                findCanonicalPackage(overlappingPkgId)?.name ||
+                overlappingPkgId;
           return {
             valid: false,
             error: `Package "${pkgName}" already has an active or scheduled discount ("${existing.name}"). Only one active discount is allowed per package at a time.`,
@@ -787,14 +1246,9 @@ export function getBaseOriginalPriceWithConfig(
 ): { originalPrice: number; matchedPackage?: StorePackageDefinition; resolvedTier: 'sim100' | 'simUnlimited' | 'routerUnlimited' } {
   const normCategory = String(params.category || '').toUpperCase().trim();
   const normPkgType = String(params.packageType || '').toLowerCase().trim();
-  const normPkgId = String(params.packageId || '').toLowerCase().trim();
-  const normPkgName = String(params.packageName || '').toLowerCase().trim();
 
-  const matchedPkg = DEFAULT_STORE_PACKAGES.find(
-    (p) =>
-      (normPkgId && p.id.toLowerCase() === normPkgId) ||
-      (normPkgName && p.name.toLowerCase() === normPkgName)
-  );
+  const matchedPkg =
+    findCanonicalPackage(params.packageId) || findCanonicalPackage(params.packageName);
 
   // Determine the tier key ('sim100' | 'simUnlimited' | 'routerUnlimited')
   let resolvedTier: 'sim100' | 'simUnlimited' | 'routerUnlimited' = matchedPkg?.tierKey || 'sim100';
@@ -809,17 +1263,30 @@ export function getBaseOriginalPriceWithConfig(
     resolvedTier = matchedPkg.tierKey;
   }
 
-  // If a per-package custom price override exists AND the customer is using the package's default tier, use it;
-  // otherwise use the tier price from Supabase settings('app').plans
-  let baseMonthly: number;
-  const hasCustomOverride =
-    matchedPkg &&
-    pricing.packagePrices &&
-    Number(pricing.packagePrices[matchedPkg.id]) > 0 &&
-    resolvedTier === matchedPkg.tierKey;
+  const candidatePkgIds = [
+    matchedPkg?.id,
+    params.packageId ? String(params.packageId).trim() : undefined,
+    params.packageName ? normalizePackageSlug(params.packageName) : undefined,
+  ].filter(Boolean) as string[];
 
-  if (hasCustomOverride && matchedPkg && pricing.packagePrices) {
-    baseMonthly = Math.round(Number(pricing.packagePrices[matchedPkg.id]));
+  let customOverridePrice: number | null = null;
+  if (pricing.packagePrices) {
+    for (const cid of candidatePkgIds) {
+      const val = Number(pricing.packagePrices[cid]);
+      if (Number.isFinite(val) && val > 0) {
+        if (!matchedPkg || resolvedTier === matchedPkg.tierKey) {
+          customOverridePrice = Math.round(val);
+          break;
+        }
+      }
+    }
+  }
+
+  let baseMonthly: number;
+  if (customOverridePrice !== null) {
+    baseMonthly = customOverridePrice;
+  } else if (matchedPkg && !DEFAULT_STORE_PACKAGES.some((d) => d.id === matchedPkg.id) && matchedPkg.basePrice > 0 && resolvedTier === matchedPkg.tierKey) {
+    baseMonthly = matchedPkg.basePrice;
   } else if (resolvedTier === 'routerUnlimited') {
     baseMonthly = pricing.routerUnlimited;
   } else if (resolvedTier === 'simUnlimited') {
@@ -928,8 +1395,45 @@ export async function calculateVerifiedOrderPrice(params: {
   duration?: string;
   customPlans?: PlanPricingConfig;
   customDiscounts?: DiscountRecord[];
+  customPackages?: StorePackageDefinition[];
 }): Promise<PriceVerificationResult> {
   const livePlans = params.customPlans || (await getLivePlanPricing(true));
+
+  if (params.customPackages) {
+    for (const cp of params.customPackages) {
+      if (cp.enabled === false) {
+        const targetIds = getAllIdentifiersForPackage(params.packageId, params.packageName);
+        if (targetIds.has(cp.id.toLowerCase()) || targetIds.has(cp.name.toLowerCase())) {
+          throw new Error(`Package "${cp.name}" is currently inactive or unavailable for purchase.`);
+        }
+      } else {
+        registerDynamicPackage(cp);
+      }
+    }
+  } else if (!params.customPlans && !params.customDiscounts) {
+    // Refresh dynamic packages and check if requested package is disabled in provision_templates
+    try {
+      const client = getDbClient();
+      const { data: tplRows } = await client.from('provision_templates').select('*');
+      if (Array.isArray(tplRows)) {
+        const reqIdentifiers = getAllIdentifiersForPackage(params.packageId, params.packageName);
+        for (const row of tplRows) {
+          const rId = String(row.id || '').trim().toLowerCase();
+          const rName = String(row.package_name || row.name || '').trim().toLowerCase();
+          const isEnabled = row.enabled !== false && row.is_active !== false;
+          if (!isEnabled && ((rId && reqIdentifiers.has(rId)) || (rName && reqIdentifiers.has(rName)))) {
+            throw new Error(`Package "${row.package_name || row.name}" is currently inactive or unavailable for purchase.`);
+          }
+        }
+      }
+      await getAllAvailablePackages(undefined, false);
+    } catch (err: any) {
+      if (err?.message?.includes('inactive or unavailable')) {
+        throw err;
+      }
+    }
+  }
+
   const { originalPrice, matchedPackage } = getBaseOriginalPriceWithConfig(livePlans, params);
 
   const resolvedPkgId = matchedPackage?.id || String(params.packageId || '').trim();
@@ -939,14 +1443,23 @@ export async function calculateVerifiedOrderPrice(params: {
     ? params.customDiscounts.filter((d) => isDiscountCurrentlyActive(d))
     : await getActiveDiscounts();
 
+  const extraIds = [
+    params.packageId,
+    params.packageName,
+    matchedPackage?.id,
+    matchedPackage?.name,
+    matchedPackage?.templateId,
+    ...(matchedPackage?.aliases || []),
+  ];
+
   // Prefer a package-specific active discount first, otherwise an all-packages ('*') active discount
   const specificDiscount =
     activeDiscounts.find(
-      (d) => !isAllPackagesDiscount(d) && discountAppliesToPackage(d, resolvedPkgId, resolvedPkgName)
+      (d) => !isAllPackagesDiscount(d) && discountAppliesToPackage(d, resolvedPkgId, resolvedPkgName, extraIds)
     ) || null;
   const globalDiscount =
     activeDiscounts.find(
-      (d) => isAllPackagesDiscount(d) && discountAppliesToPackage(d, resolvedPkgId, resolvedPkgName)
+      (d) => isAllPackagesDiscount(d) && discountAppliesToPackage(d, resolvedPkgId, resolvedPkgName, extraIds)
     ) || null;
 
   const matchedDiscount = specificDiscount || globalDiscount;

@@ -24,9 +24,28 @@ export const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
 
 export const supabase = supabaseAdmin;
 
-export const getSupabaseClient = (_token?: string) => {
-  return supabaseAdmin;
+const hasDedicatedServiceRoleKey = Boolean(
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY
+);
+
+export const getSupabaseClient = (token?: string) => {
+  if (hasDedicatedServiceRoleKey || !token) {
+    return supabaseAdmin;
+  }
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+    global: {
+      fetch: fetchWithTimeout,
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  });
 };
 
 export const getAuthenticatedSupabase = getSupabaseClient;
+
 

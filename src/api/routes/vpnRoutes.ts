@@ -14,11 +14,21 @@ import {
   getPublicActiveDiscountsHandler,
   validateOrderPriceHandler,
 } from '../controllers/discountController.js';
+import {
+  getPublicActiveSpecialOffersHandler,
+  validateSpecialOfferPriceHandler,
+} from '../controllers/specialOfferController.js';
+import {
+  getPaymentSlipSignedUrlHandler,
+  uploadPaymentSlipHandler,
+} from '../controllers/paymentSlipController.js';
 
 const router = Router();
 
-// Publicly accessible store discount & price verification routes
+// Publicly accessible store discount, special offer & price verification routes
 router.get('/discounts/active', getPublicActiveDiscountsHandler);
+router.get('/special-offers/active', getPublicActiveSpecialOffersHandler);
+router.post('/special-offers/validate-price', validateSpecialOfferPriceHandler);
 router.post('/validate-order-price', validateOrderPriceHandler);
 
 router.use(authMiddleware);
@@ -37,5 +47,11 @@ router.post('/reset-data', resetTraffic);
 router.get('/reset-traffic-status/:uuid', getResetTrafficStatus);
 router.get('/reset-policy', getTrafficResetPolicyHandler);
 
+// Private Payment Slips Signed URL & Upload routes
+router.get('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
+router.post('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
+router.post('/payment-slips/upload', uploadPaymentSlipHandler);
+
 export default router;
+
 

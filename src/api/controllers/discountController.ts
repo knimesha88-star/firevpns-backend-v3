@@ -49,12 +49,13 @@ export const getPublicActiveDiscountsHandler = async (_req: Request, res: Respon
 
 /**
  * POST /api/vpn/validate-order-price
- * Server-side price & discount calculation and validation before order creation.
+ * Server-side price, discount & special offer calculation and validation before order creation.
  */
 export const validateOrderPriceHandler = async (req: Request, res: Response): Promise<void> => {
   try {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const {
+      offerId,
       packageId,
       packageName,
       category,
@@ -62,6 +63,53 @@ export const validateOrderPriceHandler = async (req: Request, res: Response): Pr
       duration,
       submittedFinalPrice,
     } = req.body || {};
+
+    if (offerId) {
+      const { verifySpecialOfferCheckoutPrice } = await import('../services/specialOfferService.js');
+      const offerVerified = await verifySpecialOfferCheckoutPrice({
+        offerId: String(offerId),
+        packageId,
+        packageName,
+        category,
+        packageType,
+        duration,
+      });
+
+      const verifiedPayload = {
+        packageId: offerVerified.packageId,
+        packageName: offerVerified.packageName,
+        originalPrice: offerVerified.originalPrice,
+        discountAmount: offerVerified.discountAmount,
+        discountPercentage: offerVerified.discountPercentage,
+        finalPrice: offerVerified.finalPrice,
+        appliedDiscount: null,
+        appliedOffer: offerVerified.offer,
+        durationMonths: offerVerified.durationMonths,
+        durationLabel: offerVerified.durationLabel,
+        plans: offerVerified.plans,
+      };
+
+      if (submittedFinalPrice !== undefined && submittedFinalPrice !== null) {
+        const clientPrice = Math.round(Number(submittedFinalPrice));
+        if (!Number.isFinite(clientPrice) || clientPrice <= 0 || clientPrice !== offerVerified.finalPrice) {
+          res.status(400).json({
+            valid: false,
+            priceChanged: true,
+            error: `The promotional price for "${offerVerified.offer.name}" is LKR ${offerVerified.finalPrice}. Please review the updated total and confirm your order again.`,
+            submittedFinalPrice: clientPrice,
+            verified: verifiedPayload,
+          });
+          return;
+        }
+      }
+
+      res.json({
+        valid: true,
+        priceChanged: false,
+        verified: verifiedPayload,
+      });
+      return;
+    }
 
     const verified = await calculateVerifiedOrderPrice({
       packageId,
@@ -92,7 +140,19 @@ export const validateOrderPriceHandler = async (req: Request, res: Response): Pr
     });
   } catch (error: any) {
     console.error('[DiscountController] Error validating order price:', error?.message || error);
-    res.status(500).json({ error: error?.message || 'Failed to validate order price' });
+    const msg = String(error?.message || '').toLowerCase();
+    const isClientErr =
+      msg.includes('inactive or unavailable') ||
+      msg.includes('special offer') ||
+      msg.includes('not eligible') ||
+      msg.includes('invalid duration') ||
+      msg.includes('expired') ||
+      msg.includes('disabled');
+    res.status(isClientErr ? 400 : 500).json({
+      valid: false,
+      priceChanged: false,
+      error: error?.message || 'Failed to validate order price',
+    });
   }
 };
 

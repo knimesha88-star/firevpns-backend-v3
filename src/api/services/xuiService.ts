@@ -2,7 +2,7 @@ import axios, { AxiosInstance, AxiosError } from 'axios';
 import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 import { sendOrderApprovedNotification } from './telegramService.js';
 import { createCustomerNotification, runScheduledExpiryEmailCheck } from './notificationService.js';
-import { sendPaymentApprovedEmail, sendTrialApprovedEmail, sendVpnExpiredEmail } from './emailService.js';
+import { sendPaymentApprovedEmail, sendOrderCompletedEmail, sendTrialApprovedEmail, sendVpnExpiredEmail } from './emailService.js';
 
 import crypto from 'crypto';
 
@@ -511,10 +511,36 @@ export const getClientExpiry = async (identifier: string): Promise<number | null
   return null;
 };
 
+export const addCalendarMonths = (baseTimeMs: number, durationMonths: number): number => {
+  const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
+  const base = new Date(baseTimeMs);
+  const targetYear = base.getUTCFullYear();
+  const targetMonth = base.getUTCMonth() + safeMonths;
+  const originalDay = base.getUTCDate();
+
+  const result = new Date(
+    Date.UTC(
+      targetYear,
+      targetMonth,
+      1,
+      base.getUTCHours(),
+      base.getUTCMinutes(),
+      base.getUTCSeconds(),
+      base.getUTCMilliseconds()
+    )
+  );
+  const daysInTargetMonth = new Date(
+    Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)
+  ).getUTCDate();
+  result.setUTCDate(Math.min(originalDay, daysInTargetMonth));
+  return result.getTime();
+};
+
 export const updateClientExpiry = async (
   uuid: string,
   durationMonths: number,
-  planName?: string
+  planName?: string,
+  fallbackCurrentExpiryMs?: number | null
 ): Promise<{ new_expiryMs: number; newTotalBytes: number }> => {
   const inbounds = await getInbounds();
   
@@ -531,16 +557,21 @@ export const updateClientExpiry = async (
     const clients = settingsObj.clients || [];
     for (const c of clients) {
       if (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) {
-        const currentExpiry = c.expiryTime || 0;
+        const panelExpiry = Number(c.expiryTime || 0);
+        const dbExpiry = Number(fallbackCurrentExpiryMs || 0);
+        const currentExpiry = Math.max(
+          Number.isFinite(panelExpiry) ? panelExpiry : 0,
+          Number.isFinite(dbExpiry) ? dbExpiry : 0
+        );
         
-        let baseTime = currentExpiry > Date.now() ? currentExpiry : Date.now();
-        const date = new Date(baseTime);
-        date.setMonth(date.getMonth() + durationMonths);
-        const new_expiryTime = date.getTime();
+        const now = Date.now();
+        const baseTime = currentExpiry > now ? currentExpiry : now;
+        const new_expiryTime = addCalendarMonths(baseTime, durationMonths);
         
         // Parse traffic / limit GB based on planName
         let isLimitedPlan = false;
         let packageDataLimitBytes = 0;
+        const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
 
         if (planName) {
           const lowerPlan = planName.toLowerCase();
@@ -548,12 +579,12 @@ export const updateClientExpiry = async (
             isLimitedPlan = false;
           } else if (lowerPlan.includes('100gb') || lowerPlan.includes('100 gb') || lowerPlan.includes('100')) {
             isLimitedPlan = true;
-            packageDataLimitBytes = 100 * 1024 * 1024 * 1024;
+            packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
           } else {
             const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
             if (gbMatch) {
               isLimitedPlan = true;
-              packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024;
+              packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024 * safeMonths;
             }
           }
         }
@@ -874,6 +905,65 @@ export const buildVlessLink = (
 
 
 
+export function calculateOrderDurationAndExpiry(params: {
+  duration?: string | number | null;
+  durationMonths?: number | null;
+  durationProfiles?: Record<string, number> | null;
+  existingExpiryMs?: number | null;
+  isExtendingExistingAccount?: boolean;
+  isTrialOrder?: boolean;
+  nowMs?: number;
+}): { days: number; durationMonths: number; expiryMs: number } {
+  const now = params.nowMs ?? Date.now();
+  if (params.isTrialOrder) {
+    return {
+      days: 1,
+      durationMonths: 0,
+      expiryMs: now + 1 * 24 * 60 * 60 * 1000,
+    };
+  }
+
+  const rawDurationStr = String(params.duration || '1 Month').trim();
+  let durationMonths = Number(params.durationMonths) || 0;
+  if (!durationMonths) {
+    const numMatch = rawDurationStr.match(/(\d+)/);
+    if (numMatch) {
+      const n = parseInt(numMatch[1], 10);
+      if (rawDurationStr.toLowerCase().includes('month') || [1, 3, 6, 12].includes(n)) {
+        durationMonths = n;
+      }
+    }
+    if (!durationMonths) durationMonths = 1;
+  }
+
+  const canonicalDurationKey =
+    durationMonths === 1 ? '1 Month' : `${durationMonths} Months`;
+
+  let days = durationMonths * 30;
+  if (durationMonths === 12) days = 365;
+
+  if (params.durationProfiles) {
+    if (params.durationProfiles[rawDurationStr]) {
+      days = Number(params.durationProfiles[rawDurationStr]);
+    } else if (params.durationProfiles[canonicalDurationKey]) {
+      days = Number(params.durationProfiles[canonicalDurationKey]);
+    }
+  }
+
+  const validExistingExpiry =
+    params.isExtendingExistingAccount &&
+    params.existingExpiryMs &&
+    Number.isFinite(Number(params.existingExpiryMs)) &&
+    Number(params.existingExpiryMs) > now
+      ? Number(params.existingExpiryMs)
+      : now;
+
+  const expiryMs = params.isExtendingExistingAccount
+    ? addCalendarMonths(validExistingExpiry, durationMonths)
+    : validExistingExpiry + days * 24 * 60 * 60 * 1000;
+  return { days, durationMonths, expiryMs };
+}
+
 const activeProvisionings = new Set<string>();
 
 export const provisionOrderClient = async (orderId: string, token?: string): Promise<any> => {
@@ -930,6 +1020,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const packageName = extra.package_name || extra.packageName || extra.plan || extra.package || order.package_name || '';
   const customerName = extra.configurationName || extra.customerName || extra.name || extra.full_name || (order.email ? order.email.split('@')[0] : 'Customer');
   const customerId = order.customer_id || extra.customer_id || '';
+  const extendUuid = String(extra.extend_uuid || extra.existing_uuid || extra.extendUuid || '').trim();
 
   console.log('=== [PURCHASE FLOW LOGGING START] ===');
   console.log('[Purchase Flow] Purchase request payload:', {
@@ -976,15 +1067,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log(`[Purchase Flow] DEBUG: Full Template: ${JSON.stringify(template, null, 2)}`);
   console.log(`[Purchase Flow] DEBUG: Final inboundId: ${inboundId}`);
   
-  // Note: 3X-UI inbound used will be logged when calling the 3X-UI API, which typically logs inboundId.
-  // We already have the inboundId here.
-
   const address = template.address || '';
   const sni = template.sni || '';
   const remarkFormat = template.remark_template || template.remarkFormat || '{{customerName}}';
 
   const orderDisplayId = (order.order_id || order.id || '').trim();
-  const remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
+  let remark = formatClientRemark(remarkFormat, customerName, orderDisplayId);
 
   const isValidUuid = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val || '');
   const validUserId = isValidUuid(customerId) ? customerId : (isValidUuid(order.customer_id) ? order.customer_id : null);
@@ -1006,9 +1094,27 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     existingTrialConfig = trials;
   }
 
-  // Check if an existing VPN account exists for this order/user
+  // Check if an existing VPN account exists for this order/user or is being extended
   let existingAcc: any = null;
-  if (order.id) {
+  let isExtendingExistingAccount = false;
+
+  if (extendUuid) {
+    const { data: extAcc } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('uuid', extendUuid)
+      .maybeSingle();
+    if (extAcc) {
+      existingAcc = extAcc;
+      isExtendingExistingAccount = true;
+      if (extAcc.remark) {
+        remark = String(extAcc.remark).trim();
+      }
+      console.log(`[3X-UI Provisioning DB] Extending existing VPN account UUID: ${extendUuid}`);
+    }
+  }
+
+  if (!existingAcc && order.id) {
     const { data: d1, error: e1 } = await dbClient
       .from('vpn_accounts')
       .select('*')
@@ -1034,7 +1140,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Fetch all inbounds to search for an existing client in 3X-UI panel
   const allInbounds = await getInbounds();
-  let existingClient = null;
+  let existingClient: any = null;
   let targetInboundId = inboundId;
 
   // Search by known UUIDs from database (or by remark if it is a trial order)
@@ -1045,6 +1151,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     } catch (e) { continue; }
     const clients = settingsObj.clients || [];
     const found = clients.find((c: any) => 
+      (extendUuid && String(c.id).trim().toLowerCase() === extendUuid.toLowerCase()) ||
       (existingAcc && String(c.id).trim().toLowerCase() === String(existingAcc.uuid).trim().toLowerCase()) ||
       (existingTrialConfig && String(c.id).trim().toLowerCase() === String(existingTrialConfig.uuid).trim().toLowerCase()) ||
       (isTrialOrder && String(c.email).trim().toLowerCase() === remark.trim().toLowerCase())
@@ -1052,23 +1159,30 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     if (found) {
       existingClient = found;
       targetInboundId = Number(ib.id);
+      if (isExtendingExistingAccount && found.email) {
+        remark = String(found.email).trim();
+      }
       break;
     }
   }
 
-  // Duration & Traffic calculations based on loaded template profiles
-  const duration = extra.duration || '1 Month';
-  let days = 30;
-  if (template.duration_profiles && template.duration_profiles[duration]) {
-    days = Number(template.duration_profiles[duration]);
-  } else {
-    const numMatch = String(duration).match(/(\d+)/);
-    if (numMatch) {
-      const num = parseInt(numMatch[1], 10);
-      days = String(duration).toLowerCase().includes('month') ? num * 30 : num;
-    }
-  }
-  let expiryMs = Date.now() + (days * 24 * 60 * 60 * 1000);
+  // Duration & Traffic calculations based on loaded template profiles (supports 1 Month, 3 Months, 6 Months, 12 Months)
+  const duration = extra.duration || (extra.duration_months ? `${extra.duration_months} Months` : '1 Month');
+  const existingExpiryCandidateMs =
+    Number(existingClient?.expiryTime || 0) ||
+    (existingAcc?.expiry_date ? new Date(existingAcc.expiry_date).getTime() : 0);
+
+  const durationCalc = calculateOrderDurationAndExpiry({
+    duration,
+    durationMonths: extra.duration_months ? Number(extra.duration_months) : null,
+    durationProfiles: template.duration_profiles || null,
+    existingExpiryMs: existingExpiryCandidateMs,
+    isExtendingExistingAccount,
+    isTrialOrder,
+  });
+
+  let days = durationCalc.days;
+  let expiryMs = durationCalc.expiryMs;
 
   let totalBytes = 0;
   const packageTypeKey = extra.packageType || extra.type || '';
@@ -1085,6 +1199,14 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     }
   }
 
+  // Scale limited traffic allowance by multi-month duration (e.g. 3 Months or 6 Months) and preserve existing traffic when extending
+  if (totalBytes > 0 && durationCalc.durationMonths > 1) {
+    totalBytes = totalBytes * durationCalc.durationMonths;
+  }
+  if (isExtendingExistingAccount && totalBytes > 0 && existingClient?.totalGB) {
+    totalBytes = Number(existingClient.totalGB) + totalBytes;
+  }
+
   // Trial Override: Apply 1 Day (24h) and 1 GB Limit strictly for Free Trials
   if (isTrialOrder) {
     days = 1;
@@ -1093,14 +1215,17 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   // Determine UUID and subId:
-  // For re-provisioning an existing order or updating a trial: reuse existing UUID
-  // For new paid orders: ALWAYS generate a brand new UUID
+  // For extending an existing account, re-provisioning an existing order, or updating a trial: preserve existing UUID & subId
+  // For new paid orders: generate a brand new UUID
   let uuid: string;
   let subId: string;
 
   if (existingAcc && existingAcc.uuid) {
     uuid = existingAcc.uuid;
     subId = (existingClient && existingClient.subId) || existingAcc.sub_id || crypto.randomBytes(12).toString('hex');
+  } else if (extendUuid) {
+    uuid = extendUuid;
+    subId = (existingClient && existingClient.subId) || crypto.randomBytes(12).toString('hex');
   } else if (isTrialOrder && (existingTrialConfig?.uuid || existingAcc?.uuid)) {
     uuid = existingTrialConfig?.uuid || existingAcc?.uuid;
     subId = (existingClient && existingClient.subId) || existingTrialConfig?.sub_id || crypto.randomBytes(12).toString('hex');
@@ -1459,6 +1584,10 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     if (cErr) console.warn('[3X-UI Provisioning DB] vpn_configs select by order_id notice:', cErr);
     existingConfig = cData;
   }
+  if (!existingConfig && uuid) {
+    const { data: cByUuid } = await dbClient.from('vpn_configs').select('id').eq('uuid', uuid).maybeSingle();
+    if (cByUuid) existingConfig = cByUuid;
+  }
 
   const configPayload: any = {
     customer_uid: validUserId,
@@ -1595,6 +1724,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
           expiryDate: new Date(expiryMs).toISOString(),
           userId: validUserId
         }).catch(e => console.warn('[3X-UI Provisioning DB] Payment approved email notification warning:', e));
+
+        sendOrderCompletedEmail({
+          userEmail: order.email,
+          customerName: extra.customerName || undefined,
+          orderId: order.order_id || order.id,
+          packageName,
+          vlessUrl,
+          expiryDate: new Date(expiryMs).toISOString(),
+          userId: validUserId
+        }).catch(e => console.warn('[3X-UI Provisioning DB] Order completed email notification warning:', e));
       }
     }
   } catch (notifErr: any) {

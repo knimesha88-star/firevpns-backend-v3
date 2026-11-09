@@ -13,17 +13,161 @@ import {
   sendRenewalRejectedEmail
 } from '../services/emailService.js';
 
+import { verifyRenewalCheckoutPrice, verifySpecialOfferCheckoutPrice } from '../services/specialOfferService.js';
+
+export const validateRenewPrice = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const body = req.body || {};
+    const durationMonths = Number(body.durationMonths || body.duration || 1);
+    const expectedAmount = body.expectedAmount !== undefined ? Number(body.expectedAmount) : undefined;
+
+    const verified = await verifyRenewalCheckoutPrice({
+      durationMonths,
+      offerId: body.offerId || body.offer_id || null,
+      packageId: body.packageId || body.package_id || null,
+      packageName: body.packageName || body.package_name || body.configName || body.config_name || null,
+      configName: body.configName || body.config_name || null,
+      remark: body.remark || null,
+      dataLimit: body.dataLimit || body.data_limit || null,
+      planId: body.planId || body.plan_id || null,
+      planName: body.planName || body.plan_name || body.plan || null,
+      category: body.category || null,
+      packageType: body.packageType || body.package_type || null,
+      vpnAccountUuid: body.vpnAccountUuid || body.uuid || null,
+      vpnAccountId: body.vpnAccountId || body.vpn_account_id || null,
+    });
+
+    if (
+      expectedAmount !== undefined &&
+      Number.isFinite(expectedAmount) &&
+      Math.round(expectedAmount) !== verified.finalPrice
+    ) {
+      res.status(400).json({
+        valid: false,
+        priceChanged: true,
+        error: `Renewal price has changed (Submitted: LKR ${Math.round(expectedAmount)}, Current Verified Price: LKR ${verified.finalPrice}). Please review the updated total.`,
+        ...verified,
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      valid: true,
+      priceChanged: false,
+      ...verified,
+    });
+  } catch (error: any) {
+    console.warn('[RenewController] validateRenewPrice error:', error?.message || error);
+    res.status(400).json({
+      valid: false,
+      error: error?.message || 'Failed to validate renewal price.',
+    });
+  }
+};
+
 export const createRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const data = req.body || {};
     const customerEmail = data.email || data.userEmail || req.user?.email || '';
+    const requestedDuration = Number(data.durationMonths || data.duration || 1);
+
+    // Authoritatively validate renewal duration, package eligibility, and latest active offer price from Supabase
+    const verified = await verifyRenewalCheckoutPrice({
+      durationMonths: requestedDuration,
+      offerId: data.offerId || data.offer_id || null,
+      packageId: data.packageId || data.package_id || null,
+      packageName: data.packageName || data.package_name || data.configName || data.config_name || null,
+      configName: data.configName || data.config_name || null,
+      remark: data.remark || null,
+      dataLimit: data.dataLimit || data.data_limit || null,
+      planId: data.planId || data.plan_id || null,
+      planName: data.planName || data.plan || null,
+      category: data.category || null,
+      packageType: data.packageType || data.package_type || null,
+      vpnAccountUuid: data.uuid || data.vpnAccountUuid || null,
+      vpnAccountId: data.vpn_account_id || data.vpnAccountId || null,
+    });
+
+    const submittedAmount =
+      data.expectedAmount !== undefined
+        ? Number(data.expectedAmount)
+        : data.amount !== undefined
+        ? Number(data.amount)
+        : undefined;
+
+    if (
+      submittedAmount !== undefined &&
+      Number.isFinite(submittedAmount) &&
+      Math.round(submittedAmount) !== verified.finalPrice
+    ) {
+      res.status(400).json({
+        valid: false,
+        priceChanged: true,
+        error: `Invalid renewal total (LKR ${Math.round(submittedAmount)}). Server verified final price for this ${verified.durationLabel} renewal is LKR ${verified.finalPrice}.`,
+        ...verified,
+      });
+      return;
+    }
+
+    const dbClient = supabaseAdmin || supabase;
+    let renewalRecordId = data.renewalId || data.id || null;
+
+    // Sync or create the renew_requests row with authoritative price, duration, and offer metadata
+    if (renewalRecordId) {
+      try {
+        const { data: existingRow } = await dbClient
+          .from('renew_requests')
+          .select('id, notes, status')
+          .eq('id', renewalRecordId)
+          .maybeSingle();
+
+        if (existingRow && String(existingRow.status || 'pending').toLowerCase() === 'pending') {
+          let extra: any = {};
+          if (existingRow.notes && String(existingRow.notes).startsWith('{')) {
+            try {
+              extra = JSON.parse(existingRow.notes);
+            } catch (_e) {
+              extra = {};
+            }
+          }
+          extra.durationMonths = verified.durationMonths;
+          extra.duration = verified.durationLabel;
+          extra.package_id = verified.packageId;
+          extra.package_name = verified.packageName;
+          extra.original_price = verified.originalPrice;
+          extra.discount_amount = verified.discountAmount;
+          extra.discount_percentage = verified.discountPercentage;
+          extra.final_price = verified.finalPrice;
+          extra.is_special_offer = verified.isSpecialOffer;
+          extra.offer_id = verified.appliedOffer?.id || null;
+          extra.offer_name = verified.appliedOffer?.name || null;
+          extra.discount_id = verified.appliedDiscount?.id || null;
+          extra.discount_name = verified.appliedDiscount?.name || null;
+
+          await dbClient
+            .from('renew_requests')
+            .update({
+              amount: verified.finalPrice,
+              notes: JSON.stringify(extra),
+            })
+            .eq('id', existingRow.id);
+        }
+      } catch (syncErr) {
+        console.warn('[RenewController] Could not sync renew_requests price metadata:', syncErr);
+      }
+    }
+
+    const effectivePlanDisplay = verified.isSpecialOffer && verified.appliedOffer
+      ? `${verified.packageName} (${verified.appliedOffer.name} - ${verified.durationLabel})`
+      : data.planName || data.plan || `${verified.packageName} (${verified.planName})`;
 
     const notificationData = {
       email: customerEmail,
       userEmail: customerEmail,
-      planName: data.planName || data.plan || '',
-      durationMonths: data.durationMonths || data.duration || 1,
-      amount: data.amount ?? 0,
+      planName: effectivePlanDisplay,
+      durationMonths: verified.durationMonths,
+      amount: verified.finalPrice,
       receiptNumber: data.receiptNumber || '',
       message: data.message || '',
       paymentDate: data.paymentDate || '',
@@ -37,7 +181,7 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
         userId: req.user?.uid || data.userId || null,
         userEmail: customerEmail,
         title: 'Payment Submitted',
-        message: `Your payment of LKR ${notificationData.amount} for "${notificationData.planName || 'VPN Package'}" has been submitted for verification.`,
+        message: `Your payment of LKR ${notificationData.amount} for "${notificationData.planName || 'VPN Package'}" (${verified.durationLabel}) has been submitted for verification.`,
         type: 'payment_submitted'
       });
     } catch (notifErr: any) {
@@ -48,12 +192,12 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
     if (customerEmail && customerEmail.includes('@')) {
       sendRenewalRequestReceivedEmail({
         userEmail: customerEmail,
-        renewalId: data.renewalId || data.id || undefined,
+        renewalId: renewalRecordId || undefined,
         receiptNumber: notificationData.receiptNumber || undefined,
         vpnAccountId: data.vpn_account_id || data.uuid || undefined,
         packageName: notificationData.planName || 'FIREVPN Package',
-        durationMonths: Number(notificationData.durationMonths) || 1,
-        amount: Number(notificationData.amount) || 0,
+        durationMonths: Number(verified.durationMonths) || 1,
+        amount: Number(verified.finalPrice) || 0,
         userId: req.user?.uid || data.userId
       }).catch((emailErr) => {
         console.warn('[RenewController] Renewal request received email warning:', emailErr?.message || emailErr);
@@ -67,11 +211,12 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
 
     res.json({
       success: true,
-      message: 'Renewal request notification triggered successfully.'
+      message: 'Renewal request verified and submitted successfully.',
+      verifiedPrice: verified,
     });
   } catch (error: any) {
-    console.error('[RenewController] Error processing renewal notification request:', error.message);
-    res.status(500).json({ error: error.message });
+    console.error('[RenewController] Error processing renewal request:', error.message);
+    res.status(400).json({ error: error.message || 'Failed to process renewal request' });
   }
 };
 
@@ -112,13 +257,17 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }
     
     let durationMonths = Number(data.durationMonths || data.duration_months || data.duration || 1);
-    const parsedNotes = data.notes ? (typeof data.notes === 'string' ? JSON.parse(data.notes) : data.notes) : null;
-    if (parsedNotes) {
+    const parsedNotes = data.notes ? (typeof data.notes === 'string' && data.notes.startsWith('{') ? JSON.parse(data.notes) : data.notes) : null;
+    if (parsedNotes && typeof parsedNotes === 'object') {
       if (parsedNotes.durationMonths) {
         durationMonths = Number(parsedNotes.durationMonths);
       } else if (parsedNotes.duration) {
-        durationMonths = Number(parsedNotes.duration);
+        const numMatch = String(parsedNotes.duration).match(/(\d+)/);
+        if (numMatch) durationMonths = Number(numMatch[1]);
       }
+    }
+    if (!Number.isFinite(durationMonths) || durationMonths < 1) {
+      durationMonths = 1;
     }
 
     // Resolve corresponding vpn_accounts row by order_id / vpn_account_id / uuid / user
@@ -177,6 +326,8 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     let oldExpiryMs: number | null = null;
     if (data.old_expiry) {
       oldExpiryMs = new Date(data.old_expiry).getTime();
+    } else if (parsedNotes?.old_expiry) {
+      oldExpiryMs = new Date(parsedNotes.old_expiry).getTime();
     }
 
     if (!oldExpiryMs || isNaN(oldExpiryMs)) {
@@ -201,21 +352,36 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     
     const planName = data.plan_name || data.planName || data.plan || parsedNotes?.plan_name || parsedNotes?.planName || '';
 
-    // 2. Extend client expiry in 3X-UI using UUID
-    const { new_expiryMs, newTotalBytes } = await xuiService.updateClientExpiry(targetUuid, durationMonths, planName);
+    // 2. Extend client expiry in 3X-UI using UUID (preserving existing UUID & credentials and extending by durationMonths calendar months)
+    const { new_expiryMs, newTotalBytes } = await xuiService.updateClientExpiry(
+      targetUuid,
+      durationMonths,
+      planName,
+      oldExpiryMs
+    );
     const new_expiryIso = new Date(new_expiryMs).toISOString();
 
     console.log(`[RenewController] 3X-UI update successful. New expiry time: ${new_expiryIso}. New total bytes: ${newTotalBytes}. Executing atomic database updates...`);
     
     const nowIso = new Date().toISOString();
-    const adminEmail = req.user?.email || req.user?.uid || 'Admin';
 
-    // 3. Update renew_requests table
+    const updatedNotesObj =
+      parsedNotes && typeof parsedNotes === 'object'
+        ? {
+            ...parsedNotes,
+            old_expiry: oldExpiryIso,
+            new_expiry: new_expiryIso,
+            approved_at: nowIso,
+          }
+        : undefined;
+
+    // 3. Update renew_requests table (retaining original agreed amount and duration)
     const { data: updatedRow, error: updateErr } = await supabase
       .from('renew_requests')
       .update({
         status: 'approved',
         updated_at: nowIso,
+        ...(updatedNotesObj ? { notes: JSON.stringify(updatedNotesObj) } : {}),
       })
       .eq('id', requestId)
       .select()
@@ -437,15 +603,43 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
   try {
     const data = req.body || {};
 
-    // Server-side independent price & discount validation to prevent client-side tampering
-    const { calculateVerifiedOrderPrice } = await import('../services/discountService.js');
-    const verifiedPrice = await calculateVerifiedOrderPrice({
-      packageId: data.packageId,
-      packageName: data.plan,
-      category: data.category,
-      packageType: data.packageType,
-      duration: data.duration,
-    });
+    // Server-side independent price & discount / special offer validation to prevent client-side tampering
+    let verifiedPrice: {
+      originalPrice: number;
+      discountAmount: number;
+      discountPercentage: number;
+      finalPrice: number;
+      appliedDiscount?: any | null;
+      appliedOffer?: any | null;
+    };
+
+    if (data.offerId || data.offer_id) {
+      const offerVerified = await verifySpecialOfferCheckoutPrice({
+        offerId: String(data.offerId || data.offer_id),
+        packageId: data.packageId,
+        packageName: data.plan,
+        category: data.category,
+        packageType: data.packageType,
+        duration: data.duration,
+      });
+      verifiedPrice = {
+        originalPrice: offerVerified.originalPrice,
+        discountAmount: offerVerified.discountAmount,
+        discountPercentage: offerVerified.discountPercentage,
+        finalPrice: offerVerified.finalPrice,
+        appliedDiscount: null,
+        appliedOffer: offerVerified.offer,
+      };
+    } else {
+      const { calculateVerifiedOrderPrice } = await import('../services/discountService.js');
+      verifiedPrice = await calculateVerifiedOrderPrice({
+        packageId: data.packageId,
+        packageName: data.plan,
+        category: data.category,
+        packageType: data.packageType,
+        duration: data.duration,
+      });
+    }
 
     const verifiedAmount = verifiedPrice.finalPrice;
 
@@ -474,8 +668,14 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
           extra.discount_amount = verifiedPrice.discountAmount;
           extra.discount_percentage = verifiedPrice.discountPercentage;
           extra.final_price = verifiedPrice.finalPrice;
-          extra.discount_id = verifiedPrice.appliedDiscount?.id || null;
-          extra.discount_name = verifiedPrice.appliedDiscount?.name || null;
+          if (verifiedPrice.appliedOffer) {
+            extra.is_special_offer = true;
+            extra.offer_id = verifiedPrice.appliedOffer.id;
+            extra.offer_name = verifiedPrice.appliedOffer.name;
+          } else {
+            extra.discount_id = verifiedPrice.appliedDiscount?.id || null;
+            extra.discount_name = verifiedPrice.appliedDiscount?.name || null;
+          }
 
           await dbClient
             .from('orders')
