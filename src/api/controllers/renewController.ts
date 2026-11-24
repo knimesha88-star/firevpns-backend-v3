@@ -50,6 +50,131 @@ export const isUserAuthorizedForAutoActivateNewOrders = (uid?: string | null, em
 
 export const isAutoActivateRenewalsEnabled = (): boolean => false;
 
+const ALLOWED_SLIP_STORAGE_BUCKETS = new Set(['payment-slips', 'payment_slips']);
+const ALLOWED_NEW_ORDER_SLIP_FOLDERS = new Set(['orders', 'billing']);
+
+/**
+ * Validates authenticated customer ownership of a storage-backed payment slip path
+ * for automatic new-order activation.
+ * Compatible with:
+ * - Current frontend upload format (`uploadPaymentSlipFile`): `[^a-zA-Z0-9@._-]` (preserves `@` and `.`)
+ * - Raw authenticated email / UID path segments
+ * - Legacy sanitized email / UID path segments (`[^a-zA-Z0-9_-]`)
+ * Strictly rejects other customers' receipts, malformed paths, unauthorized folders/buckets, and path traversal.
+ */
+export function isPaymentSlipStoragePathOwnedByUser(params: {
+  slipUrl: string;
+  uid: string;
+  email: string;
+}): {
+  valid: boolean;
+  reason?:
+    | 'PATH_TRAVERSAL_OR_INVALID'
+    | 'UNAUTHORIZED_BUCKET'
+    | 'MALFORMED_STORAGE_PATH'
+    | 'INVALID_FOLDER'
+    | 'OWNERSHIP_MISMATCH';
+} {
+  const raw = String(params.slipUrl || '').trim();
+  let decodedOnce = raw;
+  let decodedTwice = raw;
+  try {
+    decodedOnce = decodeURIComponent(raw);
+    decodedTwice = decodeURIComponent(decodedOnce);
+  } catch {
+    // Keep last successfully decoded string
+  }
+
+  if (
+    !raw ||
+    raw.includes('..') ||
+    raw.includes('\0') ||
+    raw.includes('\\') ||
+    decodedOnce.includes('..') ||
+    decodedOnce.includes('\0') ||
+    decodedOnce.includes('\\') ||
+    decodedTwice.includes('..') ||
+    decodedTwice.includes('\0') ||
+    decodedTwice.includes('\\')
+  ) {
+    return { valid: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const parsedSlip = parsePaymentSlipReference(raw);
+  if (parsedSlip.kind === 'data') {
+    return { valid: true };
+  }
+  if (parsedSlip.kind === 'empty') {
+    return { valid: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+  if (parsedSlip.kind !== 'storage') {
+    return { valid: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+
+  if (!ALLOWED_SLIP_STORAGE_BUCKETS.has(String(parsedSlip.bucket || '').trim().toLowerCase())) {
+    return { valid: false, reason: 'UNAUTHORIZED_BUCKET' };
+  }
+
+  const objectPath = String(parsedSlip.objectPath || '').trim();
+  let doubleDecodedPath = objectPath;
+  try {
+    doubleDecodedPath = decodeURIComponent(objectPath);
+  } catch {
+    // Keep objectPath as-is if already fully decoded or contains literal %
+  }
+
+  if (
+    !objectPath ||
+    objectPath.includes('..') ||
+    objectPath.includes('\0') ||
+    objectPath.includes('\\') ||
+    doubleDecodedPath.includes('..') ||
+    doubleDecodedPath.includes('\0') ||
+    doubleDecodedPath.includes('\\')
+  ) {
+    return { valid: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const segments = objectPath.split('/').filter(Boolean);
+  if (segments.length < 3) {
+    return { valid: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+  if (segments.some((seg) => seg === '.' || seg === '..')) {
+    return { valid: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const folderSeg = String(segments[0] || '').trim().toLowerCase();
+  if (!ALLOWED_NEW_ORDER_SLIP_FOLDERS.has(folderSeg)) {
+    return { valid: false, reason: 'INVALID_FOLDER' };
+  }
+
+  const ownerSeg = String(segments[1] || '').trim().toLowerCase();
+  const fileSeg = segments.slice(2).join('/').trim();
+  if (!ownerSeg || !fileSeg) {
+    return { valid: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+
+  const cleanUid = String(params.uid || '').trim().toLowerCase();
+  const cleanEmail = String(params.email || '').trim().toLowerCase();
+  const allowedOwners = new Set<string>();
+  if (cleanUid) {
+    allowedOwners.add(cleanUid);
+    allowedOwners.add(cleanUid.replace(/[^a-zA-Z0-9@._-]/g, '_'));
+    allowedOwners.add(cleanUid.replace(/[^a-zA-Z0-9_-]/g, '_'));
+  }
+  if (cleanEmail) {
+    allowedOwners.add(cleanEmail);
+    allowedOwners.add(cleanEmail.replace(/[^a-zA-Z0-9@._-]/g, '_'));
+    allowedOwners.add(cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_'));
+  }
+
+  if (allowedOwners.size === 0 || !allowedOwners.has(ownerSeg)) {
+    return { valid: false, reason: 'OWNERSHIP_MISMATCH' };
+  }
+
+  return { valid: true };
+}
+
 export const validateRenewPrice = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const body = req.body || {};
@@ -796,22 +921,23 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
 
     const autoActivateOrdersEnabled = isUserAuthorizedForAutoActivateNewOrders(uid, authEmail);
 
-    // When automatic activation is enabled, reject explicit cross-user storage path theft up front;
+    // When automatic activation is enabled, strictly validate storage slip ownership up front;
     // when AUTO_ACTIVATE_NEW_ORDERS_ENABLED=false, preserve 100% backward-compatible manual order submission.
     if (autoActivateOrdersEnabled && !isManualBilling) {
-      const parsedSlip = parsePaymentSlipReference(slipUrl);
-      if (parsedSlip.kind === 'storage') {
-        const segments = parsedSlip.objectPath.split('/').filter(Boolean);
-        const ownerSeg = segments.length >= 3 ? String(segments[1] || '').trim().toLowerCase() : '';
-        const allowedUid = uid.trim().toLowerCase();
-        const allowedSanitizedEmail = authEmail.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
-        if (ownerSeg && ownerSeg !== allowedUid && ownerSeg !== allowedSanitizedEmail) {
-          res.status(400).json({
-            success: false,
-            error: 'Payment slip ownership mismatch. Please upload your own payment receipt.',
-          });
-          return;
-        }
+      const ownershipCheck = isPaymentSlipStoragePathOwnedByUser({
+        slipUrl,
+        uid,
+        email: authEmail,
+      });
+      if (!ownershipCheck.valid) {
+        res.status(400).json({
+          success: false,
+          error:
+            ownershipCheck.reason === 'OWNERSHIP_MISMATCH'
+              ? 'Payment slip ownership mismatch. Please upload your own payment receipt.'
+              : 'Invalid payment slip path. Please upload your payment receipt again.',
+        });
+        return;
       }
     }
 
