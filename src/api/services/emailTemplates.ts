@@ -388,29 +388,63 @@ export const buildOrderReceivedTemplate = (data: {
   packageName: string;
   amount: number;
   paymentMethod?: string;
+  vlessUrl?: string;
+  expiryDate?: string;
+  provisional?: boolean;
 }): RenderedEmailTemplate => {
-  const subject = `Order Confirmation #${data.orderId} - FIREVPNs`;
+  const isProvisional = Boolean(data.provisional && data.vlessUrl);
+  const subject = isProvisional
+    ? `Order #${data.orderId} Activated (Payment Pending Verification) - FIREVPNs`
+    : `Order Confirmation #${data.orderId} - FIREVPNs`;
+  const formattedExpiry = data.expiryDate
+    ? new Date(data.expiryDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+    : undefined;
+
   return renderBrandedEmail({
     subject,
-    preheader: `Order #${data.orderId} for ${data.packageName} has been received and is pending verification.`,
-    badgeText: 'Order Received',
-    badgeVariant: 'info',
-    heading: 'Thank You for Your Order!',
+    preheader: isProvisional
+      ? `Your ${data.packageName} VPN is active immediately while your payment slip is pending admin verification.`
+      : `Order #${data.orderId} for ${data.packageName} has been received and is pending verification.`,
+    badgeText: isProvisional ? 'VPN Active • Payment Pending' : 'Order Received',
+    badgeVariant: isProvisional ? 'success' : 'info',
+    heading: isProvisional ? 'Your VPN Is Active Immediately!' : 'Thank You for Your Order!',
     greetingName: data.customerName,
-    introParagraphs: [
-      `We have successfully received your order for <strong>${escapeHtml(data.packageName)}</strong>. Our team is processing your payment verification.`
-    ],
+    introParagraphs: isProvisional
+      ? [
+          `We have received your order and payment slip for <strong>${escapeHtml(data.packageName)}</strong>. For your convenience, your full VPN package has been <strong>automatically activated</strong> immediately while our team verifies your payment receipt.`
+        ]
+      : [
+          `We have successfully received your order for <strong>${escapeHtml(data.packageName)}</strong>. Our team is processing your payment verification.`
+        ],
     infoRows: [
       { label: 'Order Reference:', value: `#${data.orderId}` },
       { label: 'Package:', value: data.packageName },
       { label: 'Amount:', value: `LKR ${data.amount}` },
-      { label: 'Payment Method:', value: data.paymentMethod || 'Bank Transfer / Manual Slip' }
+      { label: 'Payment Method:', value: data.paymentMethod || 'Bank Transfer / Manual Slip' },
+      ...(isProvisional
+        ? [
+            { label: 'VPN Access Status:', value: 'Active (Full Package)', tone: 'success' as const },
+            { label: 'Payment Status:', value: 'Pending Admin Verification', tone: 'warning' as const },
+            ...(formattedExpiry ? [{ label: 'Expiry Date:', value: formattedExpiry }] : []),
+          ]
+        : []),
     ],
-    outroParagraphs: [
-      'You will receive another email with your VLESS VPN access credentials as soon as your payment is verified.'
-    ],
+    codeBlock: isProvisional && data.vlessUrl
+      ? {
+          title: 'Your VLESS Connection Link',
+          description: 'Import this link directly into v2rayNG, V2Box, v2rayN, Shadowrocket, or Streisand:',
+          code: data.vlessUrl,
+        }
+      : undefined,
+    outroParagraphs: isProvisional
+      ? [
+          'You can connect right away using the VLESS link above or scan your QR code in the customer dashboard. Once our administrator verifies your payment slip, your order payment status will update to Paid.'
+        ]
+      : [
+          'You will receive another email with your VLESS VPN access credentials as soon as your payment is verified.'
+        ],
     cta: {
-      label: 'View Order Status',
+      label: isProvisional ? 'Open Customer Dashboard' : 'View Order Status',
       url: `${BRAND_PORTAL_URL}/dashboard`
     }
   });
@@ -512,6 +546,7 @@ export const buildPaymentRejectedTemplate = (data: {
   orderId: string;
   packageName: string;
   reason?: string;
+  vpnRevoked?: boolean;
 }): RenderedEmailTemplate => {
   const subject = `Order #${data.orderId} Update - Action Required - FIREVPNs`;
   return renderBrandedEmail({
@@ -522,11 +557,17 @@ export const buildPaymentRejectedTemplate = (data: {
     heading: 'Payment Verification Issue',
     greetingName: data.customerName,
     introParagraphs: [
-      `We were unable to verify your payment for order <strong>#${escapeHtml(data.orderId)}</strong> (${escapeHtml(data.packageName)}).`
+      `We were unable to verify your payment for order <strong>#${escapeHtml(data.orderId)}</strong> (${escapeHtml(data.packageName)}).`,
+      ...(data.vpnRevoked
+        ? ['Because the payment could not be verified, the provisional VPN access associated with this unpaid order has been deactivated.']
+        : []),
     ],
     infoRows: [
       { label: 'Order ID:', value: `#${data.orderId}` },
       { label: 'Package:', value: data.packageName },
+      ...(data.vpnRevoked
+        ? [{ label: 'VPN Status:', value: 'Deactivated (Unpaid Order)', tone: 'danger' as const }]
+        : []),
       {
         label: 'Reason:',
         value: data.reason || 'Invalid or unreadable payment slip uploaded.',

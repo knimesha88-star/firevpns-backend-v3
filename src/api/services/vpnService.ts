@@ -34,7 +34,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const deletedOrInactiveUuids = new Set<string>();
   vpnConfigsData.forEach(cfg => {
     const cfgStatus = String(cfg.status || '').toLowerCase().trim();
-    if (cfgStatus === 'deleted' || cfgStatus === 'rejected' || cfgStatus === 'cancelled' || cfgStatus === 'pending') {
+    if (
+      cfgStatus === 'deleted' ||
+      cfgStatus === 'rejected' ||
+      cfgStatus === 'cancelled' ||
+      cfgStatus === 'pending' ||
+      cfgStatus === 'disabled' ||
+      cfgStatus === 'revoked'
+    ) {
       if (cfg.uuid) deletedOrInactiveUuids.add(String(cfg.uuid).trim().toLowerCase());
     }
     const ibId = Number(cfg.inbound_id);
@@ -80,11 +87,42 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   }
   const allOrders: any[] = Array.from(ordersById.values());
 
+  const isOrderProvisionallyActive = (ord: any): boolean => {
+    const rawStatus = String(ord.status || '').toLowerCase().trim();
+    const rawPayStatus = String(ord.payment_status || '').toLowerCase().trim();
+    if (
+      rawStatus === 'rejected' ||
+      rawStatus === 'cancelled' ||
+      rawStatus === 'deleted' ||
+      rawStatus === 'expired' ||
+      rawPayStatus === 'cancelled' ||
+      rawPayStatus === 'rejected'
+    ) {
+      return false;
+    }
+    const provStatus = String(ord.provisioning_status || '').toLowerCase().trim();
+    if (provStatus === 'revoked' || provStatus === 'revoke_failed' || provStatus === 'rejected') {
+      return false;
+    }
+    const cUuid = String(ord.client_uuid || '').trim().toLowerCase();
+    if (cUuid && deletedOrInactiveUuids.has(cUuid)) {
+      return false;
+    }
+    return (
+      provStatus === 'provisional' &&
+      Boolean(ord.vless_url) &&
+      Boolean(ord.client_uuid)
+    );
+  };
+
   const nonApprovedOrderIds = new Set<string>();
   const nonApprovedOrderUuids = new Set<string>();
 
   allOrders.forEach(ord => {
     const rawStatus = String(ord.status || '').toLowerCase().trim();
+    if (isOrderProvisionallyActive(ord)) {
+      return;
+    }
     if (
       rawStatus === 'pending' ||
       rawStatus === 'rejected' ||
@@ -162,7 +200,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   } catch (err) {
   }
 
-  // 2. Match approved orders for this authenticated user
+  // 2. Match approved or provisionally active orders for this authenticated user
   const matchedDocs = allOrders.filter(doc => {
     const data = doc;
     const docUid = String(data.customer_id || data.customerUid || data.customerId || data.uid || data.userId || '').trim();
@@ -173,8 +211,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       ? (docUid === userUid || (!docUid && userEmail && docEmail === userEmail))
       : (userEmail && docEmail === userEmail);
 
-    // Order must be explicitly approved/completed/active (never pending, rejected, cancelled, deleted, or expired)
-    const isApproved = orderStatus === 'approved' || orderStatus === 'completed' || orderStatus === 'active';
+    const isApproved =
+      orderStatus === 'approved' ||
+      orderStatus === 'completed' ||
+      orderStatus === 'active' ||
+      isOrderProvisionallyActive(data);
 
     return matchesUser && isApproved;
   });
@@ -190,11 +231,14 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         pmJson = typeof data.payment_method === 'string' ? JSON.parse(data.payment_method) : (data.payment_method || {});
       } catch(e) {}
 
+      const isProvisionalOrd = isOrderProvisionallyActive(data);
       const existingIdx = configs.findIndex(c => c.uuid && c.uuid.toLowerCase() === normUuid);
       if (existingIdx >= 0) {
         if ((!configs[existingIdx].serverNode || configs[existingIdx].serverNode === 'Singapore') && (data.server || pmJson.server)) {
           configs[existingIdx].serverNode = data.server || pmJson.server;
         }
+        configs[existingIdx].paymentStatus = data.payment_status || (isProvisionalOrd ? 'Pending Verification' : 'Paid');
+        configs[existingIdx].provisioningStatus = data.provisioning_status || pmJson.provisioning_status || (isProvisionalOrd ? 'provisional' : 'completed');
       } else {
         const isTrialOrd = !!(pmJson.is_trial || pmJson.isTrial || pmJson.paymentMethod === 'Free Trial' || String(data.order_id || data.id || '').startsWith('TRIAL-'));
         const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
@@ -213,6 +257,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : (data.traffic_limit && String(data.traffic_limit).toLowerCase() !== 'unlimited' ? ((parseFloat(String(data.traffic_limit)) || 0) * 1024 * 1024 * 1024) : 0),
           isTrial: isTrialOrd,
           templateId: tplId,
+          paymentStatus: data.payment_status || (isProvisionalOrd ? 'Pending Verification' : 'Paid'),
+          provisioningStatus: data.provisioning_status || pmJson.provisioning_status || (isProvisionalOrd ? 'provisional' : 'completed'),
         });
       }
     }

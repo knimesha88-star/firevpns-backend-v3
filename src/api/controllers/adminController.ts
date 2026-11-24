@@ -44,17 +44,22 @@ export const getUsers = async (req: AuthRequest, res: Response): Promise<void> =
 export const executeOrderApproval = async (
   orderId: string,
   token?: string,
-  options?: { adminLabel?: string }
+  options?: xuiService.ProvisionOrderClientOptions
 ): Promise<any> => {
   console.log(`[AdminController] Calling xuiService.provisionOrderClient for orderId: ${orderId}`);
-  const result = await xuiService.provisionOrderClient(orderId, token);
-
-  syncOrderTelegramInlineMessage(orderId, 'APPROVED', {
-    adminLabel: options?.adminLabel || 'Website Admin',
-    uuid: result?.uuid
-  }).catch((err) => {
-    console.warn('[AdminController] Telegram inline message sync warning on approval:', err?.message || err);
+  const result = await xuiService.provisionOrderClient(orderId, token, {
+    ...options,
+    provisional: false,
   });
+
+  if (!result?.deduplicated && !options?.skipSideEffects) {
+    syncOrderTelegramInlineMessage(orderId, 'APPROVED', {
+      adminLabel: options?.adminLabel || 'Website Admin',
+      uuid: result?.uuid
+    }).catch((err) => {
+      console.warn('[AdminController] Telegram inline message sync warning on approval:', err?.message || err);
+    });
+  }
 
   return result;
 };
@@ -69,18 +74,26 @@ export const approveOrder = async (req: AuthRequest, res: Response): Promise<voi
     }
     const authHeader = req.headers.authorization || (req.headers as any)?.Authorization;
     const token = authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : undefined;
-    
+
     const result = await executeOrderApproval(orderId, token, {
       adminLabel: req.user?.email || 'Website Admin'
     });
     res.json({ success: true, ...result });
   } catch (error: any) {
-    console.error('[AdminController] Order approval provisioning error:', error.message);
-    res.status(400).json({ error: error.message || 'Provisioning template not found.' });
+    console.error('[AdminController] Order approval provisioning error:', error?.message || error);
+    const status = error?.statusCode === 409 ? 409 : error?.statusCode === 404 ? 404 : 400;
+    res.status(status).json({ error: error?.message || 'Provisioning template not found.' });
   }
 };
 
 export const verifyPayment = async (req: AuthRequest, res: Response): Promise<void> => {
+  let durableOrderLockKey = '';
+  let durableOrderLockOwnerId = '';
+  let ownsDurableLock = false;
+  let finalLockStatus: 'completed' | 'failed' = 'failed';
+  let finalLockError: string | null = null;
+  const dbClient = supabaseAdmin;
+
   try {
     const rawOrderId = String(req.params.orderId || req.body.orderId || '').trim();
     if (!rawOrderId) {
@@ -91,11 +104,19 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawOrderId);
     let existingOrder: any = null;
     if (isUuid) {
-      const { data } = await supabaseAdmin.from('orders').select('id, status, payment_status').eq('id', rawOrderId).maybeSingle();
+      const { data } = await dbClient
+        .from('orders')
+        .select('id, order_id, status, payment_status, provisioning_status, client_uuid')
+        .eq('id', rawOrderId)
+        .maybeSingle();
       existingOrder = data;
     }
     if (!existingOrder) {
-      const { data } = await supabaseAdmin.from('orders').select('id, status, payment_status').eq('order_id', rawOrderId).maybeSingle();
+      const { data } = await dbClient
+        .from('orders')
+        .select('id, order_id, status, payment_status, provisioning_status, client_uuid')
+        .eq('order_id', rawOrderId)
+        .maybeSingle();
       existingOrder = data;
     }
 
@@ -104,41 +125,147 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    const { error: updateErr } = await supabaseAdmin
+    durableOrderLockKey = `order:${existingOrder.id}`;
+    const lockRes = await xuiService.acquireDurableProvisioningOperationLock({
+      dbClient,
+      operationKey: durableOrderLockKey,
+      operationType: 'verify_payment',
+      targetId: String(existingOrder.id),
+      clientUuid: existingOrder.client_uuid || null,
+      requireDurableLock: xuiService.isAutoActivateNewOrdersFlagEnabled(),
+      metadata: {
+        orderId: existingOrder.order_id || existingOrder.id,
+        adminLabel: req.user?.email || 'Website Admin',
+      },
+    });
+
+    if (!lockRes.acquired) {
+      const status = !lockRes.tableAvailable && xuiService.isAutoActivateNewOrdersFlagEnabled() ? 503 : 409;
+      res.status(status).json({
+        error: lockRes.error || 'Another admin action is currently in progress for this order. Please retry shortly.',
+      });
+      return;
+    }
+
+    durableOrderLockOwnerId = lockRes.lockOwnerId;
+    ownsDurableLock = lockRes.tableAvailable;
+
+    // Re-read fresh order state inside the durable lock
+    const { data: freshOrder } = await dbClient
       .from('orders')
-      .update({
-        payment_status: 'Paid',
-        updated_at: new Date().toISOString()
-      })
+      .select('id, order_id, status, payment_status, provisioning_status, client_uuid')
+      .eq('id', existingOrder.id)
+      .maybeSingle();
+    if (freshOrder) {
+      existingOrder = freshOrder;
+    }
+
+    const statusLower = String(existingOrder.status || '').toLowerCase().trim();
+    const paymentStatusLower = String(existingOrder.payment_status || '').toLowerCase().trim();
+    const provStatusLower = String(existingOrder.provisioning_status || '').toLowerCase().trim();
+
+    if (
+      statusLower === 'rejected' ||
+      statusLower === 'cancelled' ||
+      paymentStatusLower === 'cancelled' ||
+      paymentStatusLower === 'rejected' ||
+      provStatusLower === 'revoked'
+    ) {
+      finalLockError = 'Order has already been rejected and cannot be marked Paid.';
+      res.status(409).json({ error: 'Cannot verify payment on a rejected or revoked order.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const isProvisionalOrder = provStatusLower === 'provisional';
+    const orderUpdatePayload: Record<string, any> = isProvisionalOrder
+      ? {
+          payment_status: 'Paid',
+          status: 'completed',
+          provisioning_status: 'completed',
+          updated_at: nowIso,
+        }
+      : {
+          payment_status: 'Paid',
+          updated_at: nowIso,
+        };
+
+    let { error: updateErr } = await dbClient
+      .from('orders')
+      .update(orderUpdatePayload)
       .eq('id', existingOrder.id);
 
+    if (updateErr && String(updateErr.message || '').includes('provisioning_status')) {
+      const { provisioning_status: _omitted, ...fallbackPayload } = orderUpdatePayload;
+      const retryRes = await dbClient.from('orders').update(fallbackPayload).eq('id', existingOrder.id);
+      updateErr = retryRes.error;
+    }
+
     if (updateErr) {
+      finalLockError = updateErr.message || 'Failed to verify payment.';
       console.error('[AdminController] Error verifying payment in DB:', updateErr);
       res.status(500).json({ error: safeServerError(updateErr, 'Failed to verify payment.') });
       return;
     }
 
+    if (isProvisionalOrder) {
+      try {
+        await dbClient
+          .from('vpn_entitlement_grants')
+          .update({
+            status: 'verified',
+            verified_at: nowIso,
+            verified_by: req.user?.email || 'Website Admin',
+            updated_at: nowIso,
+          })
+          .eq('order_id', existingOrder.id)
+          .in('status', ['provisioning', 'provisional']);
+      } catch {
+        // Non-blocking if ledger table is not installed in legacy mode
+      }
+    }
+
+    finalLockStatus = 'completed';
     res.json({ success: true, message: 'Payment verified successfully' });
   } catch (error: any) {
+    finalLockError = error?.message || String(error);
     console.error('[AdminController] Payment verification error:', error?.message || error);
     res.status(500).json({ error: safeServerError(error, 'Failed to verify payment.') });
+  } finally {
+    if (ownsDurableLock && durableOrderLockKey && durableOrderLockOwnerId) {
+      await xuiService.finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOrderLockKey,
+        lockOwnerId: durableOrderLockOwnerId,
+        status: finalLockStatus,
+        errorMessage: finalLockError,
+      });
+    }
   }
 };
 
 export const executeOrderRejection = async (
   orderId: string,
   reason = 'Rejected by Admin',
-  options?: { adminLabel?: string; skipSeparateTelegramNotification?: boolean }
-): Promise<{ order: any; message: string }> => {
+  options?: {
+    adminLabel?: string;
+    skipSeparateTelegramNotification?: boolean;
+    skipSideEffects?: boolean;
+    dbClient?: any;
+    requestApiFn?: any;
+    getInboundsFn?: any;
+  }
+): Promise<{ order: any; message: string; revocationResult?: any; alreadyRejected?: boolean }> => {
+  const dbClient = options?.dbClient || supabaseAdmin;
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(orderId).trim());
 
   let order: any = null;
   if (isUuid) {
-    const { data } = await supabaseAdmin.from('orders').select('*').eq('id', orderId).maybeSingle();
+    const { data } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
     order = data;
   }
   if (!order) {
-    const { data: qOrder } = await supabaseAdmin.from('orders').select('*').eq('order_id', orderId).maybeSingle();
+    const { data: qOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
     order = qOrder;
   }
 
@@ -148,104 +275,229 @@ export const executeOrderRejection = async (
     throw notFoundErr;
   }
 
-  // Update order status to rejected and payment_status to Cancelled
-  const rejectPayload = {
-    status: 'rejected',
-    payment_status: 'Cancelled',
-    updated_at: new Date().toISOString()
-  };
-
-  const { error: updateErr } = await supabaseAdmin.from('orders').update(rejectPayload).eq('id', order.id);
-  if (updateErr) {
-    console.error('[AdminController] Error rejecting order in DB:', updateErr);
-    throw new Error(`Failed to update order: ${updateErr.message}`);
-  }
-
-  // Create customer notification
-  try {
-    const isTrial = !!(
-      order.is_trial || 
-      String(order.order_id || '').startsWith('TRIAL-') ||
-      String(order.package_name || '').toLowerCase().includes('trial')
-    );
-
-    if (isTrial) {
-      console.log('[AdminController] Sending Trial Rejected notification');
-      await createCustomerNotification({
-        userId: order.customer_id || null,
-        userEmail: order.email,
-        title: 'Trial Rejected',
-        message: `Your free trial request was rejected: ${reason}`,
-        type: 'trial_rejected',
-        orderId: order.id
-      });
-    } else {
-      console.log('[AdminController] Sending Order Rejected and Payment Rejected notifications');
-      await createCustomerNotification({
-        userId: order.customer_id || null,
-        userEmail: order.email,
-        title: 'Order Rejected',
-        message: `Your order #${order.order_id || order.id} was rejected: ${reason}`,
-        type: 'order_rejected',
-        orderId: order.id
-      });
-      await createCustomerNotification({
-        userId: order.customer_id || null,
-        userEmail: order.email,
-        title: 'Payment Rejected',
-        message: `Your payment/order was rejected: ${reason}`,
-        type: 'payment_rejected',
-        orderId: order.id
-      });
-    }
-
-    // Send email notification non-blockingly
-    if (order.email) {
-      const canonicalOrderId = order.order_id || order.id;
-      if (isTrial) {
-        sendTrialRejectedEmail({
-          userEmail: order.email,
-          trialId: canonicalOrderId,
-          orderId: canonicalOrderId,
-          packageName: order.package_name || 'Free Trial',
-          reason: reason,
-          userId: order.customer_id
-        }).catch(e => console.warn('[AdminController] Trial rejected email warning:', e));
-      } else {
-        sendPaymentRejectedEmail({
-          userEmail: order.email,
-          orderId: canonicalOrderId,
-          packageName: order.package_name || 'VPN Plan',
-          reason: reason,
-          userId: order.customer_id
-        }).catch(e => console.warn('[AdminController] Payment rejected email warning:', e));
-      }
-    }
-  } catch (notifErr: any) {
-    console.error('[AdminController] CRITICAL: Customer notification creation failed during rejection:', notifErr.message || notifErr);
-  }
-
-  // Update inline Telegram message if one exists for this order
-  syncOrderTelegramInlineMessage(order.order_id || order.id, 'REJECTED', {
-    adminLabel: options?.adminLabel || 'Website Admin',
-    reason
-  }).catch((err) => {
-    console.warn('[AdminController] Telegram inline message sync warning on rejection:', err?.message || err);
+  // Acquire durable order-level lock FIRST so rejection and approval/auto-provisioning/verify-payment
+  // are strictly mutually exclusive across instances and processes.
+  const durableOrderLockKey = `order:${order.id}`;
+  const lockRes = await xuiService.acquireDurableProvisioningOperationLock({
+    dbClient,
+    operationKey: durableOrderLockKey,
+    operationType: 'reject_order',
+    targetId: String(order.id),
+    clientUuid: order.client_uuid || null,
+    requireDurableLock: xuiService.isAutoActivateNewOrdersFlagEnabled(),
+    metadata: {
+      orderId: order.order_id || order.id,
+      adminLabel: options?.adminLabel || 'Website Admin',
+      reason,
+    },
   });
 
-  // Send Telegram rejection summary notification unless handled by inline callback edit
-  if (!options?.skipSeparateTelegramNotification) {
-    try {
-      await sendOrderRejectedNotification({
-        customerEmail: order.email || 'N/A',
-        reason: reason
+  if (!lockRes.acquired) {
+    const conflictErr: any = new Error(
+      lockRes.error ||
+        `Order '${order.order_id || order.id}' is currently locked by another operation (${lockRes.previousOperationType || 'in_progress'}).`
+    );
+    conflictErr.statusCode = !lockRes.tableAvailable && xuiService.isAutoActivateNewOrdersFlagEnabled() ? 503 : 409;
+    throw conflictErr;
+  }
+
+  const ownsDurableLock = lockRes.tableAvailable;
+  const lockOwnerId = lockRes.lockOwnerId;
+  let finalLockStatus: 'completed' | 'failed' = 'failed';
+  let finalLockError: string | null = null;
+
+  let revocationResult: any = null;
+  let rejectPayload: Record<string, any> = {};
+  let vpnWasRevoked = false;
+
+  try {
+    // Re-read fresh order state INSIDE the durable lock so we never act on a stale snapshot
+    const { data: freshOrder } = await dbClient.from('orders').select('*').eq('id', order.id).maybeSingle();
+    if (freshOrder) {
+      order = freshOrder;
+    }
+
+    const statusLower = String(order.status || '').toLowerCase().trim();
+    const paymentStatusLower = String(order.payment_status || '').toLowerCase().trim();
+    const provStatusLower = String(order.provisioning_status || '').toLowerCase().trim();
+
+    if (
+      statusLower === 'completed' ||
+      statusLower === 'active' ||
+      statusLower === 'approved' ||
+      paymentStatusLower === 'paid' ||
+      paymentStatusLower === 'approved' ||
+      paymentStatusLower === 'verified'
+    ) {
+      finalLockError = `Order '${order.order_id || order.id}' is already approved/paid and cannot be rejected.`;
+      const conflictErr: any = new Error(finalLockError);
+      conflictErr.statusCode = 409;
+      throw conflictErr;
+    }
+
+    // If order is already rejected and does NOT need revoke_failed retry, return idempotently without duplicate notifications
+    if (statusLower === 'rejected' && provStatusLower !== 'revoke_failed') {
+      finalLockStatus = 'completed';
+      return {
+        order,
+        alreadyRejected: true,
+        revocationResult: { revoked: provStatusLower === 'revoked', reason: 'already_rejected' },
+        message: 'Order has already been rejected',
+      };
+    }
+
+    // Requirement 3: Mandatory rejection safety
+    // Before rejecting the order, check if it has a provisionally activated VPN entitlement in public.vpn_entitlement_grants
+    // and safely disable + read-back verify it on 3X-UI while holding the durable order lock.
+    // If 3X-UI revocation or read-back verification fails, revokeProvisionalOrderClient retains 'revoke_failed' and throws.
+    revocationResult = await xuiService.revokeProvisionalOrderClient(order.id, reason, {
+      adminLabel: options?.adminLabel || 'Website Admin',
+      dbClient,
+      requestApiFn: options?.requestApiFn,
+      getInboundsFn: options?.getInboundsFn,
+      heldOrderLockOwnerId: ownsDurableLock ? lockOwnerId : undefined,
+    });
+
+    vpnWasRevoked = Boolean(revocationResult?.revoked);
+
+    // Update order status to rejected and payment_status to Cancelled INSIDE the durable lock
+    const nowIso = new Date().toISOString();
+    rejectPayload = {
+      status: 'rejected',
+      payment_status: 'Cancelled',
+      ...(vpnWasRevoked ? { provisioning_status: 'revoked' } : {}),
+      updated_at: nowIso,
+    };
+
+    let { error: updateErr } = await dbClient.from('orders').update(rejectPayload).eq('id', order.id);
+    if (updateErr && String(updateErr.message || '').includes('provisioning_status')) {
+      const { provisioning_status: _omitted, ...fallbackRejectPayload } = rejectPayload;
+      const retryRes = await dbClient.from('orders').update(fallbackRejectPayload).eq('id', order.id);
+      updateErr = retryRes.error;
+    }
+    if (updateErr) {
+      finalLockError = `Failed to update order: ${updateErr.message}`;
+      console.error('[AdminController] Error rejecting order in DB:', updateErr);
+      throw new Error(finalLockError);
+    }
+
+    finalLockStatus = 'completed';
+  } catch (err: any) {
+    finalLockError = err?.message || String(err);
+    throw err;
+  } finally {
+    if (ownsDurableLock) {
+      await xuiService.finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOrderLockKey,
+        lockOwnerId,
+        status: finalLockStatus,
+        clientUuid: revocationResult?.clientUuid || order.client_uuid || null,
+        errorMessage: finalLockError,
       });
-    } catch (tgErr) {
-      console.warn('[AdminController] Telegram rejection notification warning:', tgErr);
     }
   }
 
-  return { order, message: 'Order rejected successfully' };
+  // Side-effect notifications run AFTER durable lock release and durable DB state commit
+  if (!options?.skipSideEffects) {
+    // Create customer notification
+    try {
+      const isTrial = !!(
+        order.is_trial ||
+        String(order.order_id || '').startsWith('TRIAL-') ||
+        String(order.package_name || '').toLowerCase().includes('trial')
+      );
+
+      if (isTrial) {
+        console.log('[AdminController] Sending Trial Rejected notification');
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Trial Rejected',
+          message: `Your free trial request was rejected: ${reason}`,
+          type: 'trial_rejected',
+          orderId: order.id
+        });
+      } else {
+        console.log('[AdminController] Sending Order Rejected and Payment Rejected notifications');
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Order Rejected',
+          message: vpnWasRevoked
+            ? `Your order #${order.order_id || order.id} was rejected (${reason}) and provisional VPN access has been deactivated.`
+            : `Your order #${order.order_id || order.id} was rejected: ${reason}`,
+          type: 'order_rejected',
+          orderId: order.id
+        });
+        await createCustomerNotification({
+          userId: order.customer_id || null,
+          userEmail: order.email,
+          title: 'Payment Rejected',
+          message: vpnWasRevoked
+            ? `Your payment was rejected (${reason}). Your provisional VPN connection has been deactivated.`
+            : `Your payment/order was rejected: ${reason}`,
+          type: 'payment_rejected',
+          orderId: order.id
+        });
+      }
+
+      // Send email notification non-blockingly
+      if (order.email) {
+        const canonicalOrderId = order.order_id || order.id;
+        if (isTrial) {
+          sendTrialRejectedEmail({
+            userEmail: order.email,
+            trialId: canonicalOrderId,
+            orderId: canonicalOrderId,
+            packageName: order.package_name || 'Free Trial',
+            reason: reason,
+            userId: order.customer_id
+          }).catch(e => console.warn('[AdminController] Trial rejected email warning:', e));
+        } else {
+          sendPaymentRejectedEmail({
+            userEmail: order.email,
+            orderId: canonicalOrderId,
+            packageName: order.package_name || 'VPN Plan',
+            reason: reason,
+            vpnRevoked: vpnWasRevoked,
+            userId: order.customer_id
+          }).catch(e => console.warn('[AdminController] Payment rejected email warning:', e));
+        }
+      }
+    } catch (notifErr: any) {
+      console.error('[AdminController] CRITICAL: Customer notification creation failed during rejection:', notifErr.message || notifErr);
+    }
+
+    // Update inline Telegram message if one exists for this order
+    syncOrderTelegramInlineMessage(order.order_id || order.id, 'REJECTED', {
+      adminLabel: options?.adminLabel || 'Website Admin',
+      reason
+    }).catch((err) => {
+      console.warn('[AdminController] Telegram inline message sync warning on rejection:', err?.message || err);
+    });
+
+    // Send Telegram rejection summary notification unless handled by inline callback edit
+    if (!options?.skipSeparateTelegramNotification) {
+      try {
+        await sendOrderRejectedNotification({
+          orderId: order.order_id || order.id,
+          customerEmail: order.email || 'N/A',
+          reason: vpnWasRevoked ? `${reason} (Provisional VPN Disabled)` : reason
+        });
+      } catch (tgErr) {
+        console.warn('[AdminController] Telegram rejection notification warning:', tgErr);
+      }
+    }
+  }
+
+  return {
+    order: { ...order, ...rejectPayload },
+    revocationResult,
+    message: vpnWasRevoked
+      ? 'Order rejected and provisional VPN client disabled on 3X-UI'
+      : 'Order rejected successfully'
+  };
 };
 
 export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -265,9 +517,19 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
     res.json({ success: true, message: 'Order rejected successfully' });
   } catch (error: any) {
     console.error('[AdminController] Order rejection error:', error?.message || error);
-    const status = error?.statusCode === 404 ? 404 : 500;
+    const status =
+      error?.statusCode === 404
+        ? 404
+        : error?.statusCode === 409
+        ? 409
+        : error?.statusCode === 503
+        ? 503
+        : 500;
     res.status(status).json({
-      error: status === 404 ? (error?.message || 'Order not found.') : safeServerError(error, 'Failed to reject order.')
+      error:
+        status === 404 || status === 409 || status === 503
+          ? (error?.message || 'Unable to reject order.')
+          : safeServerError(error, 'Failed to reject order.')
     });
   }
 };

@@ -259,6 +259,14 @@ export interface OrderNotificationData {
   slipName?: string;
   notes?: string;
   status?: string;
+  provisional?: boolean;
+  provisioningStatus?: string;
+  clientUuid?: string;
+  vlessUrl?: string;
+  expiryDate?: string;
+  autoActivationBlockedReason?: string;
+  dbClient?: any;
+  fetchFn?: typeof fetch;
 }
 
 interface StoredTelegramOrderMessage {
@@ -269,6 +277,109 @@ interface StoredTelegramOrderMessage {
 
 const orderTelegramMessageCache = new Map<string, StoredTelegramOrderMessage>();
 const inFlightTelegramOrderActions = new Set<string>();
+
+interface NotificationDispatchClaimResult {
+  proceed: boolean;
+  dispatchId: string | null;
+  duplicatePrevented: boolean;
+  existingStatus?: string | null;
+}
+
+const isMissingNotificationRpcError = (err: any): boolean => {
+  const code = String(err?.code || '');
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'PGRST202' ||
+    code === 'PGRST205' ||
+    code === '42883' ||
+    code === '42P01' ||
+    msg.includes('claim_notification_dispatch') ||
+    msg.includes('notification_dispatches')
+  );
+};
+
+async function claimTelegramDispatch(params: {
+  dbClient: any;
+  eventType: string;
+  referenceId: string;
+  recipient: string;
+}): Promise<NotificationDispatchClaimResult> {
+  const { dbClient, eventType, referenceId, recipient } = params;
+  if (!referenceId || referenceId === 'N/A' || !dbClient || typeof dbClient.rpc !== 'function') {
+    return { proceed: true, dispatchId: null, duplicatePrevented: false };
+  }
+
+  try {
+    const { data, error } = await dbClient.rpc('claim_notification_dispatch', {
+      p_channel: 'telegram',
+      p_event_type: eventType,
+      p_reference_id: String(referenceId).trim(),
+      p_recipient: String(recipient || '').trim().toLowerCase(),
+      p_stale_seconds: 120,
+    });
+
+    if (error) {
+      if (isMissingNotificationRpcError(error)) {
+        return { proceed: true, dispatchId: null, duplicatePrevented: false };
+      }
+      console.warn(`[TelegramService] claim_notification_dispatch warning (${eventType}/${referenceId}):`, error.message || error);
+      return { proceed: true, dispatchId: null, duplicatePrevented: false };
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) {
+      return { proceed: true, dispatchId: null, duplicatePrevented: false };
+    }
+
+    if (!row.claimed) {
+      return {
+        proceed: false,
+        dispatchId: row.dispatch_id || null,
+        duplicatePrevented: true,
+        existingStatus: row.existing_status || null,
+      };
+    }
+
+    return {
+      proceed: true,
+      dispatchId: row.dispatch_id || null,
+      duplicatePrevented: false,
+    };
+  } catch (err: any) {
+    if (!isMissingNotificationRpcError(err)) {
+      console.warn(`[TelegramService] claimTelegramDispatch exception (${eventType}/${referenceId}):`, err?.message || err);
+    }
+    return { proceed: true, dispatchId: null, duplicatePrevented: false };
+  }
+}
+
+async function finalizeTelegramDispatch(params: {
+  dbClient: any;
+  dispatchId: string | null;
+  status: 'sent' | 'failed' | 'uncertain';
+  chatId?: string | null;
+  messageId?: number | null;
+  errorMessage?: string | null;
+  metadata?: Record<string, any>;
+}): Promise<void> {
+  if (!params.dispatchId || !params.dbClient) return;
+  try {
+    await params.dbClient
+      .from('notification_dispatches')
+      .update({
+        status: params.status,
+        ...(params.chatId ? { chat_id: String(params.chatId) } : {}),
+        ...(params.messageId ? { message_id: Number(params.messageId) } : {}),
+        ...(params.messageId ? { provider_message_id: String(params.messageId) } : {}),
+        error_message: params.errorMessage || null,
+        ...(params.metadata ? { metadata: params.metadata } : {}),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', params.dispatchId);
+  } catch {
+    // Non-critical update
+  }
+}
 
 const formatColomboTimestamp = (): string => {
   try {
@@ -349,9 +460,23 @@ const resolvePaymentSlipSummaryForTelegram = async (data: OrderNotificationData)
 export const sendNewOrderNotification = async (data: OrderNotificationData): Promise<void> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+  const dbClient = data.dbClient || supabaseAdmin;
+  const fetchCall = data.fetchFn || fetch;
 
   if (!botToken || !chatId) {
     console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram new order notification.');
+    return;
+  }
+
+  const canonicalRef = String(data.orderDocId || data.orderId || '').trim();
+  const dispatchClaim = await claimTelegramDispatch({
+    dbClient,
+    eventType: 'order_created',
+    referenceId: canonicalRef,
+    recipient: String(chatId),
+  });
+  if (!dispatchClaim.proceed) {
+    console.log(`[TelegramService] Duplicate order_created Telegram notification prevented for ${canonicalRef} (status=${dispatchClaim.existingStatus}).`);
     return;
   }
 
@@ -378,6 +503,14 @@ export const sendNewOrderNotification = async (data: OrderNotificationData): Pro
 
   const currentDateTime = formatColomboTimestamp();
   const slipInfoBlock = await resolvePaymentSlipSummaryForTelegram(data);
+
+  const isProvisional = Boolean(data.provisional || data.provisioningStatus === 'provisional');
+  const blockedNote = data.autoActivationBlockedReason
+    ? `\n⚠️ Auto-Activation Held (${data.autoActivationBlockedReason}) — Manual Review Required`
+    : '';
+  const statusDisplayBlock = isProvisional
+    ? `🟡 ${currentStatus}\n⚡ VPN Status: Active (Full Package - Provisional)`
+    : `🟡 ${currentStatus}${blockedNote}`;
 
   const text = `🛒 NEW FIREVPNs ORDER
 
@@ -411,7 +544,7 @@ ${slipInfoBlock}
 ${currentDateTime}
 
 Status:
-🟡 ${currentStatus}`;
+${statusDisplayBlock}`;
 
   const callbackOrderId = String(
     data.orderId && data.orderId !== 'N/A'
@@ -453,7 +586,7 @@ Status:
       payload.reply_markup = replyMarkup;
     }
 
-    const response = await fetch(url, {
+    const response = await fetchCall(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(8000),
@@ -463,15 +596,36 @@ Status:
     if (!response.ok) {
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'failed',
+        errorMessage: `HTTP ${response.status}`,
+      });
       return;
     }
 
     const resJson: any = await response.json().catch(() => null);
     const sentMsg = resJson?.result;
-    if (sentMsg?.message_id && sentMsg?.chat?.id) {
+    const sentChatId = sentMsg?.chat?.id ? String(sentMsg.chat.id) : String(chatId);
+    const sentMessageId = sentMsg?.message_id ? Number(sentMsg.message_id) : null;
+
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'sent',
+      chatId: sentChatId,
+      messageId: sentMessageId,
+      metadata: {
+        orderId: data.orderId || null,
+        orderDocId: data.orderDocId || null,
+      },
+    });
+
+    if (sentMessageId && sentChatId) {
       const storedMsg: StoredTelegramOrderMessage = {
-        chatId: String(sentMsg.chat.id),
-        messageId: Number(sentMsg.message_id),
+        chatId: sentChatId,
+        messageId: sentMessageId,
         text,
       };
       if (data.orderId && data.orderId !== 'N/A') {
@@ -480,41 +634,16 @@ Status:
       if (data.orderDocId) {
         orderTelegramMessageCache.set(String(data.orderDocId).trim(), storedMsg);
       }
-
-      // Persist tg_chat_id and tg_message_id into order.payment_method JSON metadata so website approvals can also edit the Telegram message
-      const lookupCol = data.orderDocId ? 'id' : 'order_id';
-      const lookupVal = data.orderDocId || data.orderId;
-      if (lookupVal && lookupVal !== 'N/A') {
-        try {
-          const { data: ordRow } = await supabaseAdmin
-            .from('orders')
-            .select('id, order_id, payment_method')
-            .eq(lookupCol, lookupVal)
-            .maybeSingle();
-          if (ordRow) {
-            if (ordRow.id) orderTelegramMessageCache.set(String(ordRow.id), storedMsg);
-            if (ordRow.order_id) orderTelegramMessageCache.set(String(ordRow.order_id), storedMsg);
-            let extra: any = {};
-            if (typeof ordRow.payment_method === 'string' && ordRow.payment_method.startsWith('{')) {
-              try {
-                extra = JSON.parse(ordRow.payment_method);
-              } catch {
-                extra = {};
-              }
-            }
-            extra.tg_chat_id = storedMsg.chatId;
-            extra.tg_message_id = storedMsg.messageId;
-            await supabaseAdmin
-              .from('orders')
-              .update({ payment_method: JSON.stringify(extra) })
-              .eq('id', ordRow.id);
-          }
-        } catch {
-          // Non-critical metadata update
-        }
-      }
     }
   } catch (err: any) {
+    // Network timeout or abort leaves external Telegram delivery state uncertain;
+    // mark 'uncertain' so automated retries do not blindly double-send.
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'uncertain',
+      errorMessage: err?.message || String(err),
+    });
     console.error('[TelegramService] Failed to send Telegram new order notification:', err?.message || err);
   }
 };
@@ -533,14 +662,30 @@ export interface OrderApprovedNotificationData {
   uuid?: string;
   orderId?: string;
   status?: string;
+  dbClient?: any;
+  fetchFn?: typeof fetch;
 }
 
 export const sendOrderApprovedNotification = async (data: OrderApprovedNotificationData): Promise<void> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+  const dbClient = data.dbClient || supabaseAdmin;
+  const fetchCall = data.fetchFn || fetch;
 
   if (!botToken || !chatId) {
     console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram order approved notification.');
+    return;
+  }
+
+  const orderId = data.orderId || 'N/A';
+  const dispatchClaim = await claimTelegramDispatch({
+    dbClient,
+    eventType: 'order_approved',
+    referenceId: orderId,
+    recipient: String(chatId),
+  });
+  if (!dispatchClaim.proceed) {
+    console.log(`[TelegramService] Duplicate order_approved Telegram notification prevented for ${orderId} (status=${dispatchClaim.existingStatus}).`);
     return;
   }
 
@@ -552,7 +697,6 @@ export const sendOrderApprovedNotification = async (data: OrderApprovedNotificat
   const rawPrice = data.price !== undefined ? data.price : (data.amount !== undefined ? data.amount : 0);
   const priceStr = typeof rawPrice === 'number' ? rawPrice.toLocaleString() : Number(rawPrice).toLocaleString();
   const uuid = data.uuid || 'N/A';
-  const orderId = data.orderId || 'N/A';
 
   const text = `✅ FIREVPNs ORDER APPROVED
 
@@ -595,7 +739,7 @@ VPN has been generated successfully.`;
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const response = await fetch(url, {
+    const response = await fetchCall(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(8000),
@@ -608,9 +752,29 @@ VPN has been generated successfully.`;
     if (!response.ok) {
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'failed',
+        errorMessage: `HTTP ${response.status}`,
+      });
     } else {
+      const resJson: any = await response.json().catch(() => null);
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'sent',
+        chatId: String(resJson?.result?.chat?.id || chatId),
+        messageId: resJson?.result?.message_id ? Number(resJson.result.message_id) : null,
+      });
     }
   } catch (err: any) {
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'uncertain',
+      errorMessage: err?.message || String(err),
+    });
     console.error('[TelegramService] Failed to send Telegram order approved notification:', err?.message || err);
   }
 };
@@ -728,14 +892,30 @@ export interface OrderRejectedNotificationData {
   customerEmail?: string;
   email?: string;
   reason?: string;
+  orderId?: string;
+  dbClient?: any;
+  fetchFn?: typeof fetch;
 }
 
 export const sendOrderRejectedNotification = async (data: OrderRejectedNotificationData): Promise<void> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+  const dbClient = data.dbClient || supabaseAdmin;
+  const fetchCall = data.fetchFn || fetch;
 
   if (!botToken || !chatId) {
     console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram order rejected notification.');
+    return;
+  }
+
+  const dispatchClaim = await claimTelegramDispatch({
+    dbClient,
+    eventType: 'order_rejected',
+    referenceId: String(data.orderId || '').trim(),
+    recipient: String(chatId),
+  });
+  if (!dispatchClaim.proceed) {
+    console.log(`[TelegramService] Duplicate order_rejected Telegram notification prevented for ${data.orderId} (status=${dispatchClaim.existingStatus}).`);
     return;
   }
 
@@ -752,7 +932,7 @@ ${reason}`;
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const response = await fetch(url, {
+    const response = await fetchCall(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(8000),
@@ -765,9 +945,29 @@ ${reason}`;
     if (!response.ok) {
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'failed',
+        errorMessage: `HTTP ${response.status}`,
+      });
     } else {
+      const resJson: any = await response.json().catch(() => null);
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'sent',
+        chatId: String(resJson?.result?.chat?.id || chatId),
+        messageId: resJson?.result?.message_id ? Number(resJson.result.message_id) : null,
+      });
     }
   } catch (err: any) {
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'uncertain',
+      errorMessage: err?.message || String(err),
+    });
     console.error('[TelegramService] Failed to send Telegram order rejected notification:', err?.message || err);
   }
 };
@@ -1049,6 +1249,33 @@ export const syncOrderTelegramInlineMessage = async (
       orderTelegramMessageCache.get(String(orderRow.id || '')) ||
       orderTelegramMessageCache.get(String(orderRow.order_id || ''));
 
+    // Primary durable lookup: notification_dispatches table (keeps orders.payment_method untouched)
+    if (!cached) {
+      try {
+        const refCandidates = [String(orderRow.id || '').trim(), String(orderRow.order_id || '').trim()].filter(Boolean);
+        for (const ref of refCandidates) {
+          const { data: dispatchRow } = await supabaseAdmin
+            .from('notification_dispatches')
+            .select('chat_id, message_id')
+            .eq('channel', 'telegram')
+            .eq('event_type', 'order_created')
+            .eq('reference_id', ref)
+            .maybeSingle();
+          if (dispatchRow?.chat_id && dispatchRow?.message_id) {
+            cached = {
+              chatId: String(dispatchRow.chat_id),
+              messageId: Number(dispatchRow.message_id),
+              text: '',
+            };
+            break;
+          }
+        }
+      } catch {
+        // Ignore if notification_dispatches table is not migrated yet
+      }
+    }
+
+    // Read-only backward-compatible fallback for pre-migration orders that already stored tg_chat_id
     if (!cached && typeof orderRow.payment_method === 'string' && orderRow.payment_method.startsWith('{')) {
       try {
         const extra = JSON.parse(orderRow.payment_method);
@@ -1316,12 +1543,16 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       // Ignore lookup warning
     }
 
+    // An order is only considered already approved when its order status or payment_status is approved/completed/paid.
+    // Provisionally activated orders have vless_url and vpn_configs while status='pending' and payment_status='Pending Verification',
+    // and MUST remain actionable by Telegram Approve / Reject buttons.
     const isAlreadyApproved =
       statusLower === 'completed' ||
       statusLower === 'active' ||
       statusLower === 'approved' ||
-      Boolean(order.vless_url) ||
-      Boolean(existingVpnConfig?.vless_link || existingVpnConfig?.vless_url || existingVpnConfig?.uuid);
+      paymentStatusLower === 'paid' ||
+      paymentStatusLower === 'approved' ||
+      paymentStatusLower === 'verified';
 
     if (isAlreadyApproved) {
       logTelegramAdminAction({
@@ -1401,6 +1632,18 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       const result = await executeOrderApproval(order.id, undefined, {
         adminLabel: `Telegram Admin ${adminDisplayLabel}`,
       });
+
+      if (result?.deduplicated) {
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: lockedCanonicalOrderId,
+          action: 'APPROVE_ORDER',
+          outcome: 'DEDUPLICATED_IN_PROGRESS',
+          timestamp,
+        });
+        return;
+      }
 
       if (messageChatId && messageId) {
         await editTelegramOrderMessage({

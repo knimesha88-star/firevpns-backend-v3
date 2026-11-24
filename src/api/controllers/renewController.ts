@@ -14,6 +14,41 @@ import {
 } from '../services/emailService.js';
 
 import { verifyRenewalCheckoutPrice, verifySpecialOfferCheckoutPrice } from '../services/specialOfferService.js';
+import {
+  computePaymentSlipSha256AndVerifyStorage,
+  claimPaymentReceiptForAutoActivation,
+  parsePaymentSlipReference,
+} from '../services/paymentSlipService.js';
+
+/**
+ * Feature flag helpers (Requirement 7 & 8):
+ * Both flags default to false. Automatic renewals are strictly disabled in Phase 1.
+ */
+export const isAutoActivateNewOrdersEnabled = (): boolean =>
+  String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || 'false').trim().toLowerCase() === 'true';
+
+/**
+ * Optional controlled rollout allowlist (comma-separated lowercase emails or user UIDs).
+ * When AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true AND AUTO_ACTIVATE_NEW_ORDERS_ALLOWLIST is non-empty,
+ * ONLY matching authorized test accounts receive automatic provisional activation; all other
+ * customers remain on the normal manual verification queue.
+ */
+export const getAutoActivateNewOrdersAllowlist = (): string[] =>
+  String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ALLOWLIST || '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+
+export const isUserAuthorizedForAutoActivateNewOrders = (uid?: string | null, email?: string | null): boolean => {
+  if (!isAutoActivateNewOrdersEnabled()) return false;
+  const allowlist = getAutoActivateNewOrdersAllowlist();
+  if (allowlist.length === 0) return true;
+  const normUid = String(uid || '').trim().toLowerCase();
+  const normEmail = String(email || '').trim().toLowerCase();
+  return Boolean((normUid && allowlist.includes(normUid)) || (normEmail && allowlist.includes(normEmail)));
+};
+
+export const isAutoActivateRenewalsEnabled = (): boolean => false;
 
 export const validateRenewPrice = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -723,6 +758,63 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
+    const dbClient = supabaseAdmin || supabase;
+
+    // Idempotency / duplicate-retry protection: if an identical pending order for this customer & slip was just created, return it instead of creating a duplicate
+    const twoMinutesAgoIso = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const { data: existingPendingOrder } = await dbClient
+      .from('orders')
+      .select('*')
+      .eq('customer_id', uid)
+      .eq('slip_url', slipUrl)
+      .eq('status', 'pending')
+      .gte('created_at', twoMinutesAgoIso)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingPendingOrder) {
+      res.status(200).json({
+        success: true,
+        deduplicated: true,
+        order: existingPendingOrder,
+        orderDocId: existingPendingOrder.id,
+        orderId: existingPendingOrder.order_id,
+        message: 'Order already submitted and pending payment verification.'
+      });
+      return;
+    }
+
+    // Basic path traversal protection always applies without breaking legacy manual slip URL formats.
+    if (slipUrl.includes('..') || slipUrl.includes('\0')) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid payment slip path.',
+      });
+      return;
+    }
+
+    const autoActivateOrdersEnabled = isUserAuthorizedForAutoActivateNewOrders(uid, authEmail);
+
+    // When automatic activation is enabled, reject explicit cross-user storage path theft up front;
+    // when AUTO_ACTIVATE_NEW_ORDERS_ENABLED=false, preserve 100% backward-compatible manual order submission.
+    if (autoActivateOrdersEnabled && !isManualBilling) {
+      const parsedSlip = parsePaymentSlipReference(slipUrl);
+      if (parsedSlip.kind === 'storage') {
+        const segments = parsedSlip.objectPath.split('/').filter(Boolean);
+        const ownerSeg = segments.length >= 3 ? String(segments[1] || '').trim().toLowerCase() : '';
+        const allowedUid = uid.trim().toLowerCase();
+        const allowedSanitizedEmail = authEmail.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+        if (ownerSeg && ownerSeg !== allowedUid && ownerSeg !== allowedSanitizedEmail) {
+          res.status(400).json({
+            success: false,
+            error: 'Payment slip ownership mismatch. Please upload your own payment receipt.',
+          });
+          return;
+        }
+      }
+    }
+
     let verifiedPrice: {
       originalPrice: number;
       discountAmount: number;
@@ -826,40 +918,12 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       payment_method: JSON.stringify(paymentMetadata),
       payment_status: 'Pending Verification',
       status: 'pending',
+      provisioning_status: 'pending',
       slip_url: slipUrl,
       vless_url: null,
       client_uuid: null,
       created_at: new Date().toISOString(),
     };
-
-    const dbClient = supabaseAdmin || supabase;
-
-    // Idempotency / duplicate-retry protection: if an identical pending order for this customer & slip was just created, return it instead of creating a duplicate
-    const twoMinutesAgoIso = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { data: existingPendingOrder } = await dbClient
-      .from('orders')
-      .select('*')
-      .eq('customer_id', uid)
-      .eq('slip_url', slipUrl)
-      .eq('package_name', packageName)
-      .eq('status', 'pending')
-      .gte('created_at', twoMinutesAgoIso)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (existingPendingOrder) {
-      res.status(200).json({
-        success: true,
-        deduplicated: true,
-        order: existingPendingOrder,
-        orderDocId: existingPendingOrder.id,
-        orderId: existingPendingOrder.order_id || generatedOrderId,
-        verifiedPrice,
-        message: 'Order already submitted and pending payment verification.'
-      });
-      return;
-    }
 
     let { data: insertedOrder, error: insertErr } = await dbClient
       .from('orders')
@@ -867,10 +931,22 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       .select('*')
       .maybeSingle();
 
+    if (insertErr && String(insertErr.message || '').includes('provisioning_status')) {
+      const { provisioning_status: _omitted, ...fallbackOrderPayload } = orderPayload;
+      const retryNoProvCol = await dbClient
+        .from('orders')
+        .insert(fallbackOrderPayload)
+        .select('*')
+        .maybeSingle();
+      insertedOrder = retryNoProvCol.data;
+      insertErr = retryNoProvCol.error;
+    }
+
     if (insertErr && (insertErr.message?.includes('payment_status') || insertErr.code === '23514')) {
+      const { provisioning_status: _omitted, ...fallbackOrderPayload } = orderPayload;
       const retry = await dbClient
         .from('orders')
-        .insert({ ...orderPayload, payment_status: 'Pending' })
+        .insert({ ...fallbackOrderPayload, payment_status: 'Pending' })
         .select('*')
         .maybeSingle();
       insertedOrder = retry.data;
@@ -881,6 +957,84 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       console.error('[RenewController] Authoritative order insert failed:', insertErr?.message || insertErr);
       res.status(500).json({ success: false, error: 'Failed to create order. Please try again.' });
       return;
+    }
+
+    // Requirement 1: Automatic New Order Activation (when AUTO_ACTIVATE_NEW_ORDERS_ENABLED === 'true')
+    // Before auto-activating, verify actual uploaded slip bytes + compute SHA-256 and atomically claim the receipt
+    // in PostgreSQL (public.claim_payment_receipt). If receipt verification or atomic claim fails (e.g. duplicate file
+    // or renamed duplicate image), hold automatic activation and preserve the order in the manual pending admin queue.
+    let autoActivationResult: any = null;
+    let autoActivationBlockedReason: string | null = null;
+    if (autoActivateOrdersEnabled && !isManualBilling) {
+      try {
+        const slipCheck = await computePaymentSlipSha256AndVerifyStorage({
+          slipUrl,
+          userUid: uid,
+          userEmail: authEmail,
+          allowedFolders: ['orders', 'billing'],
+          storageClient: dbClient.storage,
+        });
+
+        if (!slipCheck.valid) {
+          autoActivationBlockedReason = slipCheck.code || 'SLIP_VERIFICATION_FAILED';
+          console.warn(
+            `[RenewController] Auto-activation held for order ${insertedOrder.order_id || insertedOrder.id} (${autoActivationBlockedReason}): ${slipCheck.error || 'Slip verification failed'}`
+          );
+        } else {
+          const claimRes = await claimPaymentReceiptForAutoActivation({
+            sha256: slipCheck.sha256,
+            canonicalSlipUrl: slipCheck.canonicalSlipUrl,
+            orderId: insertedOrder.id,
+            userId: uid,
+            userEmail: authEmail,
+            byteSize: slipCheck.byteSize,
+            contentType: slipCheck.contentType,
+            dbClient,
+          });
+
+          if (!claimRes.claimed) {
+            autoActivationBlockedReason = claimRes.conflictReason || claimRes.code || 'DUPLICATE_SLIP';
+            console.warn(
+              `[RenewController] Auto-activation held for order ${insertedOrder.order_id || insertedOrder.id} (${autoActivationBlockedReason}): ${claimRes.error || 'Receipt claim blocked'}`
+            );
+          } else {
+            console.log(
+              `[RenewController] AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true: Receipt claimed (${slipCheck.sha256.slice(0, 12)}...). Provisioning full purchased VPN package for order ${insertedOrder.order_id || insertedOrder.id} (payment remains Pending Verification)...`
+            );
+            autoActivationResult = await xuiService.provisionOrderClient(insertedOrder.id, undefined, {
+              provisional: true,
+              dbClient,
+            });
+            if (autoActivationResult?.success && autoActivationResult?.vlessUrl) {
+              const { data: refreshedOrder } = await dbClient
+                .from('orders')
+                .select('*')
+                .eq('id', insertedOrder.id)
+                .maybeSingle();
+              if (refreshedOrder) {
+                insertedOrder = refreshedOrder;
+              } else {
+                insertedOrder = {
+                  ...insertedOrder,
+                  client_uuid: autoActivationResult.uuid,
+                  vless_url: autoActivationResult.vlessUrl,
+                  subscription_url: autoActivationResult.subscriptionUrl || autoActivationResult.vlessUrl,
+                  expiry_date: autoActivationResult.expiryDate || insertedOrder.expiry_date,
+                  provisioning_status: 'provisional',
+                  payment_status: 'Pending Verification',
+                  status: 'pending',
+                };
+              }
+            }
+          }
+        }
+      } catch (autoErr: any) {
+        autoActivationBlockedReason = autoActivationBlockedReason || 'PROVISIONING_ERROR';
+        console.error(
+          `[RenewController] Provisional automatic VPN activation failed for order ${insertedOrder.id} (order preserved in pending queue for manual admin review):`,
+          autoErr?.message || autoErr
+        );
+      }
     }
 
     let resolvedCustomerName = String(
@@ -905,6 +1059,8 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       resolvedCustomerName = authEmail.split('@')[0] || 'Customer';
     }
 
+    const isProvisionallyActive = Boolean(insertedOrder.vless_url && insertedOrder.client_uuid);
+
     const notificationData = {
       orderId: insertedOrder.order_id || generatedOrderId,
       orderDocId: insertedOrder.id,
@@ -928,6 +1084,12 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       slipName: paymentMetadata.slipName || '',
       notes: paymentMetadata.notes || '',
       status: insertedOrder.payment_status || 'Pending Verification',
+      provisional: isProvisionallyActive,
+      provisioningStatus: isProvisionallyActive ? 'provisional' : 'pending',
+      autoActivationBlockedReason: autoActivationBlockedReason || undefined,
+      clientUuid: insertedOrder.client_uuid || undefined,
+      vlessUrl: insertedOrder.vless_url || undefined,
+      expiryDate: insertedOrder.expiry_date || undefined,
     };
 
     try {
@@ -953,9 +1115,13 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
 
     sendOrderReceivedEmail({
       userEmail: authEmail,
+      customerName: resolvedCustomerName,
       orderId: notificationData.orderId,
       packageName: notificationData.plan,
       amount: Number(notificationData.amount) || 0,
+      vlessUrl: insertedOrder.vless_url || undefined,
+      expiryDate: insertedOrder.expiry_date || undefined,
+      provisional: isProvisionallyActive,
       userId: uid
     }).catch(e => console.warn('[RenewController] Order received email warning:', e));
 
@@ -968,8 +1134,17 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       order: insertedOrder,
       orderDocId: insertedOrder.id,
       orderId: insertedOrder.order_id || generatedOrderId,
+      provisional: isProvisionallyActive,
+      autoActivated: isProvisionallyActive,
+      autoActivationBlockedReason: autoActivationBlockedReason || null,
+      vlessUrl: insertedOrder.vless_url || null,
+      subscriptionUrl: insertedOrder.subscription_url || insertedOrder.vless_url || null,
+      clientUuid: insertedOrder.client_uuid || null,
+      expiryDate: insertedOrder.expiry_date || null,
       verifiedPrice,
-      message: 'Order created and submitted for payment verification.'
+      message: isProvisionallyActive
+        ? 'Order submitted and VPN package automatically activated! Payment verification is pending admin review.'
+        : 'Order created and submitted for payment verification.'
     });
   } catch (error: any) {
     console.error('[RenewController] createOrder error:', error?.message || error);
@@ -1092,6 +1267,61 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
               payment_method: JSON.stringify(extra),
             })
             .eq('id', existingOrder.id);
+
+          if (isUserAuthorizedForAutoActivateNewOrders(uid, authEmail) && resolvedExtra.source !== 'billing_page') {
+            const candidateSlip = String(
+              data.slipUrl || existingOrder.slip_url || extra.slipUrl || extra.slip_url || ''
+            ).trim();
+            try {
+              const slipCheck = await computePaymentSlipSha256AndVerifyStorage({
+                slipUrl: candidateSlip,
+                userUid: uid,
+                userEmail: authEmail,
+                allowedFolders: ['orders', 'billing'],
+                storageClient: dbClient.storage,
+              });
+
+              if (!slipCheck.valid) {
+                console.warn(
+                  `[RenewController] createOrderNotification auto-activation held for ${existingOrder.id} (${slipCheck.code}): ${slipCheck.error}`
+                );
+              } else {
+                const claimRes = await claimPaymentReceiptForAutoActivation({
+                  sha256: slipCheck.sha256,
+                  canonicalSlipUrl: slipCheck.canonicalSlipUrl,
+                  orderId: existingOrder.id,
+                  userId: uid,
+                  userEmail: authEmail,
+                  byteSize: slipCheck.byteSize,
+                  contentType: slipCheck.contentType,
+                  dbClient,
+                });
+
+                if (!claimRes.claimed) {
+                  console.warn(
+                    `[RenewController] createOrderNotification auto-activation held for ${existingOrder.id} (${claimRes.conflictReason || claimRes.code}): ${claimRes.error}`
+                  );
+                } else {
+                  const autoProvRes = await xuiService.provisionOrderClient(existingOrder.id, undefined, {
+                    provisional: true,
+                    dbClient,
+                  });
+                  if (autoProvRes?.success && autoProvRes?.vlessUrl) {
+                    resolvedOrderRow = {
+                      ...existingOrder,
+                      vless_url: autoProvRes.vlessUrl,
+                      subscription_url: autoProvRes.subscriptionUrl || autoProvRes.vlessUrl,
+                      client_uuid: autoProvRes.uuid,
+                      expiry_date: autoProvRes.expiryDate,
+                      provisioning_status: 'provisional',
+                    };
+                  }
+                }
+              }
+            } catch (autoErr: any) {
+              console.error(`[RenewController] createOrderNotification provisional activation error for ${existingOrder.id}:`, autoErr?.message || autoErr);
+            }
+          }
         }
       }
     }
@@ -1134,6 +1364,8 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
         ? `Bank Transfer (${resolvedExtra.bankName})`
         : 'Bank Transfer (Commercial Bank - G.K Nimesha, Ganemulla)');
 
+    const isProvisionallyActive = Boolean(resolvedOrderRow?.vless_url && resolvedOrderRow?.client_uuid);
+
     const notificationData = {
       orderId: data.orderId || resolvedOrderRow?.order_id || resolvedOrderRow?.id || 'N/A',
       orderDocId: data.orderDocId || resolvedOrderRow?.id || undefined,
@@ -1155,6 +1387,11 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
       slipName: data.slipName || resolvedExtra.slipName || '',
       notes: data.notes || resolvedExtra.notes || '',
       status: resolvedOrderRow?.payment_status || 'Pending Verification',
+      provisional: isProvisionallyActive,
+      provisioningStatus: isProvisionallyActive ? 'provisional' : 'pending',
+      clientUuid: resolvedOrderRow?.client_uuid || undefined,
+      vlessUrl: resolvedOrderRow?.vless_url || undefined,
+      expiryDate: resolvedOrderRow?.expiry_date || undefined,
     };
 
     try {
@@ -1180,9 +1417,13 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
 
     sendOrderReceivedEmail({
       userEmail: notificationData.email,
+      customerName: resolvedCustomerName,
       orderId: notificationData.orderId,
       packageName: notificationData.plan,
       amount: Number(notificationData.amount) || 0,
+      vlessUrl: resolvedOrderRow?.vless_url || undefined,
+      expiryDate: resolvedOrderRow?.expiry_date || undefined,
+      provisional: isProvisionallyActive,
       userId: uid
     }).catch(e => console.warn('[RenewController] Order received email warning:', e));
 
@@ -1192,6 +1433,10 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
 
     res.json({
       success: true,
+      provisional: isProvisionallyActive,
+      vlessUrl: resolvedOrderRow?.vless_url || null,
+      clientUuid: resolvedOrderRow?.client_uuid || null,
+      expiryDate: resolvedOrderRow?.expiry_date || null,
       message: 'New order Telegram notification triggered successfully.'
     });
   } catch (error: any) {

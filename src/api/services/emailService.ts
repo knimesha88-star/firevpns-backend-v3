@@ -49,6 +49,8 @@ export interface SendEmailParams {
   eventType: string;
   referenceId?: string;
   userId?: string;
+  dbClient?: any;
+  fetchFn?: typeof fetch;
 }
 
 export interface SendEmailResult {
@@ -298,6 +300,8 @@ export const checkEmailAlreadySent = async (eventType: string, referenceId: stri
 // Primary email dispatch routine
 export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResult> => {
   const { to, subject, html, text, eventType, referenceId, userId } = params;
+  const dbClient = params.dbClient || supabaseAdmin;
+  const fetchCall = params.fetchFn || fetch;
   const cleanRecipient = (to || '').trim();
 
   if (!cleanRecipient || !cleanRecipient.includes('@') || cleanRecipient === 'N/A') {
@@ -326,16 +330,16 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
     return { success: false, accepted: false, error: `Event ${eventType} disabled` };
   }
 
-  const dedupKey = referenceId ? `${eventKey}:${referenceId}` : `${eventKey}:${cleanRecipient.toLowerCase()}:${subject}`;
+  const dedupKey = referenceId ? `${eventKey}:${referenceId}:${cleanRecipient.toLowerCase()}` : `${eventKey}:${cleanRecipient.toLowerCase()}:${subject}`;
 
-  // Prevent concurrent in-flight duplicate calls
+  // Prevent concurrent in-flight duplicate calls within the same process
   if (inFlightEmailKeys.has(dedupKey)) {
     console.log(`[EmailService] In-flight duplicate send prevented for key '${dedupKey}'.`);
     return { success: true, accepted: false, duplicatePrevented: true, error: 'Duplicate email prevented (in-flight)' };
   }
 
   // Idempotency check for reference ID in memory + Supabase email_notifications
-  if (referenceId && eventType !== 'test_email') {
+  if (referenceId && eventType !== 'test_email' && !params.dbClient) {
     const alreadySent = await checkEmailAlreadySent(eventType, referenceId, cleanRecipient);
     if (alreadySent) {
       console.log(`[EmailService] Duplicate send prevented for event '${eventType}' and referenceId '${referenceId}'.`);
@@ -349,6 +353,54 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
     await logEmailStatus({ userId, email: cleanRecipient, eventType, referenceId, subject, status: 'failed', errorMessage: 'RESEND_API_KEY not configured' });
     return { success: false, accepted: false, error: 'RESEND_API_KEY is not configured in environment variables' };
   }
+
+  // Durable atomic dispatch claim across processes via public.claim_notification_dispatch
+  let dispatchId: string | null = null;
+  if (referenceId && eventType !== 'test_email' && dbClient && typeof dbClient.rpc === 'function') {
+    try {
+      const { data: claimData, error: claimErr } = await dbClient.rpc('claim_notification_dispatch', {
+        p_channel: 'email',
+        p_event_type: eventKey,
+        p_reference_id: String(referenceId).trim(),
+        p_recipient: cleanRecipient.toLowerCase(),
+        p_stale_seconds: 120,
+      });
+      if (!claimErr && claimData) {
+        const row = Array.isArray(claimData) ? claimData[0] : claimData;
+        if (row && row.claimed === false) {
+          console.log(`[EmailService] Durable duplicate send prevented for event '${eventType}' and referenceId '${referenceId}' (status=${row.existing_status}).`);
+          return {
+            success: true,
+            accepted: false,
+            duplicatePrevented: true,
+            error: `Duplicate email prevented (${row.existing_status || 'already_claimed'})`,
+          };
+        }
+        if (row?.dispatch_id) {
+          dispatchId = String(row.dispatch_id);
+        }
+      }
+    } catch (_claimEx) {
+      // Gracefully fall back to email_notifications check if migration is not yet applied
+    }
+  }
+
+  const finalizeDispatch = async (status: 'sent' | 'failed' | 'uncertain', providerMessageId?: string, errorMessage?: string) => {
+    if (!dispatchId || !dbClient) return;
+    try {
+      await dbClient
+        .from('notification_dispatches')
+        .update({
+          status,
+          ...(providerMessageId ? { provider_message_id: providerMessageId } : {}),
+          error_message: errorMessage || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', dispatchId);
+    } catch {
+      // Non-critical update
+    }
+  };
 
   const sender = await resolveVerifiedSender();
   const senderFormatted = sender.formatted || DEFAULT_SENDER_FORMATTED;
@@ -368,7 +420,7 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
       headers['Idempotency-Key'] = safeIdempotencyKey;
     }
 
-    const response = await fetch('https://api.resend.com/emails', {
+    const response = await fetchCall('https://api.resend.com/emails', {
       method: 'POST',
       headers,
       signal: AbortSignal.timeout(10000),
@@ -390,6 +442,7 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
         resData?.name ||
         (!resData?.id && response.ok ? 'Resend API returned HTTP 200 without a message ID' : `HTTP ${response.status} ${response.statusText}`);
       console.error(`[EmailService] Resend API error [${eventType}] (HTTP ${response.status}):`, errMsg);
+      await finalizeDispatch('failed', undefined, typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
       await logEmailStatus({
         userId,
         email: cleanRecipient,
@@ -412,6 +465,7 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
     const messageId = String(resData.id);
     recentSentEmailKeys.set(dedupKey, Date.now());
     console.log(`[EmailService] Email accepted by Resend! Event: ${eventType} | To: ${cleanRecipient} | Message ID: ${messageId}`);
+    await finalizeDispatch('sent', messageId);
     await logEmailStatus({ userId, email: cleanRecipient, eventType, referenceId, subject, status: 'sent' });
     return {
       success: true,
@@ -423,6 +477,7 @@ export const sendEmail = async (params: SendEmailParams): Promise<SendEmailResul
     };
   } catch (err: any) {
     console.error(`[EmailService] Exception during email dispatch [${eventType}]:`, err.message || err);
+    await finalizeDispatch('uncertain', undefined, err.message || String(err));
     await logEmailStatus({ userId, email: cleanRecipient, eventType, referenceId, subject, status: 'failed', errorMessage: err.message || String(err) });
     return {
       success: false,
@@ -469,6 +524,9 @@ export const sendOrderReceivedEmail = async (data: {
   packageName: string;
   amount: number;
   paymentMethod?: string;
+  vlessUrl?: string;
+  expiryDate?: string;
+  provisional?: boolean;
   userId?: string;
 }) => {
   const rendered = buildOrderReceivedTemplate(data);
@@ -534,6 +592,7 @@ export const sendPaymentRejectedEmail = async (data: {
   orderId: string;
   packageName: string;
   reason?: string;
+  vpnRevoked?: boolean;
   userId?: string;
 }) => {
   const rendered = buildPaymentRejectedTemplate(data);

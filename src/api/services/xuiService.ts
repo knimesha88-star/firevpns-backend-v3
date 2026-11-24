@@ -633,6 +633,7 @@ export const addCalendarMonths = (baseTimeMs: number, durationMonths: number): n
 export interface UpdateClientExpiryDeps {
   getInboundsFn?: (forceRefresh?: boolean) => Promise<XuiInbound[]>;
   requestApiFn?: <T>(endpoint: string, method?: 'GET' | 'POST', data?: any) => Promise<T>;
+  dbClient?: any;
   nowMs?: number;
 }
 
@@ -645,6 +646,7 @@ export const updateClientExpiry = async (
 ): Promise<{ new_expiryMs: number; newTotalBytes: number; verifiedEnable: boolean; inboundId: number }> => {
   const getInboundsFn = deps?.getInboundsFn || getInbounds;
   const requestApiFn = deps?.requestApiFn || requestApi;
+  const lockDbClient = deps?.dbClient || supabaseAdmin;
 
   let inbounds = await getInboundsFn(true);
   if (!inbounds || inbounds.length === 0) {
@@ -653,23 +655,62 @@ export const updateClientExpiry = async (
 
   const normalizedTargetUuid = String(uuid || '').trim().toLowerCase();
 
-  for (const inbound of inbounds) {
-    let settingsObj: { clients?: XuiClient[]; [key: string]: any } = {};
+  // Locate target inbound ID first, then serialize the entire read-modify-write + read-back under inbound lock
+  let locatedInboundId: number | null = null;
+  for (const ib of inbounds) {
+    let sObj: any = {};
     try {
-      const rawSettings: any = inbound.settings;
+      const rawSettings: any = ib.settings;
       if (rawSettings) {
-        settingsObj = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : { ...rawSettings };
+        sObj = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : { ...rawSettings };
       }
-    } catch (parseError) {
+    } catch {
       continue;
     }
+    const clientsArr = Array.isArray(sObj.clients) ? sObj.clients : [];
+    if (clientsArr.some((c: any) => c.id && String(c.id).trim().toLowerCase() === normalizedTargetUuid)) {
+      locatedInboundId = Number(ib.id);
+      break;
+    }
+  }
 
-    const clients = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
-    const clientIndex = clients.findIndex(
-      (c) => c.id && String(c.id).trim().toLowerCase() === normalizedTargetUuid
-    );
+  if (!locatedInboundId) {
+    throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbounds`);
+  }
 
-    if (clientIndex >= 0) {
+  return withInboundWriteLock(
+    {
+      dbClient: lockDbClient,
+      inboundId: locatedInboundId,
+      targetId: `renew:${normalizedTargetUuid}`,
+      clientUuid: uuid,
+      requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+    },
+    async (assertInboundLockStillHeld) => {
+      // Re-read fresh inbounds INSIDE the per-inbound lock so we never operate on a stale snapshot
+      let freshInboundsList = await getInboundsFn(true);
+      if (!freshInboundsList || freshInboundsList.length === 0) {
+        freshInboundsList = inbounds;
+      }
+
+      for (const inbound of freshInboundsList) {
+        if (Number(inbound.id) !== Number(locatedInboundId)) continue;
+        let settingsObj: { clients?: XuiClient[]; [key: string]: any } = {};
+        try {
+          const rawSettings: any = inbound.settings;
+          if (rawSettings) {
+            settingsObj = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : { ...rawSettings };
+          }
+        } catch (parseError) {
+          continue;
+        }
+
+        const clients = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+        const clientIndex = clients.findIndex(
+          (c) => c.id && String(c.id).trim().toLowerCase() === normalizedTargetUuid
+        );
+
+        if (clientIndex >= 0) {
       const c = clients[clientIndex];
       const panelExpiry = Number(c.expiryTime || 0);
       const dbExpiry = Number(fallbackCurrentExpiryMs || 0);
@@ -805,6 +846,7 @@ export const updateClientExpiry = async (
       let lastErr: any = null;
 
       for (const { ep, body } of updateEndpoints) {
+        await assertInboundLockStillHeld();
         try {
           await requestApiFn<any>(ep, 'POST', body);
           updated = true;
@@ -840,6 +882,7 @@ export const updateClientExpiry = async (
         delete updateInboundPayload.trafficReset;
         delete updateInboundPayload.lastTrafficResetTime;
 
+        await assertInboundLockStillHeld();
         await requestApiFn<any>(`/panel/api/inbounds/update/${inbound.id}`, 'POST', updateInboundPayload);
       };
 
@@ -932,10 +975,12 @@ export const updateClientExpiry = async (
         verifiedEnable: true,
         inboundId: Number(inbound.id)
       };
-    }
-  }
+        }
+      }
 
-  throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbounds`);
+      throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbound ${locatedInboundId}`);
+    }
+  );
 };
 
 export const findProvisioningTemplate = async (
@@ -1244,69 +1289,728 @@ export function calculateOrderDurationAndExpiry(params: {
 }
 
 const activeProvisionings = new Set<string>();
+const inboundProcessQueues = new Map<number, Promise<void>>();
+const DEFAULT_LOCK_LEASE_SECONDS = 120;
+const INBOUND_LOCK_LEASE_SECONDS = 45;
 
-export const provisionOrderClient = async (orderId: string, token?: string): Promise<any> => {
-  console.log(`[xuiService] [FUNCTION ENTERED] provisionOrderClient - orderId: ${orderId}`);
-  if (activeProvisionings.has(orderId)) {
+export const isAutoActivateNewOrdersFlagEnabled = (): boolean =>
+  String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || 'false').trim().toLowerCase() === 'true';
+
+const isMissingSchemaOrRpcError = (err: any): boolean => {
+  const code = String(err?.code || '');
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'PGRST202' ||
+    code === 'PGRST205' ||
+    code === '42883' ||
+    code === '42P01' ||
+    msg.includes('could not find the function') ||
+    msg.includes('does not exist')
+  );
+};
+
+export interface ProvisionOrderClientOptions {
+  provisional?: boolean;
+  adminLabel?: string;
+  dbClient?: any;
+  requestApiFn?: typeof requestApi;
+  getInboundsFn?: typeof getInbounds;
+  getClientByEmailFn?: typeof getClientByEmail;
+  findProvisioningTemplateFn?: typeof findProvisioningTemplate;
+  heldOrderLockOwnerId?: string;
+  skipSideEffects?: boolean;
+}
+
+export type DurableOperationType =
+  | 'auto_order'
+  | 'auto_renew'
+  | 'approve_order'
+  | 'reject_order'
+  | 'verify_payment'
+  | 'approve_renew'
+  | 'reject_renew'
+  | 'inbound_write';
+
+export interface DurableLockAcquireResult {
+  acquired: boolean;
+  lockOwnerId: string;
+  tableAvailable: boolean;
+  staleRecovery: boolean;
+  previousStatus?: string | null;
+  previousOperationType?: string | null;
+  previousClientUuid?: string | null;
+  holderOwnerId?: string | null;
+  leaseExpiresAt?: string | null;
+  error?: string;
+}
+
+/**
+ * Atomically acquires a durable, lease-based PostgreSQL lock via public.acquire_provisioning_lock().
+ * Fails CLOSED whenever requireDurableLock is true (always true for auto_order, reject_order,
+ * verify_payment, inbound_write, or whenever AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true).
+ */
+export async function acquireDurableProvisioningOperationLock(params: {
+  dbClient: any;
+  operationKey: string;
+  operationType: DurableOperationType;
+  targetId: string;
+  clientUuid?: string | null;
+  leaseSeconds?: number;
+  metadata?: Record<string, any>;
+  requireDurableLock?: boolean;
+  lockOwnerId?: string;
+  allowUncertainRecovery?: boolean;
+  staleGraceSeconds?: number;
+}): Promise<DurableLockAcquireResult> {
+  const {
+    dbClient,
+    operationKey,
+    operationType,
+    targetId,
+    clientUuid,
+    metadata,
+  } = params;
+  const lockOwnerId = params.lockOwnerId || crypto.randomUUID();
+  const leaseSeconds = params.leaseSeconds || DEFAULT_LOCK_LEASE_SECONDS;
+  const staleGraceSeconds = params.staleGraceSeconds ?? 35;
+  // Never blindly take over uncertain operations during automated auto_order;
+  // only explicit admin reconciliation (approve_order / reject_order) or post-grace inbound_write may recover.
+  const allowUncertainRecovery =
+    params.allowUncertainRecovery !== undefined
+      ? params.allowUncertainRecovery
+      : operationType === 'approve_order' ||
+        operationType === 'reject_order' ||
+        operationType === 'inbound_write';
+  const mustFailClosed =
+    params.requireDurableLock !== undefined
+      ? params.requireDurableLock
+      : isAutoActivateNewOrdersFlagEnabled() ||
+        operationType === 'auto_order' ||
+        operationType === 'reject_order' ||
+        operationType === 'verify_payment' ||
+        operationType === 'inbound_write';
+
+  if (!dbClient || typeof dbClient.rpc !== 'function') {
+    if (!mustFailClosed) {
+      return { acquired: true, lockOwnerId, tableAvailable: false, staleRecovery: false };
+    }
+    return {
+      acquired: false,
+      lockOwnerId,
+      tableAvailable: false,
+      staleRecovery: false,
+      error: 'Durable lock RPC client is unavailable.',
+    };
+  }
+
+  try {
+    const { data, error } = await dbClient.rpc('acquire_provisioning_lock', {
+      p_operation_key: operationKey,
+      p_operation_type: operationType,
+      p_target_id: targetId,
+      p_lock_owner_id: lockOwnerId,
+      p_lease_seconds: leaseSeconds,
+      p_client_uuid: clientUuid || null,
+      p_metadata: metadata || {},
+      p_allow_uncertain_recovery: allowUncertainRecovery,
+      p_stale_grace_seconds: staleGraceSeconds,
+    });
+
+    if (error) {
+      if (isMissingSchemaOrRpcError(error) && !mustFailClosed) {
+        console.warn(
+          `[xuiService] Durable lock RPC acquire_provisioning_lock is not installed yet (legacy manual mode, flag=false). Proceeding with in-process guard only for ${operationKey}.`
+        );
+        return { acquired: true, lockOwnerId, tableAvailable: false, staleRecovery: false };
+      }
+      console.error(`[xuiService] Durable lock acquisition failed CLOSED for ${operationKey}:`, error.message || error);
+      return {
+        acquired: false,
+        lockOwnerId,
+        tableAvailable: !isMissingSchemaOrRpcError(error),
+        staleRecovery: false,
+        error: error.message || 'Failed to acquire durable operation lock.',
+      };
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row.acquired !== 'boolean') {
+      return {
+        acquired: false,
+        lockOwnerId,
+        tableAvailable: true,
+        staleRecovery: false,
+        error: 'Unexpected response from acquire_provisioning_lock RPC.',
+      };
+    }
+
+    return {
+      acquired: Boolean(row.acquired),
+      lockOwnerId,
+      tableAvailable: true,
+      staleRecovery: Boolean(row.stale_recovery),
+      previousStatus: row.previous_status ?? null,
+      previousOperationType: row.previous_operation_type ?? null,
+      previousClientUuid: row.previous_client_uuid ?? null,
+      holderOwnerId: row.holder_owner_id ?? null,
+      leaseExpiresAt: row.lease_expires_at ?? null,
+    };
+  } catch (err: any) {
+    if (isMissingSchemaOrRpcError(err) && !mustFailClosed) {
+      return { acquired: true, lockOwnerId, tableAvailable: false, staleRecovery: false };
+    }
+    console.error(`[xuiService] Durable lock acquisition exception (fail CLOSED) for ${operationKey}:`, err?.message || err);
+    return {
+      acquired: false,
+      lockOwnerId,
+      tableAvailable: false,
+      staleRecovery: false,
+      error: err?.message || 'Durable lock acquisition exception.',
+    };
+  }
+}
+
+export async function renewDurableProvisioningOperationLock(params: {
+  dbClient: any;
+  operationKey: string;
+  lockOwnerId: string;
+  leaseSeconds?: number;
+}): Promise<boolean> {
+  if (!params.dbClient || typeof params.dbClient.rpc !== 'function') return false;
+  try {
+    const { data, error } = await params.dbClient.rpc('renew_provisioning_lock', {
+      p_operation_key: params.operationKey,
+      p_lock_owner_id: params.lockOwnerId,
+      p_lease_seconds: params.leaseSeconds || DEFAULT_LOCK_LEASE_SECONDS,
+    });
+    if (error) return false;
+    return Boolean(data);
+  } catch {
+    return false;
+  }
+}
+
+export async function finalizeDurableProvisioningOperationLock(params: {
+  dbClient: any;
+  operationKey: string;
+  lockOwnerId: string;
+  status: 'completed' | 'failed' | 'uncertain';
+  clientUuid?: string | null;
+  errorMessage?: string | null;
+  metadata?: Record<string, any>;
+}): Promise<void> {
+  const { dbClient, operationKey, lockOwnerId, status, clientUuid, errorMessage, metadata } = params;
+  if (!dbClient || typeof dbClient.rpc !== 'function') return;
+  try {
+    await dbClient.rpc('release_provisioning_lock', {
+      p_operation_key: operationKey,
+      p_lock_owner_id: lockOwnerId,
+      p_status: status,
+      p_client_uuid: clientUuid || null,
+      p_error_message: errorMessage || null,
+      p_metadata: metadata || null,
+    });
+  } catch (_err) {
+    // Best-effort release; lease expiration guarantees eventual recoverability
+  }
+}
+
+/**
+ * Serializes all 3X-UI writes targeting the same inbound across both same-process
+ * concurrency (FIFO promise queue) and multi-instance concurrency (durable DB lock
+ * `inbound:<inboundId>` with bounded retry/backoff).
+ */
+export async function withInboundWriteLock<T>(
+  params: {
+    dbClient: any;
+    inboundId: number;
+    targetId: string;
+    clientUuid?: string | null;
+    requireDurableLock?: boolean;
+    maxWaitMs?: number;
+  },
+  fn: (assertInboundLockStillHeld: () => Promise<void>) => Promise<T>
+): Promise<T> {
+  const inboundId = Number(params.inboundId);
+  const maxWaitMs = params.maxWaitMs ?? 12000;
+  const inboundKey = `inbound:${inboundId}`;
+
+  // Layer 1: Same-process FIFO serialization for this inbound
+  const previousTail = inboundProcessQueues.get(inboundId) || Promise.resolve();
+  let releaseLocalQueue!: () => void;
+  const localGate = new Promise<void>((resolve) => {
+    releaseLocalQueue = resolve;
+  });
+  const nextTail = previousTail.then(() => localGate);
+  inboundProcessQueues.set(inboundId, nextTail);
+
+  await previousTail;
+
+  let acquiredLock: DurableLockAcquireResult | null = null;
+  try {
+    // Layer 2: Cross-process durable DB lock with bounded wait
+    const deadline = Date.now() + maxWaitMs;
+    let attempt = 0;
+
+    while (true) {
+      attempt++;
+      const res = await acquireDurableProvisioningOperationLock({
+        dbClient: params.dbClient,
+        operationKey: inboundKey,
+        operationType: 'inbound_write',
+        targetId: params.targetId,
+        clientUuid: params.clientUuid || null,
+        leaseSeconds: INBOUND_LOCK_LEASE_SECONDS,
+        metadata: { inboundId, targetId: params.targetId },
+        requireDurableLock: params.requireDurableLock ?? isAutoActivateNewOrdersFlagEnabled(),
+      });
+
+      if (res.acquired) {
+        acquiredLock = res;
+        break;
+      }
+
+      // If table/RPC is missing or hard DB error occurred under fail-closed mode, fail immediately instead of spinning
+      if (!res.tableAvailable) {
+        throw new Error(res.error || `Unable to acquire durable inbound lock for inbound ${inboundId}.`);
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for durable inbound write lock on inbound ${inboundId}.`);
+      }
+
+      const backoffMs = Math.min(40 * attempt + Math.floor(Math.random() * 25), 250);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+
+    // Pre-mutation fencing helper: verifies this worker STILL owns the inbound lock
+    // and refreshes its lease right before dispatching an external 3X-UI mutation.
+    const assertInboundLockStillHeld = async (): Promise<void> => {
+      if (!acquiredLock?.tableAvailable) return;
+      const renewed = await renewDurableProvisioningOperationLock({
+        dbClient: params.dbClient,
+        operationKey: inboundKey,
+        lockOwnerId: acquiredLock.lockOwnerId,
+        leaseSeconds: INBOUND_LOCK_LEASE_SECONDS,
+      });
+      if (!renewed) {
+        const fenceErr: any = new Error(
+          `Lost durable inbound write lock '${inboundKey}' before 3X-UI mutation; aborting to prevent overlapping writes.`
+        );
+        fenceErr.statusCode = 409;
+        throw fenceErr;
+      }
+    };
+
+    let opOutcome: 'completed' | 'failed' | 'uncertain' = 'completed';
+    let opErr: string | null = null;
+    try {
+      return await fn(assertInboundLockStillHeld);
+    } catch (err: any) {
+      const msgLower = String(err?.message || '').toLowerCase();
+      const isUncertainTransportErr =
+        msgLower.includes('timeout') ||
+        msgLower.includes('etimedout') ||
+        msgLower.includes('econnreset') ||
+        msgLower.includes('econnrefused') ||
+        msgLower.includes('socket hang up') ||
+        msgLower.includes('network error');
+      opOutcome = isUncertainTransportErr ? 'uncertain' : 'failed';
+      opErr = err?.message || String(err);
+      throw err;
+    } finally {
+      if (acquiredLock?.tableAvailable) {
+        await finalizeDurableProvisioningOperationLock({
+          dbClient: params.dbClient,
+          operationKey: inboundKey,
+          lockOwnerId: acquiredLock.lockOwnerId,
+          status: opOutcome,
+          clientUuid: params.clientUuid || null,
+          errorMessage: opErr,
+        });
+      }
+    }
+  } finally {
+    releaseLocalQueue();
+    if (inboundProcessQueues.get(inboundId) === nextTail) {
+      inboundProcessQueues.delete(inboundId);
+    }
+  }
+}
+
+export const provisionOrderClient = async (
+  orderId: string,
+  token?: string,
+  options?: ProvisionOrderClientOptions
+): Promise<any> => {
+  const isProvisionalActivation = Boolean(options?.provisional);
+  const requestApiCall = options?.requestApiFn || requestApi;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
+  const getClientByEmailCall = options?.getClientByEmailFn || getClientByEmail;
+  const findTemplateCall = options?.findProvisioningTemplateFn || findProvisioningTemplate;
+
+  console.log(`[xuiService] [FUNCTION ENTERED] provisionOrderClient - orderId: ${orderId} | provisional: ${isProvisionalActivation}`);
+  if (!options?.heldOrderLockOwnerId && activeProvisionings.has(orderId)) {
     console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] provisionOrderClient is already running for orderId: ${orderId}`);
     return {
       success: true,
-      message: 'Client already exists on this inbound. Skipping duplicate assignment.'
+      deduplicated: true,
+      message: 'Provisioning is already in progress for this order. Skipping duplicate execution.'
     };
   }
   activeProvisionings.add(orderId);
   let canonicalOrderLockKey = '';
+  let durableOperationKey = '';
+  let acquiredLockOwnerId = options?.heldOrderLockOwnerId || '';
+  let ownsDurableLock = false;
+  let xuiWriteAttempted = false;
+  let xuiWriteConfirmed = false;
+  const dbClient = options?.dbClient || supabaseAdmin;
 
   try {
-    const dbClient = supabaseAdmin;
+    let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
 
-  let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
-
-  if (!order) {
-    const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
-    if (!queryOrder) {
-      console.error(`[3X-UI Provisioning] Order '${orderId}' not found in database. Fetch error:`, fetchErr);
-      throw new Error(`Order '${orderId}' not found in database.`);
+    if (!order) {
+      const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
+      if (!queryOrder) {
+        console.error(`[3X-UI Provisioning] Order '${orderId}' not found in database. Fetch error:`, fetchErr);
+        throw new Error(`Order '${orderId}' not found in database.`);
+      }
+      order = queryOrder;
     }
-    order = queryOrder;
-  }
 
-  // Acquire canonical lock on order.id to prevent concurrent approval via order_id vs UUID
-  if (order.id && String(order.id) !== String(orderId)) {
-    canonicalOrderLockKey = String(order.id);
-    if (activeProvisionings.has(canonicalOrderLockKey)) {
-      console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] Canonical order ${canonicalOrderLockKey} is already provisioning.`);
+    // Acquire canonical in-process guard on order.id to prevent concurrent approval via order_id vs UUID
+    if (!options?.heldOrderLockOwnerId && order.id && String(order.id) !== String(orderId)) {
+      canonicalOrderLockKey = String(order.id);
+      if (activeProvisionings.has(canonicalOrderLockKey)) {
+        console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] Canonical order ${canonicalOrderLockKey} is already provisioning.`);
+        return {
+          success: true,
+          deduplicated: true,
+          message: 'Provisioning is already in progress for this order. Skipping duplicate assignment.'
+        };
+      }
+      activeProvisionings.add(canonicalOrderLockKey);
+    }
+
+    durableOperationKey = `order:${order.id}`;
+    let staleLockRecovered = false;
+    if (!options?.heldOrderLockOwnerId) {
+      const lockRes = await acquireDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOperationKey,
+        operationType: isProvisionalActivation ? 'auto_order' : 'approve_order',
+        targetId: String(order.id),
+        clientUuid: order.client_uuid || null,
+        metadata: {
+          orderId: order.order_id || order.id,
+          provisional: isProvisionalActivation,
+        },
+        requireDurableLock: isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled(),
+      });
+
+      if (!lockRes.acquired) {
+        if (!lockRes.tableAvailable && (isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled())) {
+          throw new Error(lockRes.error || 'Durable order coordination lock is unavailable; refusing to provision.');
+        }
+        if (lockRes.previousStatus === 'uncertain') {
+          const uncErr: any = new Error(
+            `Order '${order.order_id || order.id}' has an uncertain prior external provisioning state; automatic takeover blocked until explicit reconciliation.`
+          );
+          uncErr.statusCode = 409;
+          throw uncErr;
+        }
+        console.warn(`[xuiService] Durable operation lock '${durableOperationKey}' is currently held by another active operation (${lockRes.previousOperationType || 'unknown'}).`);
+        if (lockRes.previousOperationType === 'reject_order') {
+          const conflictErr: any = new Error('Order rejection is currently in progress for this order.');
+          conflictErr.statusCode = 409;
+          throw conflictErr;
+        }
+        return {
+          success: true,
+          deduplicated: true,
+          message: 'Provisioning operation is already in progress for this order.',
+        };
+      }
+
+      acquiredLockOwnerId = lockRes.lockOwnerId;
+      ownsDurableLock = lockRes.tableAvailable;
+      staleLockRecovered = lockRes.staleRecovery;
+
+      // Re-read fresh order state INSIDE the durable lock so decisions never use a pre-lock snapshot
+      const { data: freshOrder } = await dbClient.from('orders').select('*').eq('id', order.id).maybeSingle();
+      if (freshOrder) {
+        order = freshOrder;
+      }
+
+      if (staleLockRecovered) {
+        console.warn(
+          `[xuiService] Recovered stale/uncertain lock '${durableOperationKey}' (prevOp=${lockRes.previousOperationType}, prevStatus=${lockRes.previousStatus}). Reconciling DB & live 3X-UI state before proceeding...`
+        );
+      }
+    }
+
+    // Parse read-only order metadata from payment_method (NEVER mutate payment_method for internal entitlement state)
+    let extra: any = {};
+    if (order.payment_method && typeof order.payment_method === 'string' && order.payment_method.startsWith('{')) {
+      try {
+        extra = JSON.parse(order.payment_method);
+      } catch (e) {
+        console.error('[3X-UI Provisioning] Error parsing payment_method JSON:', e);
+      }
+    }
+
+    // Load authoritative entitlement grant ledger row (if any) inside the lock
+    let existingGrantRow: any = null;
+    try {
+      const { data: grantRow, error: grantSelErr } = await dbClient
+        .from('vpn_entitlement_grants')
+        .select('*')
+        .eq('grant_type', 'new_order')
+        .eq('source_id', String(order.id))
+        .maybeSingle();
+      if (!grantSelErr && grantRow) {
+        existingGrantRow = grantRow;
+      } else if (!grantSelErr && !grantRow) {
+        const { data: byOrderGrant } = await dbClient
+          .from('vpn_entitlement_grants')
+          .select('*')
+          .eq('order_id', order.id)
+          .maybeSingle();
+        if (byOrderGrant) existingGrantRow = byOrderGrant;
+      } else if (grantSelErr && !isMissingSchemaOrRpcError(grantSelErr)) {
+        throw new Error(`Failed to read vpn_entitlement_grants: ${grantSelErr.message}`);
+      }
+    } catch (grantLookupErr: any) {
+      if (isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled()) {
+        throw new Error(`Authoritative entitlement ledger lookup failed: ${grantLookupErr?.message || grantLookupErr}`);
+      }
+    }
+
+    const rawStatusLower = String(order.status || '').toLowerCase().trim();
+    const rawPayLower = String(order.payment_status || '').toLowerCase().trim();
+    const rawProvLower = String(order.provisioning_status || '').toLowerCase().trim();
+
+    if (
+      rawStatusLower === 'rejected' ||
+      rawStatusLower === 'cancelled' ||
+      rawPayLower === 'cancelled' ||
+      rawPayLower === 'rejected' ||
+      rawProvLower === 'revoked' ||
+      existingGrantRow?.status === 'revoked'
+    ) {
+      if (ownsDurableLock) {
+        await finalizeDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: durableOperationKey,
+          lockOwnerId: acquiredLockOwnerId,
+          status: 'failed',
+          errorMessage: `Order ${order.order_id || order.id} has already been rejected.`,
+        });
+        ownsDurableLock = false;
+      }
+      const rejErr: any = new Error(`Order '${order.order_id || order.id}' has already been rejected and cannot be provisioned or approved.`);
+      rejErr.statusCode = 409;
+      throw rejErr;
+    }
+
+    // Idempotency Check 1: If order is already completed/paid with existing VPN link, return existing details immediately
+    const isAlreadyCompleted =
+      (rawStatusLower === 'completed' || rawStatusLower === 'active' || rawStatusLower === 'approved') &&
+      Boolean(order.vless_url);
+    if (isAlreadyCompleted) {
+      const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
+      if (ownsDurableLock) {
+        await finalizeDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: durableOperationKey,
+          lockOwnerId: acquiredLockOwnerId,
+          status: 'completed',
+          clientUuid: order.client_uuid || existingVpnAcc?.uuid,
+        });
+        ownsDurableLock = false;
+      }
       return {
         success: true,
-        message: 'Provisioning is already in progress for this order. Skipping duplicate assignment.'
+        alreadyProvisioned: true,
+        message: 'Order already provisioned and completed',
+        orderId: order.order_id || order.id,
+        uuid: order.client_uuid || existingVpnAcc?.uuid,
+        vlessUrl: order.vless_url || existingVpnAcc?.vless_url,
+        subscriptionUrl: order.subscription_url || order.vless_url || existingVpnAcc?.vless_url,
+        vpnAccountId: existingVpnAcc?.id
       };
     }
-    activeProvisionings.add(canonicalOrderLockKey);
-  }
 
-  // Idempotency Check: If order is already completed/active with existing VPN link, return existing details
-  const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active' || order.status === 'approved') && order.vless_url;
-  if (isAlreadyCompleted) {
-    const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
-    return {
-      success: true,
-      message: 'Order already provisioned',
-      uuid: order.client_uuid || existingVpnAcc?.uuid,
-      vlessUrl: order.vless_url || existingVpnAcc?.vless_url,
-      subscriptionUrl: order.vless_url || existingVpnAcc?.vless_url,
-      vpnAccountId: existingVpnAcc?.id
-    };
-  }
+    // Idempotency Check 2: Authoritative provisional activation detection (orders.provisioning_status OR vpn_entitlement_grants; ZERO payment_method fallback)
+    const isAlreadyProvisionallyActive =
+      (rawProvLower === 'provisional' || existingGrantRow?.status === 'provisional') &&
+      Boolean(order.vless_url) &&
+      Boolean(order.client_uuid);
 
-  // Parse JSON-serialized order metadata from payment_method if applicable
-  let extra: any = {};
-  if (order.payment_method && order.payment_method.startsWith('{')) {
-    try {
-      extra = JSON.parse(order.payment_method);
-    } catch (e) {
-      console.error('[3X-UI Provisioning] Error parsing payment_method JSON:', e);
+    if (isAlreadyProvisionallyActive) {
+      const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
+      const { data: existingVpnCfg } = await dbClient.from('vpn_configs').select('*').eq('order_id', order.id).maybeSingle();
+
+      // If caller requested provisional activation again, return the existing provisional credentials without re-running 3X-UI
+      if (isProvisionalActivation) {
+        if (ownsDurableLock) {
+          await finalizeDurableProvisioningOperationLock({
+            dbClient,
+            operationKey: durableOperationKey,
+            lockOwnerId: acquiredLockOwnerId,
+            status: 'completed',
+            clientUuid: order.client_uuid,
+          });
+          ownsDurableLock = false;
+        }
+        return {
+          success: true,
+          provisional: true,
+          alreadyProvisioned: true,
+          message: 'Order VPN client is already provisionally active.',
+          orderId: order.order_id || order.id,
+          uuid: order.client_uuid,
+          vlessUrl: order.vless_url,
+          subscriptionUrl: order.subscription_url || order.vless_url,
+          expiryDate: order.expiry_date || existingVpnAcc?.expiry_date || existingVpnCfg?.expiry_date,
+          vpnAccountId: existingVpnAcc?.id,
+        };
+      }
+
+      // Admin / Telegram Approval confirming payment of an already provisionally active order!
+      // Confirms payment WITHOUT creating another VPN client, resetting traffic, extending twice, or mutating payment_method.
+      console.log(`[3X-UI Provisioning] Order ${order.order_id || order.id} already has an active provisional VPN client (${order.client_uuid}). Confirming payment without re-provisioning or resetting traffic...`);
+      const nowIso = new Date().toISOString();
+
+      // If stale recovery occurred, reconcile 3X-UI live state to confirm the client wasn't disabled by an interrupted rejection
+      if (staleLockRecovered) {
+        const liveInbounds = await getInboundsCall(true);
+        const liveMatch = liveInbounds.some((ib: any) => {
+          try {
+            const s = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+            return (s?.clients || []).some(
+              (c: any) => String(c.id || '').trim().toLowerCase() === String(order.client_uuid).trim().toLowerCase() && c.enable !== false
+            );
+          } catch {
+            return false;
+          }
+        });
+        if (!liveMatch) {
+          throw new Error(`Stale lock reconciliation detected provisional client ${order.client_uuid} is missing or disabled on 3X-UI. Manual review required.`);
+        }
+      }
+
+      // Mark authoritative entitlement grant as verified FIRST (fail closed if ledger update fails)
+      if (existingGrantRow?.id) {
+        const { error: verifyGrantErr } = await dbClient
+          .from('vpn_entitlement_grants')
+          .update({
+            status: 'verified',
+            verified_at: nowIso,
+            verified_by: options?.adminLabel || 'Admin',
+            updated_at: nowIso,
+          })
+          .eq('id', existingGrantRow.id);
+        if (verifyGrantErr) {
+          throw new Error(`Failed to mark vpn_entitlement_grants verified: ${verifyGrantErr.message}`);
+        }
+      }
+
+      const { error: confirmOrderErr } = await dbClient
+        .from('orders')
+        .update({
+          payment_status: 'Paid',
+          status: 'completed',
+          provisioning_status: 'completed',
+          updated_at: nowIso,
+        })
+        .eq('id', order.id);
+
+      if (confirmOrderErr) {
+        throw new Error(`Failed to confirm payment on provisionally active order: ${confirmOrderErr.message}`);
+      }
+
+      const packageNameForNotif = extra.package_name || extra.packageName || extra.plan || extra.package || order.package_name || 'FIREVPN Package';
+      const durationForNotif = extra.duration || (extra.duration_months ? `${extra.duration_months} Months` : '1 Month');
+      const isValidUuidCheck = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val || '');
+      const validUid = isValidUuidCheck(order.customer_id) ? order.customer_id : null;
+
+      if (!options?.skipSideEffects) {
+        try {
+          await createCustomerNotification({
+            userId: validUid,
+            userEmail: order.email,
+            title: 'Order Approved',
+            message: `Your order for "${packageNameForNotif}" has been approved!`,
+            type: 'order_approved',
+            orderId: order.id,
+            vpnName: packageNameForNotif,
+          });
+          await createCustomerNotification({
+            userId: validUid,
+            userEmail: order.email,
+            title: 'Payment Approved',
+            message: `Your payment for "${packageNameForNotif}" has been verified and approved! Your VPN connection remains active.`,
+            type: 'payment_approved',
+            orderId: order.id,
+            vpnName: packageNameForNotif,
+          });
+
+          if (order.email) {
+            sendPaymentApprovedEmail({
+              userEmail: order.email,
+              customerName: extra.customerName || extra.configurationName || undefined,
+              orderId: order.order_id || order.id,
+              packageName: packageNameForNotif,
+              vlessUrl: order.vless_url,
+              expiryDate: order.expiry_date || existingVpnAcc?.expiry_date || undefined,
+              userId: validUid || undefined,
+            }).catch(e => console.warn('[3X-UI Provisioning DB] Payment approved email warning:', e));
+          }
+        } catch (notifErr: any) {
+          console.warn('[3X-UI Provisioning DB] Notification warning on provisional approval confirmation:', notifErr?.message || notifErr);
+        }
+
+        try {
+          await sendOrderApprovedNotification({
+            customerEmail: order.email || 'N/A',
+            packageName: packageNameForNotif,
+            packageType: extra.packageType || 'SIM Unlimited',
+            server: extra.server || 'Singapore',
+            duration: durationForNotif,
+            price: order.amount || 0,
+            uuid: order.client_uuid,
+            orderId: order.order_id || order.id,
+            status: '🟢 COMPLETED',
+          });
+        } catch (tgErr) {
+          console.warn('[3X-UI Provisioning DB] Telegram notification warning on provisional confirmation:', tgErr);
+        }
+      }
+
+      if (ownsDurableLock) {
+        await finalizeDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: durableOperationKey,
+          lockOwnerId: acquiredLockOwnerId,
+          status: 'completed',
+          clientUuid: order.client_uuid,
+        });
+        ownsDurableLock = false;
+      }
+
+      return {
+        success: true,
+        confirmedProvisional: true,
+        message: 'Payment verified and provisionally active VPN order marked completed without duplicate provisioning.',
+        orderId: order.order_id || order.id,
+        uuid: order.client_uuid,
+        vlessUrl: order.vless_url,
+        subscriptionUrl: order.subscription_url || order.vless_url,
+        vpnAccountId: existingVpnAcc?.id,
+      };
     }
-  }
 
   const templateId = extra.template_id || extra.templateId || order.template_id || order.templateId || '';
   const packageName = extra.package_name || extra.packageName || extra.plan || extra.package || order.package_name || '';
@@ -1328,7 +2032,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Step 1: Find the provisioning template (returns null if not found; NO fallback to template[0])
   const selectedServerNode = extra.server_node || extra.server || order.server || 'Singapore';
-  const template = await findProvisioningTemplate({ templateId, packageName, server: selectedServerNode });
+  const template = await findTemplateCall({ templateId, packageName, server: selectedServerNode });
   if (!template) {
     console.error(`[Purchase Flow] Error: Provisioning template not found for package '${packageName}' (Template ID: '${templateId}').`);
     throw new Error(`Provisioning template not found for package '${packageName || templateId}'.`);
@@ -1431,12 +2135,16 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     console.log('Lookup by trial:', d1);
   }
 
+  // Check if a prior interrupted attempt already persisted an intended client UUID in vpn_entitlement_grants or orders.client_uuid
+  const priorIntendedUuid = String(existingGrantRow?.client_uuid || order.client_uuid || '').trim();
+  const priorIntendedSubId = String(existingGrantRow?.sub_id || '').trim();
+
   // Fetch all inbounds to search for an existing client in 3X-UI panel
-  const allInbounds = await getInbounds();
+  const allInbounds = await getInboundsCall();
   let existingClient: any = null;
   let targetInboundId = inboundId;
 
-  // Search by known UUIDs from database (or by remark if it is a trial order)
+  // Search by known UUIDs from database (including priorIntendedUuid or by remark if it is a trial order)
   for (const ib of allInbounds) {
     let settingsObj: any = {};
     try {
@@ -1445,6 +2153,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     const clients = settingsObj.clients || [];
     const found = clients.find((c: any) => 
       (extendUuid && String(c.id).trim().toLowerCase() === extendUuid.toLowerCase()) ||
+      (priorIntendedUuid && String(c.id).trim().toLowerCase() === priorIntendedUuid.toLowerCase()) ||
       (existingAcc && String(c.id).trim().toLowerCase() === String(existingAcc.uuid).trim().toLowerCase()) ||
       (existingTrialConfig && String(c.id).trim().toLowerCase() === String(existingTrialConfig.uuid).trim().toLowerCase()) ||
       (isTrialOrder && String(c.email).trim().toLowerCase() === remark.trim().toLowerCase())
@@ -1508,23 +2217,109 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 
   // Determine UUID and subId:
-  // For extending an existing account, re-provisioning an existing order, or updating a trial: preserve existing UUID & subId
+  // For extending an existing account, re-provisioning an existing order (or recovering a lost 3X-UI response via priorIntendedUuid), or updating a trial: preserve existing UUID & subId
   // For new paid orders: generate a brand new UUID
   let uuid: string;
   let subId: string;
 
   if (existingAcc && existingAcc.uuid) {
     uuid = existingAcc.uuid;
-    subId = (existingClient && existingClient.subId) || existingAcc.sub_id || crypto.randomBytes(12).toString('hex');
+    subId = (existingClient && existingClient.subId) || existingAcc.sub_id || priorIntendedSubId || crypto.randomBytes(12).toString('hex');
   } else if (extendUuid) {
     uuid = extendUuid;
-    subId = (existingClient && existingClient.subId) || crypto.randomBytes(12).toString('hex');
+    subId = (existingClient && existingClient.subId) || priorIntendedSubId || crypto.randomBytes(12).toString('hex');
+  } else if (priorIntendedUuid) {
+    uuid = priorIntendedUuid;
+    subId = (existingClient && existingClient.subId) || priorIntendedSubId || crypto.randomBytes(12).toString('hex');
+    console.log(`[3X-UI Provisioning] Recovering pre-persisted intended client UUID for order ${order.id}: ${uuid}`);
   } else if (isTrialOrder && (existingTrialConfig?.uuid || existingAcc?.uuid)) {
     uuid = existingTrialConfig?.uuid || existingAcc?.uuid;
     subId = (existingClient && existingClient.subId) || existingTrialConfig?.sub_id || crypto.randomBytes(12).toString('hex');
   } else {
     uuid = crypto.randomUUID();
     subId = crypto.randomBytes(12).toString('hex');
+  }
+
+  // Resolve accountEmail early so pre-persisted entitlement ledger record is complete
+  let accountEmail = (order.email || extra.email || extra.user_email || extra.customerEmail || '').trim();
+  if (!accountEmail && order.customer_id) {
+    const { data: prof } = await dbClient.from('profiles').select('email').eq('id', order.customer_id).maybeSingle();
+    if (prof?.email) {
+      accountEmail = prof.email.trim();
+    }
+  }
+
+  // Authoritative Pre-Persistence BEFORE calling 3X-UI:
+  // Insert/update vpn_entitlement_grants with status='provisioning' (and NEVER mutate orders.payment_method).
+  // Fail CLOSED for provisional activations so an untracked unpaid 3X-UI client can never be created.
+  const prePersistNowIso = new Date().toISOString();
+  const preGrantPayload = {
+    grant_type: 'new_order',
+    source_id: String(order.id),
+    order_id: order.id,
+    user_id: validUserId,
+    user_email: accountEmail || order.email || '',
+    vpn_account_id: existingAcc?.id || null,
+    client_uuid: uuid,
+    sub_id: subId,
+    inbound_id: inboundId,
+    remark,
+    package_name: packageName,
+    duration_months: durationCalc.durationMonths,
+    previous_expiry_ms: existingExpiryCandidateMs > 0 ? existingExpiryCandidateMs : 0,
+    previous_total_bytes: isExtendingExistingAccount && existingClient?.totalGB ? Number(existingClient.totalGB) : 0,
+    previous_was_unlimited: isExtendingExistingAccount ? Number(existingClient?.totalGB || 0) === 0 : false,
+    previous_enable: existingClient ? existingClient.enable !== false : true,
+    previous_status: existingAcc?.status || 'active',
+    added_duration_months: durationCalc.durationMonths,
+    granted_expiry_ms: expiryMs,
+    added_quota_bytes: totalBytes,
+    granted_unlimited: totalBytes === 0,
+    provisional: isProvisionalActivation,
+    status: 'provisioning',
+    updated_at: prePersistNowIso,
+  };
+
+  let authoritativeGrantId: string | null = existingGrantRow?.id || null;
+  let grantTableAvailable = true;
+  {
+    let grantWriteErr: any = null;
+    if (authoritativeGrantId) {
+      const { error } = await dbClient
+        .from('vpn_entitlement_grants')
+        .update(preGrantPayload)
+        .eq('id', authoritativeGrantId);
+      grantWriteErr = error;
+    } else {
+      const { data: insertedGrant, error } = await dbClient
+        .from('vpn_entitlement_grants')
+        .insert({ ...preGrantPayload, created_at: prePersistNowIso })
+        .select('id')
+        .maybeSingle();
+      grantWriteErr = error;
+      if (insertedGrant?.id) authoritativeGrantId = insertedGrant.id;
+    }
+
+    if (grantWriteErr) {
+      if (isMissingSchemaOrRpcError(grantWriteErr) && !isProvisionalActivation && !isAutoActivateNewOrdersFlagEnabled()) {
+        grantTableAvailable = false;
+        console.warn('[3X-UI Provisioning] vpn_entitlement_grants table not migrated yet (legacy manual approval mode, flag=false).');
+      } else {
+        throw new Error(`Failed to pre-persist authoritative vpn_entitlement_grants record before 3X-UI call: ${grantWriteErr.message || JSON.stringify(grantWriteErr)}`);
+      }
+    }
+  }
+
+  // Persist client_uuid on orders before 3X-UI call (without modifying payment_method)
+  const { error: preOrderUuidErr } = await dbClient
+    .from('orders')
+    .update({
+      client_uuid: uuid,
+      updated_at: prePersistNowIso,
+    })
+    .eq('id', order.id);
+  if (preOrderUuidErr && isProvisionalActivation) {
+    throw new Error(`Failed to pre-persist client_uuid on orders before 3X-UI call: ${preOrderUuidErr.message}`);
   }
 
   // Let's ensure if existingAcc is null, we fetch any existing account with the same UUID to prevent duplicate key constraint violation.
@@ -1616,223 +2411,255 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   let skipMsg = '';
 
-  // Step 2: Provision client using inbound update strategy (GET inbound -> update settings.clients -> POST /panel/api/inbounds/update/{id})
-  console.log(`[3X-UI Provisioning] Provisioning client for inbound ${inboundId} using inbound update strategy...`);
-  
-  // Fetch target inbound
-  let targetInboundObj: any = null;
-  try {
-    const getRes = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
-    targetInboundObj = getRes?.obj || getRes;
-  } catch (getErr: any) {
-    console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
-  }
+  // Step 2: Provision client INSIDE per-inbound durable write lock (serializes GET -> modify clients[] -> POST -> read-back)
+  console.log(`[3X-UI Provisioning] Provisioning client for inbound ${inboundId} under per-inbound write lock...`);
 
-  if (!targetInboundObj || typeof targetInboundObj !== 'object' || !targetInboundObj.id) {
-    console.log(`[3X-UI Provisioning] Falling back to getInbounds() list to find inbound ${inboundId}`);
-    const allInboundsList = await getInbounds();
-    targetInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
-  }
-
-  if (!targetInboundObj) {
-    throw new Error(`Target inbound with ID ${inboundId} not found on 3X-UI panel.`);
-  }
-
-  // Parse inbound.settings.clients
-  let settingsObj: any = {};
-  if (typeof targetInboundObj.settings === 'string') {
-    try {
-      settingsObj = JSON.parse(targetInboundObj.settings);
-    } catch (e) {
-      settingsObj = { clients: [] };
-    }
-  } else if (targetInboundObj.settings && typeof targetInboundObj.settings === 'object') {
-    settingsObj = targetInboundObj.settings;
-  } else {
-    settingsObj = { clients: [] };
-  }
-
-  if (!Array.isArray(settingsObj.clients)) {
-    settingsObj.clients = [];
-  }
-
-  const existingClients: any[] = settingsObj.clients;
-  const clientCountBefore = existingClients.length;
-
-  // Check whether the UUID already exists on this inbound (or by email for trial orders)
-  const existingIndex = existingClients.findIndex((c: any) =>
-    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
-    (isTrialOrder && c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
-  );
-
-  const matchedExistingClient = existingIndex >= 0 ? existingClients[existingIndex] : existingClient;
-  const isExistingClientRecord = existingIndex >= 0 || Boolean(existingClient);
-
-  const generateRandom16CharCredential = (): string => {
-    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    let out = '';
-    for (let i = 0; i < 16; i++) {
-      out += alphabet[crypto.randomInt(0, alphabet.length)];
-    }
-    return out;
-  };
-
-  const clientCredentialFields: Record<string, string> = {};
-  if (isExistingClientRecord) {
-    if (matchedExistingClient?.password !== undefined) {
-      clientCredentialFields.password = String(matchedExistingClient.password);
-    }
-    if (matchedExistingClient?.auth !== undefined) {
-      clientCredentialFields.auth = String(matchedExistingClient.auth);
-    }
-  } else {
-    clientCredentialFields.password = generateRandom16CharCredential();
-    clientCredentialFields.auth = generateRandom16CharCredential();
-  }
-
-  const newClientRecord: any = {
-    id: uuid,
-    email: remark,
-    flow: flow || '',
-    limitIp: 0,
-    totalGB: totalBytes,
-    expiryTime: expiryMs,
-    enable: true,
-    tgId: 0,
-    subId: subId,
-    reset: 0,
-    comment: '',
-    group: '',
-    ...clientCredentialFields
-  };
-
-  // Add protocol-specific fields if defined on target inbound (e.g., security, password, auth for VLESS/Reality)
-  if (targetInboundObj.protocol === 'vless' || targetInboundObj.protocol === 'trojan' || targetInboundObj.protocol === 'vmess') {
-    if (security) {
-      newClientRecord.security = security;
-    }
-  }
-
-  const redactClientSecrets = (record: any) => ({
-    ...record,
-    ...(record?.password ? { password: '[REDACTED]' } : {}),
-    ...(record?.auth ? { auth: '[REDACTED]' } : {}),
-  });
-
-  // Direct addClient payload format for 3X-UI /panel/api/inbounds/addClient
-  const addClientDirectPayload = {
-    id: Number(inboundId),
-    settings: JSON.stringify({
-      clients: [newClientRecord]
-    })
-  };
-
-  console.log('=== [3X-UI ADD CLIENT REQUEST BODY LOGGING] ===');
-  console.log('Target Inbound ID:', inboundId);
-  console.log('Client Record (Matches Manual Client Structure):');
-  console.log(JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
-  console.log('Direct addClient Payload:');
-  console.log(JSON.stringify({
-    id: Number(inboundId),
-    settings: JSON.stringify({
-      clients: [redactClientSecrets(newClientRecord)]
-    })
-  }, null, 2));
-  console.log('==============================================');
-
-  console.log('=== [DIAGNOSTIC] 1. Before update ===');
-  console.log(`Target inbound ID: ${inboundId}`);
-  console.log(`settingsObj.clients.length: ${settingsObj.clients.length}`);
-  console.log(`New UUID already exists in settingsObj.clients: ${settingsObj.clients.some((c: any) => c.id === uuid)}`);
-  console.log('New client object being appended/updated:', JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
-
-  if (existingIndex >= 0) {
-    skipMsg = 'Client already exists on this inbound. Updated existing client settings.';
-    console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
-    existingClients[existingIndex] = {
-      ...existingClients[existingIndex],
-      ...newClientRecord
-    };
-  } else {
-    console.log(`[3X-UI Provisioning] Client not found on inbound. Appending new client record.`);
-    existingClients.push(newClientRecord);
-  }
-
-  const clientCountAfter = existingClients.length;
-
-  // Preserve every existing client & preserve every inbound property
-  settingsObj.clients = existingClients;
-
-  const updateInboundPayload: any = {
-    ...targetInboundObj,
-    id: Number(inboundId),
-    settings: JSON.stringify(settingsObj)
-  };
-
-  // Remove runtime / statistics fields
-  delete updateInboundPayload.up;
-  delete updateInboundPayload.down;
-  delete updateInboundPayload.clientStats;
-  delete updateInboundPayload.trafficReset;
-  delete updateInboundPayload.lastTrafficResetTime;
-
-  console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
-  console.log(`[3X-UI Provisioning] Detailed Logs:`);
-  console.log(`  - Client count before update: ${clientCountBefore}`);
-  console.log(`  - Client count after update: ${clientCountAfter}`);
-  console.log(`  - UUID added/updated: ${uuid}`);
-  console.log(`  - Email added/updated: ${remark}`);
-
-  const updateRes = await requestApi<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
-
-  if (updateRes && updateRes.success === false) {
-    const panelMsg = updateRes.msg || updateRes.message || '3X-UI panel rejected inbound update';
-    console.error(`[3X-UI Provisioning] Inbound update failed on panel: ${panelMsg}`);
-    throw new Error(`3X-UI provisioning failed: ${panelMsg}`);
-  }
-
-  let afterInboundObj: any = null;
-  try {
-    const getRes = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
-    afterInboundObj = getRes?.obj || getRes;
-  } catch (getErr: any) {
-    console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
-  }
-
-  if (!afterInboundObj || typeof afterInboundObj !== 'object' || !afterInboundObj.id) {
-    const allInboundsList = await getInbounds();
-    afterInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
-  }
-
-  let afterSettingsObj: any = {};
-  if (afterInboundObj) {
-    if (typeof afterInboundObj.settings === 'string') {
+  await withInboundWriteLock(
+    {
+      dbClient,
+      inboundId,
+      targetId: String(order.id),
+      clientUuid: uuid,
+      requireDurableLock: isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled(),
+    },
+    async (assertInboundLockStillHeld) => {
+      // Fetch fresh target inbound INSIDE the inbound lock
+      let targetInboundObj: any = null;
       try {
-        afterSettingsObj = JSON.parse(afterInboundObj.settings);
-      } catch (_e) {
-        afterSettingsObj = { clients: [] };
+        const getRes = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+        targetInboundObj = getRes?.obj || getRes;
+      } catch (getErr: any) {
+        console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
       }
-    } else if (afterInboundObj.settings && typeof afterInboundObj.settings === 'object') {
-      afterSettingsObj = afterInboundObj.settings;
+
+      if (!targetInboundObj || typeof targetInboundObj !== 'object' || !targetInboundObj.id) {
+        console.log(`[3X-UI Provisioning] Falling back to getInbounds(true) list to find inbound ${inboundId}`);
+        const allInboundsList = await getInboundsCall(true);
+        targetInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
+      }
+
+      if (!targetInboundObj) {
+        throw new Error(`Target inbound with ID ${inboundId} not found on 3X-UI panel.`);
+      }
+
+      // Parse inbound.settings.clients
+      let settingsObj: any = {};
+      if (typeof targetInboundObj.settings === 'string') {
+        try {
+          settingsObj = JSON.parse(targetInboundObj.settings);
+        } catch (e) {
+          settingsObj = { clients: [] };
+        }
+      } else if (targetInboundObj.settings && typeof targetInboundObj.settings === 'object') {
+        settingsObj = { ...targetInboundObj.settings };
+      } else {
+        settingsObj = { clients: [] };
+      }
+
+      if (!Array.isArray(settingsObj.clients)) {
+        settingsObj.clients = [];
+      }
+
+      const existingClients: any[] = [...settingsObj.clients];
+      const clientCountBefore = existingClients.length;
+
+      // Check whether the UUID already exists on this inbound (or by email for trial orders)
+      const existingIndex = existingClients.findIndex((c: any) =>
+        (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+        (isTrialOrder && c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+      );
+
+      const matchedExistingClient = existingIndex >= 0 ? existingClients[existingIndex] : existingClient;
+      const isExistingClientRecord = existingIndex >= 0 || Boolean(existingClient);
+
+      // Stale / interrupted provisioning reconciliation:
+      // If a pre-persisted client UUID for this new order ALREADY exists and is enabled on 3X-UI,
+      // adopt the live 3X-UI client directly without issuing a duplicate update write.
+      if (
+        existingIndex >= 0 &&
+        Boolean(priorIntendedUuid) &&
+        !isExtendingExistingAccount &&
+        !isTrialOrder &&
+        matchedExistingClient?.enable !== false
+      ) {
+        console.log(
+          `[3X-UI Provisioning] Reconciled existing live 3X-UI client ${uuid} on inbound ${inboundId} (staleLockRecovered=${staleLockRecovered}). Adopting without duplicate 3X-UI write.`
+        );
+        if (matchedExistingClient?.subId) subId = String(matchedExistingClient.subId);
+        if (matchedExistingClient?.email) remark = String(matchedExistingClient.email);
+        if (Number(matchedExistingClient?.expiryTime || 0) > 0) expiryMs = Number(matchedExistingClient.expiryTime);
+        if (matchedExistingClient?.totalGB !== undefined) totalBytes = Number(matchedExistingClient.totalGB);
+        xuiWriteConfirmed = true;
+        return;
+      }
+
+      const generateRandom16CharCredential = (): string => {
+        const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        let out = '';
+        for (let i = 0; i < 16; i++) {
+          out += alphabet[crypto.randomInt(0, alphabet.length)];
+        }
+        return out;
+      };
+
+      const clientCredentialFields: Record<string, string> = {};
+      if (isExistingClientRecord) {
+        if (matchedExistingClient?.password !== undefined) {
+          clientCredentialFields.password = String(matchedExistingClient.password);
+        }
+        if (matchedExistingClient?.auth !== undefined) {
+          clientCredentialFields.auth = String(matchedExistingClient.auth);
+        }
+      } else {
+        clientCredentialFields.password = generateRandom16CharCredential();
+        clientCredentialFields.auth = generateRandom16CharCredential();
+      }
+
+      const newClientRecord: any = {
+        id: uuid,
+        email: remark,
+        flow: flow || '',
+        limitIp: 0,
+        totalGB: totalBytes,
+        expiryTime: expiryMs,
+        enable: true,
+        tgId: 0,
+        subId: subId,
+        reset: 0,
+        comment: '',
+        group: '',
+        ...clientCredentialFields
+      };
+
+      // Add protocol-specific fields if defined on target inbound
+      if (targetInboundObj.protocol === 'vless' || targetInboundObj.protocol === 'trojan' || targetInboundObj.protocol === 'vmess') {
+        if (security) {
+          newClientRecord.security = security;
+        }
+      }
+
+      const redactClientSecrets = (record: any) => ({
+        ...record,
+        ...(record?.password ? { password: '[REDACTED]' } : {}),
+        ...(record?.auth ? { auth: '[REDACTED]' } : {}),
+      });
+
+      console.log('=== [3X-UI ADD CLIENT REQUEST BODY LOGGING] ===');
+      console.log('Target Inbound ID:', inboundId);
+      console.log('Client Record (Matches Manual Client Structure):');
+      console.log(JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
+      console.log('==============================================');
+
+      if (existingIndex >= 0) {
+        skipMsg = 'Client already exists on this inbound. Updated existing client settings.';
+        console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
+        existingClients[existingIndex] = {
+          ...existingClients[existingIndex],
+          ...newClientRecord
+        };
+      } else {
+        console.log(`[3X-UI Provisioning] Client not found on inbound. Appending new client record.`);
+        existingClients.push(newClientRecord);
+      }
+
+      const clientCountAfter = existingClients.length;
+
+      // Preserve every existing client & preserve every inbound property
+      settingsObj.clients = existingClients;
+
+      const updateInboundPayload: any = {
+        ...targetInboundObj,
+        id: Number(inboundId),
+        settings: JSON.stringify(settingsObj)
+      };
+
+      // Remove runtime / statistics fields
+      delete updateInboundPayload.up;
+      delete updateInboundPayload.down;
+      delete updateInboundPayload.clientStats;
+      delete updateInboundPayload.trafficReset;
+      delete updateInboundPayload.lastTrafficResetTime;
+
+      console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
+      console.log(`[3X-UI Provisioning] Detailed Logs:`);
+      console.log(`  - Client count before update: ${clientCountBefore}`);
+      console.log(`  - Client count after update: ${clientCountAfter}`);
+      console.log(`  - UUID added/updated: ${uuid}`);
+      console.log(`  - Email added/updated: ${remark}`);
+
+      // Fencing verification immediately before external 3X-UI mutation:
+      // ensure BOTH the inbound write lock and the order lock are still actively owned by this worker.
+      await assertInboundLockStillHeld();
+      if (ownsDurableLock && durableOperationKey && acquiredLockOwnerId) {
+        const orderLockValid = await renewDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: durableOperationKey,
+          lockOwnerId: acquiredLockOwnerId,
+        });
+        if (!orderLockValid) {
+          const fenceErr: any = new Error(
+            `Lost durable order lock '${durableOperationKey}' before 3X-UI update; aborting to prevent overlapping mutation.`
+          );
+          fenceErr.statusCode = 409;
+          throw fenceErr;
+        }
+      }
+
+      xuiWriteAttempted = true;
+      const updateRes = await requestApiCall<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
+
+      if (updateRes && updateRes.success === false) {
+        const panelMsg = updateRes.msg || updateRes.message || '3X-UI panel rejected inbound update';
+        console.error(`[3X-UI Provisioning] Inbound update failed on panel: ${panelMsg}`);
+        throw new Error(`3X-UI provisioning failed: ${panelMsg}`);
+      }
+
+      let afterInboundObj: any = null;
+      try {
+        const getRes = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+        afterInboundObj = getRes?.obj || getRes;
+      } catch (getErr: any) {
+        console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
+      }
+
+      if (!afterInboundObj || typeof afterInboundObj !== 'object' || !afterInboundObj.id) {
+        const allInboundsList = await getInboundsCall(true);
+        afterInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
+      }
+
+      let afterSettingsObj: any = {};
+      if (afterInboundObj) {
+        if (typeof afterInboundObj.settings === 'string') {
+          try {
+            afterSettingsObj = JSON.parse(afterInboundObj.settings);
+          } catch (_e) {
+            afterSettingsObj = { clients: [] };
+          }
+        } else if (afterInboundObj.settings && typeof afterInboundObj.settings === 'object') {
+          afterSettingsObj = afterInboundObj.settings;
+        }
+      }
+
+      const afterClients: any[] = Array.isArray(afterSettingsObj.clients) ? afterSettingsObj.clients : [];
+
+      const foundClient = afterClients.find((c: any) =>
+        (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+        (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+      );
+
+      // Immediately read back the created client from 3X-UI to verify persistence and exact UUID
+      const readBackClient = await getClientByEmailCall(remark);
+      if (readBackClient && readBackClient.uuid && String(readBackClient.uuid).trim().toLowerCase() === String(uuid).trim().toLowerCase()) {
+        uuid = readBackClient.uuid;
+        if (readBackClient.subId) subId = readBackClient.subId;
+      } else if (!foundClient) {
+        console.error(`[3X-UI Provisioning] Verification failed: client '${remark}' (UUID: ${uuid}) was not persisted in inbound ${inboundId}. Aborting order completion.`);
+        throw new Error(`3X-UI panel update did not persist client configuration on inbound ${inboundId}. Order was not marked completed.`);
+      }
+
+      xuiWriteConfirmed = true;
     }
-  }
-
-  const afterClients: any[] = Array.isArray(afterSettingsObj.clients) ? afterSettingsObj.clients : [];
-
-  const foundClient = afterClients.find((c: any) =>
-    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
-    (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
   );
-
-  // Immediately read back the created client from 3X-UI to verify persistence and exact UUID
-  const readBackClient = await getClientByEmail(remark);
-  if (readBackClient && readBackClient.uuid) {
-    uuid = readBackClient.uuid;
-    if (readBackClient.subId) subId = readBackClient.subId;
-  } else if (!foundClient) {
-    console.error(`[3X-UI Provisioning] Verification failed: client '${remark}' (UUID: ${uuid}) was not persisted in inbound ${inboundId}. Aborting order completion.`);
-    throw new Error(`3X-UI panel update did not persist client configuration on inbound ${inboundId}. Order was not marked completed.`);
-  }
 
   // Step 3: Generate the VLESS URL and subscription URL
   const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
@@ -1840,14 +2667,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   // Step 4: Upsert vpn_accounts
   let vpnAccountId = '';
-
-  let accountEmail = (order.email || extra.email || extra.user_email || extra.customerEmail || '').trim();
-  if (!accountEmail && order.customer_id) {
-    const { data: prof } = await dbClient.from('profiles').select('email').eq('id', order.customer_id).maybeSingle();
-    if (prof?.email) {
-      accountEmail = prof.email.trim();
-    }
-  }
 
   const accPayload: any = {
     user_id: validUserId,
@@ -1943,137 +2762,242 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     throw new Error(`Failed to persist inbound_id in vpn_configs: expected ${inboundId}, got ${savedConfig?.inbound_id}`);
   }
 
-  // Step 6: Update orders (payment_status='Paid', status='completed')
+  // Step 5.5: Promote authoritative Entitlement Grant from 'provisioning' -> 'provisional' | 'verified'
+  // Never mutate orders.payment_method with internal entitlement metadata.
+  const nowIso = new Date().toISOString();
+  const grantUpdatePayload = {
+    vpn_account_id: vpnAccountId || null,
+    client_uuid: uuid,
+    sub_id: subId,
+    inbound_id: inboundId,
+    remark,
+    provisional: isProvisionalActivation,
+    status: isProvisionalActivation ? 'provisional' : 'verified',
+    verified_at: isProvisionalActivation ? null : nowIso,
+    verified_by: isProvisionalActivation ? null : (options?.adminLabel || 'Admin'),
+    updated_at: nowIso,
+  };
+
+  if (grantTableAvailable) {
+    let promoteErr: any = null;
+    if (authoritativeGrantId) {
+      const { error } = await dbClient
+        .from('vpn_entitlement_grants')
+        .update(grantUpdatePayload)
+        .eq('id', authoritativeGrantId);
+      promoteErr = error;
+    } else {
+      const { error } = await dbClient
+        .from('vpn_entitlement_grants')
+        .update(grantUpdatePayload)
+        .eq('grant_type', 'new_order')
+        .eq('source_id', String(order.id));
+      promoteErr = error;
+    }
+
+    if (promoteErr) {
+      throw new Error(`Failed to finalize authoritative vpn_entitlement_grants record: ${promoteErr.message || JSON.stringify(promoteErr)}`);
+    }
+  }
+
+  // Step 6: Update orders (keeping orders.payment_method completely untouched)
+  // For provisional activation, keep payment_status='Pending Verification' and status='pending'
   const ordersPayload: any = {
-    payment_status: 'Paid',
-    status: 'completed',
+    payment_status: isProvisionalActivation ? (order.payment_status || 'Pending Verification') : 'Paid',
+    status: isProvisionalActivation ? (order.status || 'pending') : 'completed',
+    provisioning_status: isProvisionalActivation ? 'provisional' : 'completed',
     client_uuid: uuid,
     vless_url: vlessUrl,
     subscription_url: subscriptionUrl,
     expiry_date: new Date(expiryMs).toISOString(),
     is_trial: isTrialOrder,
-    activated_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
+    activated_at: nowIso,
+    updated_at: nowIso
   };
 
-  const { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
+  let { error: orderUpdateErr } = await dbClient.from('orders').update(ordersPayload).eq('id', order.id);
+  if (orderUpdateErr && String(orderUpdateErr.message || '').includes('provisioning_status') && !isProvisionalActivation) {
+    const { provisioning_status: _omitted, ...fallbackOrdersPayload } = ordersPayload;
+    const retryRes = await dbClient.from('orders').update(fallbackOrdersPayload).eq('id', order.id);
+    orderUpdateErr = retryRes.error;
+  }
 
   if (orderUpdateErr) {
     console.error("[3X-UI Provisioning DB] Error updating table 'orders':", orderUpdateErr);
     throw new Error(`Database update failed for table 'orders': ${orderUpdateErr.message || JSON.stringify(orderUpdateErr)}`);
   }
 
-  // Step 7: Create customer notification in notifications table
-  try {
-    if (isTrialOrder) {
-      console.log('[3X-UI Provisioning DB] Triggering Trial Approved and VPN Created notifications');
-      await createCustomerNotification({
-        userId: validUserId,
-        userEmail: order.email,
-        title: 'Trial Approved',
-        message: `Your free trial request for "${packageName}" has been approved!`,
-        type: 'trial_approved',
-        orderId: order.id,
-        vpnName: packageName
-      });
-      await createCustomerNotification({
-        userId: validUserId,
-        userEmail: order.email,
-        title: 'VPN Created',
-        message: `Your trial VPN configuration "${packageName}" has been created successfully and is ready to use.`,
-        type: 'vpn_created',
-        orderId: order.id,
-        vpnName: packageName
-      });
-    } else {
-      console.log('[3X-UI Provisioning DB] Triggering Order Approved, Payment Approved, and VPN Created notifications');
-      await createCustomerNotification({
-        userId: validUserId,
-        userEmail: order.email,
-        title: 'Order Approved',
-        message: `Your order for "${packageName}" has been approved!`,
-        type: 'order_approved',
-        orderId: order.id,
-        vpnName: packageName
-      });
-      await createCustomerNotification({
-        userId: validUserId,
-        userEmail: order.email,
-        title: 'Payment Approved',
-        message: `Your payment for "${packageName}" has been verified and approved!`,
-        type: 'payment_approved',
-        orderId: order.id,
-        vpnName: packageName
-      });
-      await createCustomerNotification({
-        userId: validUserId,
-        userEmail: order.email,
-        title: 'VPN Created',
-        message: `Your VPN configuration "${packageName}" has been created successfully and is ready to use.`,
-        type: 'vpn_created',
-        orderId: order.id,
-        vpnName: packageName
-      });
-    }
-
-    // Trigger Email Notification (non-blocking)
-    if (order.email) {
-      const canonicalOrderId = order.order_id || order.id;
-      if (isTrialOrder) {
-        sendTrialApprovedEmail({
+  if (isProvisionalActivation) {
+    if (!options?.skipSideEffects) {
+      try {
+        await createCustomerNotification({
+          userId: validUserId,
           userEmail: order.email,
-          customerName: extra.customerName || undefined,
-          trialId: canonicalOrderId,
-          orderId: canonicalOrderId,
-          packageName,
-          vlessUrl,
-          expiryDate: new Date(expiryMs).toISOString(),
-          userId: validUserId
-        }).catch(e => console.warn('[3X-UI Provisioning DB] Trial approved email notification warning:', e));
-      } else {
-        sendPaymentApprovedEmail({
-          userEmail: order.email,
-          orderId: order.order_id || order.id,
-          packageName,
-          vlessUrl,
-          expiryDate: new Date(expiryMs).toISOString(),
-          userId: validUserId
-        }).catch(e => console.warn('[3X-UI Provisioning DB] Payment approved email notification warning:', e));
-
-        sendOrderCompletedEmail({
-          userEmail: order.email,
-          customerName: extra.customerName || undefined,
-          orderId: order.order_id || order.id,
-          packageName,
-          vlessUrl,
-          expiryDate: new Date(expiryMs).toISOString(),
-          userId: validUserId
-        }).catch(e => console.warn('[3X-UI Provisioning DB] Order completed email notification warning:', e));
+          title: 'VPN Activated (Payment Pending Verification)',
+          message: `Your VPN configuration "${packageName}" is now active! Payment verification is pending admin review.`,
+          type: 'vpn_created',
+          orderId: order.id,
+          vpnName: packageName,
+        });
+      } catch (provNotifErr: any) {
+        console.warn('[3X-UI Provisioning DB] Provisional notification warning:', provNotifErr?.message || provNotifErr);
       }
+      triggerBackgroundSyncIfNeeded('VPN Provisionally Activated', true);
     }
-  } catch (notifErr: any) {
-    console.error('[3X-UI Provisioning DB] CRITICAL: Customer notification creation failed:', notifErr.message || notifErr);
-  }
 
-  // Step 8: Send Telegram notification and return success
-  try {
-    await sendOrderApprovedNotification({
-      customerEmail: order.email || 'N/A',
-      packageName: packageName,
-      packageType: extra.packageType || 'SIM Unlimited',
-      server: template.server || extra.server || 'Singapore',
-      duration: duration,
-      price: order.amount || 0,
-      uuid: uuid,
+    if (ownsDurableLock) {
+      await finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOperationKey,
+        lockOwnerId: acquiredLockOwnerId,
+        status: 'completed',
+        clientUuid: uuid,
+        metadata: {
+          provisional: true,
+          inboundId,
+          expiryDate: new Date(expiryMs).toISOString(),
+        },
+      });
+      ownsDurableLock = false;
+    }
+
+    return {
+      success: true,
+      provisional: true,
+      message: skipMsg || 'VPN client provisionally activated pending payment verification',
       orderId: order.order_id || order.id,
-      status: '🟢 COMPLETED'
-    });
-  } catch (tgErr) {
-    console.warn('[3X-UI Provisioning DB] Telegram notification warning:', tgErr);
+      uuid,
+      vlessUrl,
+      subscriptionUrl,
+      expiryDate: new Date(expiryMs).toISOString(),
+      vpnAccountId,
+    };
   }
 
-  // Trigger background synchronization asynchronously and non-blockingly
-  triggerBackgroundSyncIfNeeded('VPN Created', true);
+  // Step 7: Create customer notification in notifications table (for final approved/completed orders)
+  if (!options?.skipSideEffects) {
+    try {
+      if (isTrialOrder) {
+        console.log('[3X-UI Provisioning DB] Triggering Trial Approved and VPN Created notifications');
+        await createCustomerNotification({
+          userId: validUserId,
+          userEmail: order.email,
+          title: 'Trial Approved',
+          message: `Your free trial request for "${packageName}" has been approved!`,
+          type: 'trial_approved',
+          orderId: order.id,
+          vpnName: packageName
+        });
+        await createCustomerNotification({
+          userId: validUserId,
+          userEmail: order.email,
+          title: 'VPN Created',
+          message: `Your trial VPN configuration "${packageName}" has been created successfully and is ready to use.`,
+          type: 'vpn_created',
+          orderId: order.id,
+          vpnName: packageName
+        });
+      } else {
+        console.log('[3X-UI Provisioning DB] Triggering Order Approved, Payment Approved, and VPN Created notifications');
+        await createCustomerNotification({
+          userId: validUserId,
+          userEmail: order.email,
+          title: 'Order Approved',
+          message: `Your order for "${packageName}" has been approved!`,
+          type: 'order_approved',
+          orderId: order.id,
+          vpnName: packageName
+        });
+        await createCustomerNotification({
+          userId: validUserId,
+          userEmail: order.email,
+          title: 'Payment Approved',
+          message: `Your payment for "${packageName}" has been verified and approved!`,
+          type: 'payment_approved',
+          orderId: order.id,
+          vpnName: packageName
+        });
+        await createCustomerNotification({
+          userId: validUserId,
+          userEmail: order.email,
+          title: 'VPN Created',
+          message: `Your VPN configuration "${packageName}" has been created successfully and is ready to use.`,
+          type: 'vpn_created',
+          orderId: order.id,
+          vpnName: packageName
+        });
+      }
+
+      // Trigger Email Notification (non-blocking)
+      if (order.email) {
+        const canonicalOrderId = order.order_id || order.id;
+        if (isTrialOrder) {
+          sendTrialApprovedEmail({
+            userEmail: order.email,
+            customerName: extra.customerName || undefined,
+            trialId: canonicalOrderId,
+            orderId: canonicalOrderId,
+            packageName,
+            vlessUrl,
+            expiryDate: new Date(expiryMs).toISOString(),
+            userId: validUserId
+          }).catch(e => console.warn('[3X-UI Provisioning DB] Trial approved email notification warning:', e));
+        } else {
+          sendPaymentApprovedEmail({
+            userEmail: order.email,
+            orderId: order.order_id || order.id,
+            packageName,
+            vlessUrl,
+            expiryDate: new Date(expiryMs).toISOString(),
+            userId: validUserId
+          }).catch(e => console.warn('[3X-UI Provisioning DB] Payment approved email notification warning:', e));
+
+          sendOrderCompletedEmail({
+            userEmail: order.email,
+            customerName: extra.customerName || undefined,
+            orderId: order.order_id || order.id,
+            packageName,
+            vlessUrl,
+            expiryDate: new Date(expiryMs).toISOString(),
+            userId: validUserId
+          }).catch(e => console.warn('[3X-UI Provisioning DB] Order completed email notification warning:', e));
+        }
+      }
+    } catch (notifErr: any) {
+      console.error('[3X-UI Provisioning DB] CRITICAL: Customer notification creation failed:', notifErr.message || notifErr);
+    }
+
+    // Step 8: Send Telegram notification and return success
+    try {
+      await sendOrderApprovedNotification({
+        customerEmail: order.email || 'N/A',
+        packageName: packageName,
+        packageType: extra.packageType || 'SIM Unlimited',
+        server: template.server || extra.server || 'Singapore',
+        duration: duration,
+        price: order.amount || 0,
+        uuid: uuid,
+        orderId: order.order_id || order.id,
+        status: '🟢 COMPLETED'
+      });
+    } catch (tgErr) {
+      console.warn('[3X-UI Provisioning DB] Telegram notification warning:', tgErr);
+    }
+
+    // Trigger background synchronization asynchronously and non-blockingly
+    triggerBackgroundSyncIfNeeded('VPN Created', true);
+  }
+
+  if (ownsDurableLock) {
+    await finalizeDurableProvisioningOperationLock({
+      dbClient,
+      operationKey: durableOperationKey,
+      lockOwnerId: acquiredLockOwnerId,
+      status: 'completed',
+      clientUuid: uuid,
+    });
+    ownsDurableLock = false;
+  }
 
   return {
     success: true,
@@ -2084,6 +3008,18 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     subscriptionUrl,
     vpnAccountId
   };
+  } catch (err: any) {
+    if (ownsDurableLock && durableOperationKey && acquiredLockOwnerId) {
+      await finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOperationKey,
+        lockOwnerId: acquiredLockOwnerId,
+        status: xuiWriteAttempted && !xuiWriteConfirmed ? 'uncertain' : 'failed',
+        errorMessage: err?.message || String(err),
+      });
+      ownsDurableLock = false;
+    }
+    throw err;
   } finally {
     activeProvisionings.delete(orderId);
     if (canonicalOrderLockKey) {
@@ -2092,54 +3028,578 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   }
 };
 
-export const disable3XUiClient = async (inboundId: number | null, uuid: string, email?: string): Promise<boolean> => {
-  try {
-    const config = await getXuiConfig();
-    const token = config.apiToken || config.password;
-    if (!token) return false;
+export interface RevokeProvisionalOrderClientOptions {
+  adminLabel?: string;
+  dbClient?: any;
+  requestApiFn?: typeof requestApi;
+  getInboundsFn?: typeof getInbounds;
+  heldOrderLockOwnerId?: string;
+}
 
-    const endpointsToTry = [
-      `/panel/api/inbounds/updateClient/${uuid}`,
-      `/panel/api/clients/update/${uuid}`
-    ];
+/**
+ * Mandatory Rejection Safety:
+ * Revokes ONLY an unpaid provisional VPN entitlement specifically tracked in public.vpn_entitlement_grants.
+ * - ZERO payment_method fallback: public.vpn_entitlement_grants is the sole authoritative ledger.
+ * - Handles partial/interrupted provisional states (`status IN ('provisioning', 'provisional', 'revoke_failed')`)
+ *   by reconciling live 3X-UI state and disabling any unpaid client that already exists on 3X-UI.
+ * - Serializes 3X-UI writes under per-inbound durable lock (`inbound:<id>`).
+ * - Performs mandatory read-back verification from 3X-UI after setting `enable: false` before marking 'revoked'.
+ * - On failure, marks 'revoke_failed' in vpn_entitlement_grants & orders.provisioning_status and throws.
+ */
+export const revokeProvisionalOrderClient = async (
+  orderId: string,
+  reason: string,
+  options?: RevokeProvisionalOrderClientOptions
+): Promise<{
+  revoked: boolean;
+  skippedSafety?: boolean;
+  reason?: string;
+  uuid?: string;
+  inboundId?: number | null;
+}> => {
+  const dbClient = options?.dbClient || supabaseAdmin;
+  const requestApiCall = options?.requestApiFn || requestApi;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
 
-    if (inboundId) {
-      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/delClient/${uuid}`);
+  let { data: order } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
+  if (!order) {
+    const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
+    order = queryOrder;
+  }
+  if (!order) {
+    throw new Error(`Order '${orderId}' not found.`);
+  }
+
+  const durableOperationKey = `order:${order.id}`;
+  let acquiredLockOwnerId = options?.heldOrderLockOwnerId || '';
+  let ownsDurableLock = false;
+
+  if (!options?.heldOrderLockOwnerId) {
+    const lockRes = await acquireDurableProvisioningOperationLock({
+      dbClient,
+      operationKey: durableOperationKey,
+      operationType: 'reject_order',
+      targetId: String(order.id),
+      clientUuid: order.client_uuid || null,
+      metadata: { reason, adminLabel: options?.adminLabel || 'Admin' },
+      requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+    });
+
+    if (!lockRes.acquired) {
+      const conflictErr: any = new Error(
+        lockRes.error || 'Another provisioning, approval, or rejection operation is currently in progress for this order.'
+      );
+      conflictErr.statusCode = 409;
+      throw conflictErr;
     }
 
-    for (const endpoint of endpointsToTry) {
-      try {
-        const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, endpoint);
-        const client = createAxiosInstance(baseUrl);
+    acquiredLockOwnerId = lockRes.lockOwnerId;
+    ownsDurableLock = lockRes.tableAvailable;
+  }
 
-        if (endpoint.includes('delClient')) {
-          await client.post(fullPath, {}, { headers: { Authorization: `Bearer ${token}` } });
-          return true;
-        } else {
-          const payload = {
-            id: inboundId || 1,
-            settings: JSON.stringify({
-              clients: [{
-                id: uuid,
-                email: email || '',
-                enable: false,
-                expiryTime: 0,
-                totalGB: 0
-              }]
-            })
-          };
-          const res = await client.post(fullPath, payload, { headers: { Authorization: `Bearer ${token}` } });
-          if (res.data && (res.data.success || res.status === 200)) return true;
+  let dbGrant: any = null;
+  let clientUuid = '';
+
+  const releaseOwnedLock = async (status: 'completed' | 'failed' | 'uncertain', errMsg?: string | null, metadata?: Record<string, any>) => {
+    if (ownsDurableLock && acquiredLockOwnerId) {
+      await finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOperationKey,
+        lockOwnerId: acquiredLockOwnerId,
+        status,
+        clientUuid: clientUuid || null,
+        errorMessage: errMsg || null,
+        metadata,
+      });
+      ownsDurableLock = false;
+    }
+  };
+
+  try {
+    // Re-read fresh order INSIDE the lock
+    const { data: freshOrder } = await dbClient.from('orders').select('*').eq('id', order.id).maybeSingle();
+    if (freshOrder) {
+      order = freshOrder;
+    }
+
+    let extra: any = {};
+    if (order.payment_method && typeof order.payment_method === 'string' && order.payment_method.startsWith('{')) {
+      try {
+        extra = JSON.parse(order.payment_method);
+      } catch (_e) {}
+    }
+
+    // Safety Check 1: Never revoke or reject if the order is already marked Paid or completed
+    const payStatusLower = String(order.payment_status || '').toLowerCase().trim();
+    const orderStatusLower = String(order.status || '').toLowerCase().trim();
+    if (payStatusLower === 'paid' || orderStatusLower === 'completed' || orderStatusLower === 'approved') {
+      await releaseOwnedLock('failed', 'Cannot revoke a paid or completed order.');
+      const conflictErr: any = new Error('Order is already marked Paid/Completed. Refusing to revoke active paid VPN client.');
+      conflictErr.statusCode = 409;
+      throw conflictErr;
+    }
+
+    // Safety Check 2: Never disable an entire VPN client if the order was extending an existing UUID
+    const extendUuid = String(extra.extend_uuid || extra.existing_uuid || extra.extendUuid || '').trim();
+    if (extendUuid) {
+      await releaseOwnedLock('completed');
+      return {
+        revoked: false,
+        skippedSafety: true,
+        reason: 'Order references an existing extended account (extend_uuid). Refusing to disable existing customer VPN account.',
+      };
+    }
+
+    // Safety Check 3: Authoritative lookup in public.vpn_entitlement_grants ONLY (ZERO payment_method fallback!)
+    const { data: grantRow, error: grantSelErr } = await dbClient
+      .from('vpn_entitlement_grants')
+      .select('*')
+      .eq('grant_type', 'new_order')
+      .eq('source_id', String(order.id))
+      .maybeSingle();
+
+    if (grantSelErr) {
+      if (isMissingSchemaOrRpcError(grantSelErr) && !isAutoActivateNewOrdersFlagEnabled()) {
+        // Legacy pre-migration manual rejection when auto-activation has never been enabled
+        await releaseOwnedLock('completed');
+        return {
+          revoked: false,
+          reason: 'Order was not provisionally provisioned (entitlement ledger not installed and auto-activation disabled).',
+        };
+      }
+      throw new Error(`Authoritative vpn_entitlement_grants lookup failed: ${grantSelErr.message}`);
+    }
+
+    dbGrant = grantRow;
+
+    if (!dbGrant) {
+      await releaseOwnedLock('completed');
+      return {
+        revoked: false,
+        skippedSafety: Boolean(order.client_uuid),
+        reason: order.client_uuid
+          ? 'No authoritative provisional entitlement grant exists in vpn_entitlement_grants for this order. Refusing to revoke client.'
+          : 'Order was not provisionally provisioned.',
+      };
+    }
+
+    if (dbGrant.status === 'revoked') {
+      await releaseOwnedLock('completed');
+      return {
+        revoked: true,
+        uuid: dbGrant.client_uuid,
+        inboundId: dbGrant.inbound_id || null,
+        reason: 'Provisional entitlement grant was already revoked.',
+      };
+    }
+
+    const orderClientUuid = String(order.client_uuid || '').trim();
+    const grantClientUuid = String(dbGrant.client_uuid || '').trim();
+    clientUuid = grantClientUuid || orderClientUuid;
+
+    const isRevocableGrantStatus =
+      dbGrant.status === 'provisional' ||
+      dbGrant.status === 'provisioning' ||
+      dbGrant.status === 'revoke_failed';
+
+    const uuidMatchesOrderIfSet =
+      !orderClientUuid || orderClientUuid.toLowerCase() === grantClientUuid.toLowerCase();
+
+    if (
+      dbGrant.grant_type !== 'new_order' ||
+      String(dbGrant.source_id) !== String(order.id) ||
+      dbGrant.provisional !== true ||
+      !clientUuid ||
+      !uuidMatchesOrderIfSet ||
+      !isRevocableGrantStatus
+    ) {
+      console.warn(`[Rejection Safety] Order ${order.id} grant (status=${dbGrant.status}, provisional=${dbGrant.provisional}) is not eligible for automatic revocation. Refusing to revoke client.`);
+      await releaseOwnedLock('completed');
+      return {
+        revoked: false,
+        skippedSafety: true,
+        reason: 'Entitlement grant does not represent an unpaid provisional new-order client for this order. Protected client from revocation.',
+      };
+    }
+
+    // Safety Check 4: Confirm no other paid/completed order is linked to this client_uuid
+    const { data: otherOrders } = await dbClient
+      .from('orders')
+      .select('id, status, payment_status')
+      .eq('client_uuid', clientUuid);
+
+    const hasOtherPaidOrder = (otherOrders || []).some((o: any) => {
+      if (String(o.id) === String(order.id)) return false;
+      const st = String(o.status || '').toLowerCase().trim();
+      const ps = String(o.payment_status || '').toLowerCase().trim();
+      return st === 'completed' || st === 'active' || st === 'approved' || ps === 'paid';
+    });
+
+    if (hasOtherPaidOrder) {
+      console.warn(`[Rejection Safety] Client UUID ${clientUuid} belongs to another paid/completed order! Refusing to revoke.`);
+      await releaseOwnedLock('completed');
+      return {
+        revoked: false,
+        skippedSafety: true,
+        reason: 'Client UUID is associated with another paid/completed order. Protected existing client from revocation.',
+      };
+    }
+
+    // Safety Check 5: Confirm vpn_accounts record (if present) belongs to this order
+    const { data: vpnAcc } = await dbClient
+      .from('vpn_accounts')
+      .select('*')
+      .eq('uuid', clientUuid)
+      .maybeSingle();
+
+    if (vpnAcc && vpnAcc.order_id && String(vpnAcc.order_id) !== String(order.id)) {
+      console.warn(`[Rejection Safety] vpn_accounts record for ${clientUuid} has order_id=${vpnAcc.order_id} (expected ${order.id}). Refusing to revoke.`);
+      await releaseOwnedLock('completed');
+      return {
+        revoked: false,
+        skippedSafety: true,
+        reason: 'VPN account belongs to a different order. Protected existing client from revocation.',
+      };
+    }
+
+    // Locate target inbound ID first
+    let targetInboundId = Number(dbGrant.inbound_id || 0) || null;
+    if (!targetInboundId) {
+      const initialInbounds = await getInboundsCall(true);
+      for (const ib of initialInbounds) {
+        let sObj: any = {};
+        try {
+          sObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+        } catch {
+          continue;
         }
-      } catch (e) {
-        // Continue to next endpoint
+        if ((sObj?.clients || []).some((c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase())) {
+          targetInboundId = Number(ib.id);
+          break;
+        }
       }
     }
-    return false;
-  } catch (err) {
-    console.warn(`[3X-UI] Error disabling client ${uuid}:`, err);
-    return false;
+
+    if (!targetInboundId) {
+      if (dbGrant.status === 'provisioning') {
+        // Interrupted before client was written to 3X-UI; verify absence across all fresh inbounds
+        const freshCheck = await getInboundsCall(true);
+        const existsAnywhere = freshCheck.some((ib: any) => {
+          try {
+            const s = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+            return (s?.clients || []).some((c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase());
+          } catch {
+            return false;
+          }
+        });
+        if (existsAnywhere) {
+          throw new Error(`Provisional client ${clientUuid} exists on 3X-UI but target inbound ID could not be determined.`);
+        }
+      } else {
+        throw new Error(`Unable to locate inbound on 3X-UI panel for provisional client ${clientUuid}.`);
+      }
+    }
+
+    const inboundId = targetInboundId;
+
+    // Disable on 3X-UI INSIDE durable per-inbound write lock AND perform mandatory read-back verification
+    if (inboundId) {
+      await withInboundWriteLock(
+        {
+          dbClient,
+          inboundId,
+          targetId: String(order.id),
+          clientUuid,
+          requireDurableLock: true,
+        },
+        async (assertInboundLockStillHeld) => {
+          const fetchFreshInbound = async (): Promise<any | null> => {
+            try {
+              const res = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+              const obj = res?.obj || res;
+              if (obj && typeof obj === 'object' && obj.id !== undefined) return obj;
+            } catch (_e) {}
+            const list = await getInboundsCall(true);
+            return list.find((ib: any) => Number(ib.id) === Number(inboundId)) || null;
+          };
+
+          const matchedInboundObj = await fetchFreshInbound();
+          if (!matchedInboundObj) {
+            throw new Error(`Unable to fetch live inbound ${inboundId} from 3X-UI panel.`);
+          }
+
+          let settingsObj: any = {};
+          if (typeof matchedInboundObj.settings === 'string') {
+            try {
+              settingsObj = JSON.parse(matchedInboundObj.settings);
+            } catch (_e) {
+              settingsObj = { clients: [] };
+            }
+          } else if (matchedInboundObj.settings && typeof matchedInboundObj.settings === 'object') {
+            settingsObj = { ...matchedInboundObj.settings };
+          }
+
+          const clientsList: any[] = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+          const clientIdx = clientsList.findIndex((c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase());
+
+          if (clientIdx >= 0) {
+            // Disable the client on 3X-UI while preserving its record and credentials
+            clientsList[clientIdx] = {
+              ...clientsList[clientIdx],
+              enable: false,
+            };
+            settingsObj.clients = clientsList;
+
+            const updateInboundPayload: any = {
+              ...matchedInboundObj,
+              id: inboundId,
+              settings: JSON.stringify(settingsObj),
+            };
+            delete updateInboundPayload.up;
+            delete updateInboundPayload.down;
+            delete updateInboundPayload.clientStats;
+            delete updateInboundPayload.trafficReset;
+            delete updateInboundPayload.lastTrafficResetTime;
+
+            await assertInboundLockStillHeld();
+            const updateRes = await requestApiCall<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
+            if (updateRes && updateRes.success === false) {
+              throw new Error(updateRes.msg || updateRes.message || `3X-UI rejected disabling provisional client ${clientUuid}`);
+            }
+
+            // MANDATORY READ-BACK VERIFICATION: confirm enable === false persisted on 3X-UI
+            const verifiedInbound = await fetchFreshInbound();
+            if (!verifiedInbound) {
+              throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after disabling client ${clientUuid}.`);
+            }
+            let verifiedSettings: any = {};
+            try {
+              verifiedSettings = typeof verifiedInbound.settings === 'string'
+                ? JSON.parse(verifiedInbound.settings)
+                : verifiedInbound.settings || {};
+            } catch {
+              verifiedSettings = {};
+            }
+            const verifiedClient = (Array.isArray(verifiedSettings.clients) ? verifiedSettings.clients : []).find(
+              (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+            );
+
+            if (!verifiedClient || verifiedClient.enable !== false) {
+              throw new Error(
+                `Read-back verification failed for provisional client ${clientUuid} on inbound ${inboundId}: expected enable=false, got ${String(verifiedClient?.enable)}.`
+              );
+            }
+          } else if (dbGrant.status !== 'provisioning') {
+            // Client missing on expected inbound; double-check across all inbounds so we don't miss a moved client
+            const allFresh = await getInboundsCall(true);
+            const stillEnabledElsewhere = allFresh.some((ib: any) => {
+              try {
+                const s = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
+                return (s?.clients || []).some(
+                  (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase() && c.enable !== false
+                );
+              } catch {
+                return false;
+              }
+            });
+            if (stillEnabledElsewhere) {
+              throw new Error(`Provisional client ${clientUuid} is still enabled on another inbound; refusing to mark revoked.`);
+            }
+          }
+        }
+      );
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Update vpn_accounts and vpn_configs to disabled
+    if (vpnAcc?.id) {
+      await dbClient
+        .from('vpn_accounts')
+        .update({
+          status: 'disabled',
+          updated_at: nowIso,
+        })
+        .eq('id', vpnAcc.id);
+    }
+
+    await dbClient
+      .from('vpn_configs')
+      .update({
+        enabled: false,
+        status: 'disabled',
+      })
+      .eq('order_id', order.id)
+      .eq('uuid', clientUuid);
+
+    // Update authoritative vpn_entitlement_grants to revoked
+    const { error: revokeGrantErr } = await dbClient
+      .from('vpn_entitlement_grants')
+      .update({
+        status: 'revoked',
+        revoked_at: nowIso,
+        revoked_by: options?.adminLabel || 'Admin',
+        revoke_reason: reason,
+        last_error: null,
+        updated_at: nowIso,
+      })
+      .eq('id', dbGrant.id);
+
+    if (revokeGrantErr) {
+      throw new Error(`Failed to mark vpn_entitlement_grants revoked: ${revokeGrantErr.message}`);
+    }
+
+    // Update orders.provisioning_status without touching orders.payment_method
+    await dbClient
+      .from('orders')
+      .update({
+        provisioning_status: 'revoked',
+        updated_at: nowIso,
+      })
+      .eq('id', order.id);
+
+    await releaseOwnedLock('completed', null, { revoked: true, inboundId, reason });
+
+    return {
+      revoked: true,
+      uuid: clientUuid,
+      inboundId,
+    };
+  } catch (err: any) {
+    // Do NOT overwrite 409 conflict (e.g., already paid order) with revoke_failed
+    if (err?.statusCode === 409) {
+      await releaseOwnedLock('failed', err?.message || String(err));
+      throw err;
+    }
+
+    // Retain recoverable 'revoke_failed' state in vpn_entitlement_grants & orders.provisioning_status (NEVER mutate payment_method)
+    const nowIso = new Date().toISOString();
+    const errText = err?.message || String(err);
+
+    if (dbGrant?.id) {
+      try {
+        await dbClient
+          .from('vpn_entitlement_grants')
+          .update({
+            status: 'revoke_failed',
+            last_error: errText,
+            updated_at: nowIso,
+          })
+          .eq('id', dbGrant.id);
+      } catch (_e) {}
+    }
+
+    try {
+      await dbClient
+        .from('orders')
+        .update({
+          provisioning_status: 'revoke_failed',
+          updated_at: nowIso,
+        })
+        .eq('id', order.id);
+    } catch (_e) {}
+
+    await releaseOwnedLock('failed', errText);
+
+    throw new Error(`Failed to disable provisional VPN client on 3X-UI (order retained in recoverable 'revoke_failed' state): ${errText}`);
   }
+};
+
+export const disable3XUiClient = async (inboundId: number | null, uuid: string, email?: string): Promise<boolean> => {
+  const executeDisable = async (): Promise<boolean> => {
+    try {
+      const config = await getXuiConfig();
+      const token = config.apiToken || config.password;
+      if (!token) return false;
+
+      const endpointsToTry = [
+        `/panel/api/inbounds/updateClient/${uuid}`,
+        `/panel/api/clients/update/${uuid}`
+      ];
+
+      if (inboundId) {
+        endpointsToTry.push(`/panel/api/inbounds/${inboundId}/delClient/${uuid}`);
+      }
+
+      for (const endpoint of endpointsToTry) {
+        try {
+          const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, endpoint);
+          const client = createAxiosInstance(baseUrl);
+
+          if (endpoint.includes('delClient')) {
+            await client.post(fullPath, {}, { headers: { Authorization: `Bearer ${token}` } });
+            return true;
+          } else {
+            const payload = {
+              id: inboundId || 1,
+              settings: JSON.stringify({
+                clients: [{
+                  id: uuid,
+                  email: email || '',
+                  enable: false,
+                  expiryTime: 0,
+                  totalGB: 0
+                }]
+              })
+            };
+            const res = await client.post(fullPath, payload, { headers: { Authorization: `Bearer ${token}` } });
+            if (res.data && (res.data.success || res.status === 200)) return true;
+          }
+        } catch (e) {
+          // Continue to next endpoint
+        }
+      }
+      return false;
+    } catch (err) {
+      console.warn(`[3X-UI] Error disabling client ${uuid}:`, err);
+      return false;
+    }
+  };
+
+  let resolvedInboundId = inboundId && Number(inboundId) > 0 ? Number(inboundId) : null;
+  if (!resolvedInboundId && (uuid || email)) {
+    try {
+      const inbounds = await getCachedInbounds();
+      for (const ib of inbounds) {
+        const settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : (ib.settings || {});
+        const clients: any[] = Array.isArray(settingsObj?.clients) ? settingsObj.clients : [];
+        const match = clients.find(
+          (c: any) =>
+            (uuid && String(c.id || '').trim().toLowerCase() === uuid.trim().toLowerCase()) ||
+            (email && String(c.email || '').trim().toLowerCase() === email.trim().toLowerCase())
+        );
+        if (match && Number(ib.id) > 0) {
+          resolvedInboundId = Number(ib.id);
+          break;
+        }
+      }
+    } catch {
+      // Non-blocking resolution
+    }
+  }
+
+  if (resolvedInboundId && resolvedInboundId > 0) {
+    try {
+      return await withInboundWriteLock(
+        {
+          dbClient: supabaseAdmin,
+          inboundId: resolvedInboundId,
+          targetId: `disable:${uuid}`,
+          clientUuid: uuid,
+          requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+        },
+        async (assertInboundLockStillHeld) => {
+          await assertInboundLockStillHeld();
+          return executeDisable();
+        }
+      );
+    } catch (lockErr: any) {
+      console.warn(`[3X-UI] Inbound lock warning in disable3XUiClient(${uuid}):`, lockErr?.message || lockErr);
+      return false;
+    }
+  }
+
+  return executeDisable();
 };
 
 let lastCleanupTime = 0;
@@ -2642,7 +4102,13 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
         const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
         const currentStatus = String(ord.status || '').toLowerCase();
 
-        if (currentStatus === 'expired' || currentStatus === 'disabled' || currentStatus === 'cancelled') {
+        if (
+          currentStatus === 'expired' ||
+          currentStatus === 'disabled' ||
+          currentStatus === 'cancelled' ||
+          currentStatus === 'rejected' ||
+          currentStatus === 'pending'
+        ) {
           continue;
         }
 
@@ -2746,36 +4212,78 @@ export const resetClientTraffic = async (
     endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(clientUuid)}`);
   }
 
-  let resetSuccess = false;
-  let lastError: any = null;
-  let responseMsg = '';
-
-  for (const ep of endpointsToTry) {
+  let resolvedInboundId = inboundId && Number(inboundId) > 0 ? Number(inboundId) : null;
+  if (!resolvedInboundId && (clientUuid || email)) {
     try {
-      console.log(`[xuiService] Invoking 3X-UI reset endpoint: ${ep}`);
-      const res: any = await requestApi(ep, 'POST');
-      resetSuccess = true;
-      responseMsg = res?.msg || 'Traffic has been reset.';
-      console.log(`[xuiService] Successfully reset traffic via ${ep}:`, res);
-      break;
-    } catch (err: any) {
-      console.warn(`[xuiService] Reset endpoint ${ep} failed:`, err?.response?.data || err.message);
-      lastError = err;
+      const inbounds = await getCachedInbounds();
+      for (const ib of inbounds) {
+        const settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : (ib.settings || {});
+        const clients: any[] = Array.isArray(settingsObj?.clients) ? settingsObj.clients : [];
+        const match = clients.find(
+          (c: any) =>
+            (clientUuid && String(c.id || '').trim().toLowerCase() === clientUuid.trim().toLowerCase()) ||
+            (email && String(c.email || '').trim().toLowerCase() === email.trim().toLowerCase())
+        );
+        if (match && Number(ib.id) > 0) {
+          resolvedInboundId = Number(ib.id);
+          break;
+        }
+      }
+    } catch {
+      // Non-blocking resolution
     }
   }
 
-  if (!resetSuccess) {
-    throw new Error(`Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`);
+  const executeReset = async (): Promise<{ success: boolean; message: string }> => {
+    let resetSuccess = false;
+    let lastError: any = null;
+    let responseMsg = '';
+
+    for (const ep of endpointsToTry) {
+      try {
+        console.log(`[xuiService] Invoking 3X-UI reset endpoint: ${ep}`);
+        const res: any = await requestApi(ep, 'POST');
+        resetSuccess = true;
+        responseMsg = res?.msg || 'Traffic has been reset.';
+        console.log(`[xuiService] Successfully reset traffic via ${ep}:`, res);
+        break;
+      } catch (err: any) {
+        console.warn(`[xuiService] Reset endpoint ${ep} failed:`, err?.response?.data || err.message);
+        lastError = err;
+      }
+    }
+
+    if (!resetSuccess) {
+      throw new Error(`Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`);
+    }
+
+    // Invalidate inbounds cache so that subsequent queries immediately retrieve updated 0 byte traffic stats
+    try {
+      await getInbounds(true);
+    } catch (refreshErr: any) {
+      console.warn('[xuiService] Inbounds cache refresh warning after reset:', refreshErr?.message || refreshErr);
+    }
+
+    return { success: true, message: responseMsg || 'Traffic counter successfully reset in 3X-UI' };
+  };
+
+  if (resolvedInboundId && resolvedInboundId > 0) {
+    return await withInboundWriteLock(
+      {
+        dbClient: supabaseAdmin,
+        inboundId: resolvedInboundId,
+        targetId: `reset_traffic:${clientUuid || email}`,
+        clientUuid: clientUuid || null,
+        requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+      },
+      async (assertInboundLockStillHeld) => {
+        await assertInboundLockStillHeld();
+        return executeReset();
+      }
+    );
   }
 
-  // Invalidate inbounds cache so that subsequent queries immediately retrieve updated 0 byte traffic stats
-  try {
-    await getInbounds(true);
-  } catch (refreshErr: any) {
-    console.warn('[xuiService] Inbounds cache refresh warning after reset:', refreshErr?.message || refreshErr);
-  }
-
-  return { success: true, message: responseMsg || 'Traffic counter successfully reset in 3X-UI' };
+  return executeReset();
 };
 
 

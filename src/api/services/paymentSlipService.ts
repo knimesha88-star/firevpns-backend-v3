@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 
 export const PAYMENT_SLIPS_BUCKET = 'payment-slips';
@@ -563,3 +564,593 @@ export async function uploadPaymentSlipViaBackend(params: {
     error: uploadErrorMsg || 'Failed to upload payment slip to storage.',
   };
 }
+
+export interface PaymentSlipValidationResult {
+  valid: boolean;
+  canonicalSlipUrl: string;
+  bucket: string;
+  objectPath: string;
+  error?: string;
+  code?: 'INVALID_SLIP' | 'UNAUTHORIZED_LOCATION' | 'OWNERSHIP_MISMATCH' | 'STORAGE_NOT_FOUND' | 'DUPLICATE_SLIP';
+}
+
+/**
+ * Validates payment slip ownership, authorized storage location, storage existence,
+ * and duplicate receipt submission prevention on the backend before creating/activating an order.
+ */
+export async function validatePaymentSlipForOrderSubmission(params: {
+  slipUrl: string;
+  userUid: string;
+  userEmail: string;
+  allowedFolders?: Array<'orders' | 'renewals' | 'billing'>;
+  excludeOrderId?: string;
+  dbClient?: any;
+  storageClient?: any;
+}): Promise<PaymentSlipValidationResult> {
+  const rawSlip = String(params.slipUrl || '').trim();
+  const cleanUid = String(params.userUid || '').trim();
+  const cleanEmail = String(params.userEmail || '').trim().toLowerCase();
+  const allowedFolders = params.allowedFolders || ['orders', 'billing'];
+  const db = params.dbClient || supabaseAdmin || supabase;
+  const storage = params.storageClient || params.dbClient?.storage || supabaseAdmin?.storage || supabase.storage;
+
+  if (!rawSlip) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: PAYMENT_SLIPS_BUCKET,
+      objectPath: '',
+      error: 'Payment slip receipt is required.',
+      code: 'INVALID_SLIP',
+    };
+  }
+
+  const parsed = parsePaymentSlipReference(rawSlip);
+
+  if (parsed.kind === 'empty' || parsed.kind === 'external') {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      error: 'Unauthorized payment slip storage location. Receipts must be uploaded through FIREVPNs.',
+      code: 'UNAUTHORIZED_LOCATION',
+    };
+  }
+
+  if (parsed.kind === 'data') {
+    const dataHeaderMatch = rawSlip.match(/^data:(image\/(?:jpeg|jpg|png|webp)|application\/pdf);base64,([A-Za-z0-9+/=\s]+)$/i);
+    if (!dataHeaderMatch) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: PAYMENT_SLIPS_BUCKET,
+        objectPath: '',
+        error: 'Invalid inline payment slip format. Only JPG, PNG, WEBP, and PDF receipts are accepted.',
+        code: 'INVALID_SLIP',
+      };
+    }
+    const b64Payload = dataHeaderMatch[2].replace(/\s+/g, '');
+    const byteLen = Buffer.from(b64Payload, 'base64').byteLength;
+    if (byteLen < 32 || byteLen > MAX_FILE_SIZE_BYTES) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: PAYMENT_SLIPS_BUCKET,
+        objectPath: '',
+        error: 'Payment slip file size is invalid.',
+        code: 'INVALID_SLIP',
+      };
+    }
+  } else if (parsed.kind === 'storage') {
+    if (!FALLBACK_BUCKETS.includes(parsed.bucket)) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        error: `Unauthorized storage bucket '${parsed.bucket}'.`,
+        code: 'UNAUTHORIZED_LOCATION',
+      };
+    }
+
+    const segments = parsed.objectPath.split('/').filter(Boolean);
+    if (segments.length < 3) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        error: 'Invalid payment slip storage path structure.',
+        code: 'UNAUTHORIZED_LOCATION',
+      };
+    }
+
+    const folderSegment = segments[0].toLowerCase() as 'orders' | 'renewals' | 'billing';
+    if (!allowedFolders.includes(folderSegment)) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        error: `Invalid payment slip folder '${segments[0]}'.`,
+        code: 'UNAUTHORIZED_LOCATION',
+      };
+    }
+
+    // Verify ownership: second path segment must match user's sanitized email or UID
+    const ownerSegment = segments[1].toLowerCase();
+    const safeEmailSeg = cleanEmail.replace(/[^a-zA-Z0-9@._-]/g, '_').toLowerCase();
+    const safeUidSeg = cleanUid.replace(/[^a-zA-Z0-9@._-]/g, '_').toLowerCase();
+
+    const matchesOwner =
+      (cleanEmail && (ownerSegment === cleanEmail || ownerSegment === safeEmailSeg)) ||
+      (cleanUid && (ownerSegment === cleanUid.toLowerCase() || ownerSegment === safeUidSeg));
+
+    if (!matchesOwner) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        error: 'Forbidden: Payment slip ownership does not match the authenticated account.',
+        code: 'OWNERSHIP_MISMATCH',
+      };
+    }
+
+    // Verify existence in Supabase Storage
+    let fileExistsInStorage = false;
+    let storageVerifyErr = '';
+    try {
+      const { data: signedData, error: signErr } = await storage
+        .from(parsed.bucket)
+        .createSignedUrl(parsed.objectPath, 60);
+      if (!signErr && signedData?.signedUrl) {
+        fileExistsInStorage = true;
+      } else if (signErr) {
+        storageVerifyErr = signErr.message || String(signErr);
+      }
+    } catch (sErr: any) {
+      storageVerifyErr = sErr?.message || String(sErr);
+    }
+
+    if (!fileExistsInStorage) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        error: `Uploaded payment slip was not found in storage (${storageVerifyErr || 'Object missing'}). Please re-upload your payment slip.`,
+        code: 'STORAGE_NOT_FOUND',
+      };
+    }
+  }
+
+  // Prevent duplicate receipt reuse across already-provisioned, completed, or rejected orders
+  try {
+    const slipCandidates = Array.from(
+      new Set(
+        [
+          rawSlip,
+          parsed.objectPath ? `${parsed.bucket}/${parsed.objectPath}` : '',
+          parsed.objectPath || '',
+        ].filter(Boolean)
+      )
+    );
+
+    for (const candidate of slipCandidates) {
+      const { data: existingOrdersWithSlip } = await db
+        .from('orders')
+        .select('id, order_id, customer_id, status, payment_status, provisioning_status, client_uuid, vless_url')
+        .eq('slip_url', candidate)
+        .limit(5);
+
+      if (Array.isArray(existingOrdersWithSlip) && existingOrdersWithSlip.length > 0) {
+        const reusedOrder = existingOrdersWithSlip.find((ord: any) => {
+          if (params.excludeOrderId && String(ord.id) === String(params.excludeOrderId)) {
+            return false;
+          }
+          const ordOwner = String(ord.customer_id || '').trim();
+          const st = String(ord.status || '').toLowerCase();
+          const paySt = String(ord.payment_status || '').toLowerCase();
+          const provSt = String(ord.provisioning_status || '').toLowerCase();
+          // If used by another customer, or already approved/completed/rejected/provisioned
+          if (ordOwner && cleanUid && ordOwner !== cleanUid) return true;
+          if (
+            st === 'completed' ||
+            st === 'active' ||
+            st === 'rejected' ||
+            paySt === 'paid' ||
+            paySt === 'cancelled' ||
+            paySt === 'rejected' ||
+            provSt === 'provisional' ||
+            provSt === 'completed' ||
+            provSt === 'revoked' ||
+            Boolean(ord.vless_url)
+          ) {
+            return true;
+          }
+          return false;
+        });
+
+        if (reusedOrder) {
+          return {
+            valid: false,
+            canonicalSlipUrl: '',
+            bucket: parsed.bucket,
+            objectPath: parsed.objectPath,
+            error: 'This payment slip has already been submitted on a processed or active order. Please upload a fresh payment receipt.',
+            code: 'DUPLICATE_SLIP',
+          };
+        }
+      }
+    }
+  } catch (dupErr) {
+    console.warn('[PaymentSlipService] Duplicate slip check notice:', dupErr);
+  }
+
+  const canonicalSlipUrl =
+    parsed.kind === 'storage' && parsed.objectPath
+      ? `${parsed.bucket}/${parsed.objectPath}`
+      : rawSlip;
+
+  return {
+    valid: true,
+    canonicalSlipUrl,
+    bucket: parsed.bucket,
+    objectPath: parsed.objectPath,
+  };
+}
+
+export interface PaymentSlipContentVerificationResult {
+  valid: boolean;
+  canonicalSlipUrl: string;
+  bucket: string;
+  objectPath: string;
+  sha256: string;
+  byteSize: number;
+  contentType: string;
+  error?: string;
+  code?:
+    | 'INVALID_SLIP'
+    | 'UNAUTHORIZED_LOCATION'
+    | 'OWNERSHIP_MISMATCH'
+    | 'STORAGE_NOT_FOUND'
+    | 'STORAGE_READ_FAILED';
+}
+
+/**
+ * Verifies payment slip ownership and storage existence, reads the actual uploaded
+ * bytes (from Supabase Storage or inline data URI), and computes a SHA-256 digest.
+ * NOTE: SHA-256 detects exact duplicate file re-submissions (including renamed re-uploads),
+ * but does not prove payment authenticity or detect edited/re-encoded images.
+ */
+export async function computePaymentSlipSha256AndVerifyStorage(params: {
+  slipUrl: string;
+  userUid: string;
+  userEmail: string;
+  allowedFolders?: Array<'orders' | 'renewals' | 'billing'>;
+  storageClient?: any;
+}): Promise<PaymentSlipContentVerificationResult> {
+  const rawSlip = String(params.slipUrl || '').trim();
+  const cleanUid = String(params.userUid || '').trim();
+  const cleanEmail = String(params.userEmail || '').trim().toLowerCase();
+  const allowedFolders = params.allowedFolders || ['orders', 'billing'];
+  const storage = params.storageClient || supabaseAdmin?.storage || supabase.storage;
+
+  if (!rawSlip) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: PAYMENT_SLIPS_BUCKET,
+      objectPath: '',
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: 'Payment slip receipt is required.',
+      code: 'INVALID_SLIP',
+    };
+  }
+
+  const parsed = parsePaymentSlipReference(rawSlip);
+
+  if (parsed.kind === 'empty' || parsed.kind === 'external') {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: 'Unauthorized payment slip storage location. Receipts must be uploaded through FIREVPNs.',
+      code: 'UNAUTHORIZED_LOCATION',
+    };
+  }
+
+  if (parsed.kind === 'data') {
+    const dataHeaderMatch = rawSlip.match(
+      /^data:(image\/(?:jpeg|jpg|png|webp)|application\/pdf);base64,([A-Za-z0-9+/=\s]+)$/i
+    );
+    if (!dataHeaderMatch) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: PAYMENT_SLIPS_BUCKET,
+        objectPath: '',
+        sha256: '',
+        byteSize: 0,
+        contentType: '',
+        error: 'Invalid inline payment slip format. Only JPG, PNG, WEBP, and PDF receipts are accepted.',
+        code: 'INVALID_SLIP',
+      };
+    }
+
+    const contentType = dataHeaderMatch[1].toLowerCase();
+    const buf = Buffer.from(dataHeaderMatch[2].replace(/\s+/g, ''), 'base64');
+    if (buf.byteLength < 32 || buf.byteLength > MAX_FILE_SIZE_BYTES) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: PAYMENT_SLIPS_BUCKET,
+        objectPath: '',
+        sha256: '',
+        byteSize: buf.byteLength,
+        contentType,
+        error: 'Payment slip file size is invalid.',
+        code: 'INVALID_SLIP',
+      };
+    }
+
+    const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+    return {
+      valid: true,
+      canonicalSlipUrl: `inline-sha256:${sha256}`,
+      bucket: PAYMENT_SLIPS_BUCKET,
+      objectPath: '',
+      sha256,
+      byteSize: buf.byteLength,
+      contentType,
+    };
+  }
+
+  // parsed.kind === 'storage'
+  if (!FALLBACK_BUCKETS.includes(parsed.bucket)) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: `Unauthorized storage bucket '${parsed.bucket}'.`,
+      code: 'UNAUTHORIZED_LOCATION',
+    };
+  }
+
+  const segments = parsed.objectPath.split('/').filter(Boolean);
+  if (segments.length < 3) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: 'Invalid payment slip storage path structure.',
+      code: 'UNAUTHORIZED_LOCATION',
+    };
+  }
+
+  const folderSegment = segments[0].toLowerCase() as 'orders' | 'renewals' | 'billing';
+  if (!allowedFolders.includes(folderSegment)) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: `Invalid payment slip folder '${segments[0]}'.`,
+      code: 'UNAUTHORIZED_LOCATION',
+    };
+  }
+
+  const ownerSegment = segments[1].toLowerCase();
+  const safeEmailSeg = cleanEmail.replace(/[^a-zA-Z0-9@._-]/g, '_').toLowerCase();
+  const safeUidSeg = cleanUid.replace(/[^a-zA-Z0-9@._-]/g, '_').toLowerCase();
+  const matchesOwner =
+    (cleanEmail && (ownerSegment === cleanEmail || ownerSegment === safeEmailSeg)) ||
+    (cleanUid && (ownerSegment === cleanUid.toLowerCase() || ownerSegment === safeUidSeg));
+
+  if (!matchesOwner) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: 'Forbidden: Payment slip ownership does not match the authenticated account.',
+      code: 'OWNERSHIP_MISMATCH',
+    };
+  }
+
+  // Download actual object bytes from private storage to confirm existence and compute SHA-256
+  try {
+    const { data: blobOrBuf, error: downloadErr } = await storage
+      .from(parsed.bucket)
+      .download(parsed.objectPath);
+
+    if (downloadErr || !blobOrBuf) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        sha256: '',
+        byteSize: 0,
+        contentType: '',
+        error: `Uploaded payment slip could not be verified in storage (${downloadErr?.message || 'Object not found'}).`,
+        code: 'STORAGE_NOT_FOUND',
+      };
+    }
+
+    let fileBuffer: Buffer;
+    let detectedType = parsed.isPdf ? 'application/pdf' : 'image/jpeg';
+
+    if (Buffer.isBuffer(blobOrBuf)) {
+      fileBuffer = blobOrBuf;
+    } else if (blobOrBuf instanceof Uint8Array) {
+      fileBuffer = Buffer.from(blobOrBuf);
+    } else if (typeof blobOrBuf.arrayBuffer === 'function') {
+      const ab = await blobOrBuf.arrayBuffer();
+      fileBuffer = Buffer.from(ab);
+      if (typeof blobOrBuf.type === 'string' && blobOrBuf.type) {
+        detectedType = blobOrBuf.type;
+      }
+    } else {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        sha256: '',
+        byteSize: 0,
+        contentType: '',
+        error: 'Unable to read payment slip bytes from storage.',
+        code: 'STORAGE_READ_FAILED',
+      };
+    }
+
+    if (fileBuffer.byteLength < 32 || fileBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
+      return {
+        valid: false,
+        canonicalSlipUrl: '',
+        bucket: parsed.bucket,
+        objectPath: parsed.objectPath,
+        sha256: '',
+        byteSize: fileBuffer.byteLength,
+        contentType: detectedType,
+        error: 'Payment slip file size is invalid.',
+        code: 'INVALID_SLIP',
+      };
+    }
+
+    const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    return {
+      valid: true,
+      canonicalSlipUrl: `${parsed.bucket}/${parsed.objectPath}`,
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256,
+      byteSize: fileBuffer.byteLength,
+      contentType: detectedType,
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      canonicalSlipUrl: '',
+      bucket: parsed.bucket,
+      objectPath: parsed.objectPath,
+      sha256: '',
+      byteSize: 0,
+      contentType: '',
+      error: `Storage verification failed: ${err?.message || String(err)}`,
+      code: 'STORAGE_READ_FAILED',
+    };
+  }
+}
+
+export interface PaymentReceiptClaimResult {
+  claimed: boolean;
+  existingOrderId?: string | null;
+  existingUserId?: string | null;
+  conflictReason?: string | null;
+  code?: 'CLAIMED' | 'DUPLICATE_SLIP' | 'CLAIM_UNAVAILABLE';
+  error?: string;
+}
+
+/**
+ * Atomically claims a payment receipt SHA-256 and canonical path in PostgreSQL
+ * via public.claim_payment_receipt(). Fails CLOSED if the atomic claim RPC is
+ * unavailable or errors, so duplicate receipts cannot trigger multiple auto-activations.
+ */
+export async function claimPaymentReceiptForAutoActivation(params: {
+  sha256: string;
+  canonicalSlipUrl: string;
+  orderId: string;
+  userId: string;
+  userEmail: string;
+  byteSize: number;
+  contentType?: string;
+  dbClient?: any;
+}): Promise<PaymentReceiptClaimResult> {
+  const db = params.dbClient || supabaseAdmin;
+  if (!db || typeof db.rpc !== 'function') {
+    return {
+      claimed: false,
+      code: 'CLAIM_UNAVAILABLE',
+      error: 'Database RPC client unavailable for atomic payment receipt claiming.',
+    };
+  }
+
+  try {
+    const { data, error } = await db.rpc('claim_payment_receipt', {
+      p_receipt_sha256: params.sha256,
+      p_canonical_slip_url: params.canonicalSlipUrl || null,
+      p_order_id: params.orderId,
+      p_user_id: params.userId,
+      p_user_email: params.userEmail || '',
+      p_byte_size: params.byteSize || 0,
+      p_content_type: params.contentType || null,
+    });
+
+    if (error) {
+      return {
+        claimed: false,
+        code: 'CLAIM_UNAVAILABLE',
+        error: error.message || 'Atomic payment receipt claim RPC failed.',
+      };
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row.claimed !== 'boolean') {
+      return {
+        claimed: false,
+        code: 'CLAIM_UNAVAILABLE',
+        error: 'Unexpected response from claim_payment_receipt RPC.',
+      };
+    }
+
+    if (!row.claimed) {
+      return {
+        claimed: false,
+        code: 'DUPLICATE_SLIP',
+        existingOrderId: row.existing_order_id || null,
+        existingUserId: row.existing_user_id || null,
+        conflictReason: row.conflict_reason || 'duplicate_receipt_sha256',
+        error: 'Duplicate payment receipt detected; automatic activation blocked pending manual admin verification.',
+      };
+    }
+
+    return {
+      claimed: true,
+      code: 'CLAIMED',
+      existingOrderId: row.existing_order_id || params.orderId,
+      existingUserId: row.existing_user_id || params.userId,
+    };
+  } catch (err: any) {
+    return {
+      claimed: false,
+      code: 'CLAIM_UNAVAILABLE',
+      error: err?.message || 'Atomic payment receipt claim failed.',
+    };
+  }
+}
+
+
