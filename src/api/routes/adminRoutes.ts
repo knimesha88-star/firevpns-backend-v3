@@ -81,6 +81,14 @@ router.delete('/special-offers/:id', deleteAdminSpecialOfferHandler);
 router.get('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
 router.post('/payment-slips/signed-url', getPaymentSlipSignedUrlHandler);
 
+// Admin AI Assistant Settings routes
+import {
+  getAdminAiSettingsHandler,
+  saveAdminAiSettingsHandler,
+} from '../controllers/aiController.js';
+router.get('/ai-settings', getAdminAiSettingsHandler);
+router.post('/ai-settings', saveAdminAiSettingsHandler);
+
 export default router;
 
 

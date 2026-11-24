@@ -78,39 +78,124 @@ const XUI_CONFIG_TTL_MS = 60 * 1000;
 let cachedXuiAuth: { panelUrl: string; headers: Record<string, string>; expiresAt: number } | null = null;
 const XUI_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes (3X-UI session cookie lasts 6 hours)
 
-const getXuiConfig = async (forceRefresh = false): Promise<XuiConfig> => {
+export const invalidateXuiConfigCache = (): void => {
+  cachedXuiConfig = null;
+  cachedXuiAuth = null;
+};
+
+/**
+ * Validates that a 3X-UI panel URL uses http/https and does not target
+ * cloud metadata services or loopback interfaces (SSRF protection).
+ */
+export const validateXuiPanelUrl = (urlStr: string): string => {
+  const trimmed = String(urlStr || '').trim();
+  if (!trimmed) {
+    throw new Error('3X-UI Panel URL is required.');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Invalid 3X-UI Panel URL format.');
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('3X-UI Panel URL must use http:// or https://.');
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const isMetadataOrLoopback =
+    host === 'localhost' ||
+    host === '::1' ||
+    host === '[::1]' ||
+    host === '0.0.0.0' ||
+    host.startsWith('127.') ||
+    host.startsWith('169.254.') ||
+    host === 'metadata.google.internal' ||
+    host.endsWith('.internal');
+
+  if (isMetadataOrLoopback && process.env.XUI_ALLOW_PRIVATE_URLS !== 'true') {
+    throw new Error('3X-UI Panel URL cannot target localhost or cloud metadata addresses.');
+  }
+
+  return trimmed;
+};
+
+export const getXuiConfig = async (forceRefresh = false): Promise<XuiConfig> => {
   const now = Date.now();
   if (!forceRefresh && cachedXuiConfig && cachedXuiConfig.expiresAt > now) {
     return cachedXuiConfig.config;
   }
 
-  const { data: doc, error } = await supabase.from('settings').select('*').eq('id', 'xui').maybeSingle();
-  if (error || !doc) {
+  const db = supabaseAdmin || supabase;
+  const { data: doc } = await db.from('settings').select('*').eq('id', 'xui').maybeSingle();
+  const data = (doc && typeof doc.data === 'object' ? doc.data : {}) as Record<string, any>;
+
+  const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || '').trim();
+  const username = String(data.username || process.env.XUI_USERNAME || 'admin').trim();
+  const password = String(
+    data.password ||
+      data.apiToken ||
+      process.env.XUI_PASSWORD ||
+      process.env.XUI_API_TOKEN ||
+      ''
+  ).trim();
+  const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
+
+  if (!panelUrl) {
     throw new Error('3X-UI settings not configured');
   }
-  
-  const data = doc.data || {};
-  
+
   const config: XuiConfig = {
-    panelUrl: data.panelUrl || '',
-    username: data.username || 'admin',
-    password: data.password || data.apiToken || '',
-    apiToken: data.apiToken || '',
-    panelName: data.panelName || ''
+    panelUrl,
+    username,
+    password,
+    apiToken,
+    panelName: String(data.panelName || 'Primary Node'),
   };
 
   cachedXuiConfig = { config, expiresAt: now + XUI_CONFIG_TTL_MS };
   return config;
 };
 
+export const getMaskedXuiSettings = async (): Promise<{
+  panelUrl: string;
+  username: string;
+  panelName: string;
+  hasPassword: boolean;
+  status: 'connected' | 'disconnected';
+  lastSync: string | null;
+}> => {
+  const db = supabaseAdmin || supabase;
+  const { data: doc } = await db.from('settings').select('*').eq('id', 'xui').maybeSingle();
+  const data = (doc && typeof doc.data === 'object' ? doc.data : {}) as Record<string, any>;
+
+  const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || '').trim();
+  const username = String(data.username || process.env.XUI_USERNAME || '').trim();
+  const hasPassword = Boolean(
+    data.password || data.apiToken || process.env.XUI_PASSWORD || process.env.XUI_API_TOKEN
+  );
+
+  return {
+    panelUrl,
+    username,
+    panelName: String(data.panelName || 'Primary Node'),
+    hasPassword,
+    status: data.status === 'connected' ? 'connected' : 'disconnected',
+    lastSync: data.lastSync || null,
+  };
+};
+
 const parseUrl = (urlStr: string) => {
   try {
-    const parsed = new URL(urlStr);
+    const validated = validateXuiPanelUrl(urlStr);
+    const parsed = new URL(validated);
     const baseUrl = `${parsed.protocol}//${parsed.host}`;
     const basePath = parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
     return { baseUrl, basePath };
-  } catch (e) {
-    throw new Error(`Invalid Panel URL: ${urlStr}`);
+  } catch (e: any) {
+    throw new Error(e?.message || `Invalid Panel URL`);
   }
 };
 
@@ -151,7 +236,16 @@ const logAxiosError = (error: any) => {
   }
 };
 
-const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
+// Enforce TLS certificate verification by default.
+// Only allow self-signed certificates when explicitly opted in via XUI_ALLOW_INSECURE_TLS=true.
+const allowInsecureTls = process.env.XUI_ALLOW_INSECURE_TLS === 'true';
+if (allowInsecureTls) {
+  console.warn('[xuiService] WARNING: XUI_ALLOW_INSECURE_TLS=true is enabled. Use a valid TLS certificate in production.');
+}
+const sharedHttpsAgent = new https.Agent({
+  rejectUnauthorized: !allowInsecureTls,
+  keepAlive: true,
+});
 
 const createAxiosInstance = (baseUrl: string, timeoutMs: number = 10000) => {
   return axios.create({
@@ -536,179 +630,338 @@ export const addCalendarMonths = (baseTimeMs: number, durationMonths: number): n
   return result.getTime();
 };
 
+export interface UpdateClientExpiryDeps {
+  getInboundsFn?: (forceRefresh?: boolean) => Promise<XuiInbound[]>;
+  requestApiFn?: <T>(endpoint: string, method?: 'GET' | 'POST', data?: any) => Promise<T>;
+  nowMs?: number;
+}
+
 export const updateClientExpiry = async (
   uuid: string,
   durationMonths: number,
   planName?: string,
-  fallbackCurrentExpiryMs?: number | null
-): Promise<{ new_expiryMs: number; newTotalBytes: number }> => {
-  const inbounds = await getInbounds();
-  
+  fallbackCurrentExpiryMs?: number | null,
+  deps?: UpdateClientExpiryDeps
+): Promise<{ new_expiryMs: number; newTotalBytes: number; verifiedEnable: boolean; inboundId: number }> => {
+  const getInboundsFn = deps?.getInboundsFn || getInbounds;
+  const requestApiFn = deps?.requestApiFn || requestApi;
+
+  let inbounds = await getInboundsFn(true);
+  if (!inbounds || inbounds.length === 0) {
+    inbounds = await getInboundsFn(false);
+  }
+
+  const normalizedTargetUuid = String(uuid || '').trim().toLowerCase();
+
   for (const inbound of inbounds) {
-    let settingsObj: { clients?: XuiClient[] } = {};
+    let settingsObj: { clients?: XuiClient[]; [key: string]: any } = {};
     try {
-      if (inbound.settings) {
-        settingsObj = typeof inbound.settings === 'string' ? JSON.parse(inbound.settings) : inbound.settings;
+      const rawSettings: any = inbound.settings;
+      if (rawSettings) {
+        settingsObj = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : { ...rawSettings };
       }
     } catch (parseError) {
       continue;
     }
-    
-    const clients = settingsObj.clients || [];
-    for (const c of clients) {
-      if (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) {
-        const panelExpiry = Number(c.expiryTime || 0);
-        const dbExpiry = Number(fallbackCurrentExpiryMs || 0);
-        const currentExpiry = Math.max(
-          Number.isFinite(panelExpiry) ? panelExpiry : 0,
-          Number.isFinite(dbExpiry) ? dbExpiry : 0
-        );
-        
-        const now = Date.now();
-        const baseTime = currentExpiry > now ? currentExpiry : now;
-        const new_expiryTime = addCalendarMonths(baseTime, durationMonths);
-        
-        // Parse traffic / limit GB based on planName
-        let isLimitedPlan = false;
-        let packageDataLimitBytes = 0;
-        const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
 
-        if (planName) {
-          const lowerPlan = planName.toLowerCase();
-          if (lowerPlan.includes('unlimited') || lowerPlan.includes('unlimit')) {
-            isLimitedPlan = false;
-          } else if (lowerPlan.includes('100gb') || lowerPlan.includes('100 gb') || lowerPlan.includes('100')) {
+    const clients = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+    const clientIndex = clients.findIndex(
+      (c) => c.id && String(c.id).trim().toLowerCase() === normalizedTargetUuid
+    );
+
+    if (clientIndex >= 0) {
+      const c = clients[clientIndex];
+      const panelExpiry = Number(c.expiryTime || 0);
+      const dbExpiry = Number(fallbackCurrentExpiryMs || 0);
+      const currentExpiry = Math.max(
+        Number.isFinite(panelExpiry) ? panelExpiry : 0,
+        Number.isFinite(dbExpiry) ? dbExpiry : 0
+      );
+
+      const now = deps?.nowMs ?? Date.now();
+      const baseTime = currentExpiry > now ? currentExpiry : now;
+      const new_expiryTime = addCalendarMonths(baseTime, durationMonths);
+
+      // Parse traffic / limit GB based on planName
+      let isLimitedPlan = false;
+      let packageDataLimitBytes = 0;
+      const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
+
+      if (planName) {
+        const lowerPlan = planName.toLowerCase();
+        if (lowerPlan.includes('unlimited') || lowerPlan.includes('unlimit')) {
+          isLimitedPlan = false;
+        } else if (lowerPlan.includes('100gb') || lowerPlan.includes('100 gb') || lowerPlan.includes('100')) {
+          isLimitedPlan = true;
+          packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
+        } else {
+          const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
+          if (gbMatch) {
             isLimitedPlan = true;
-            packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
-          } else {
-            const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
-            if (gbMatch) {
-              isLimitedPlan = true;
-              packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024 * safeMonths;
-            }
+            packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024 * safeMonths;
           }
         }
-
-        const currentTotalBytes = Number(c.totalGB || 0);
-        let newTotalBytes = currentTotalBytes; // default fallback if no plan specified
-
-        if (planName) {
-          if (isLimitedPlan) {
-            newTotalBytes = currentTotalBytes + packageDataLimitBytes;
-          } else {
-            newTotalBytes = 0; // Unlimited
-          }
-        }
-
-        const updateEndpoints = [
-          `/panel/api/inbounds/updateClient/${c.id}`,
-          `/panel/api/inbounds/updateClient/${c.email}`,
-          `/panel/api/clients/update/${c.email}`
-        ];
-
-        let updated = false;
-        let lastErr: any = null;
-
-        const clientAny = c as any;
-
-        // Ensure all numeric fields match 3X-UI Go Client struct types (int64 / int):
-        let parsedTgId = 0;
-        if (clientAny.tgId !== undefined && clientAny.tgId !== null && clientAny.tgId !== '') {
-          const num = Number(clientAny.tgId);
-          if (!isNaN(num)) {
-            parsedTgId = Math.floor(num);
-          }
-        }
-
-        let parsedLimitIp = 0;
-        if (clientAny.limitIp !== undefined && clientAny.limitIp !== null && clientAny.limitIp !== '') {
-          const num = Number(clientAny.limitIp);
-          if (!isNaN(num)) {
-            parsedLimitIp = Math.floor(num);
-          }
-        }
-
-        let parsedTotalGB = 0;
-        if (newTotalBytes !== undefined && newTotalBytes !== null) {
-          parsedTotalGB = Math.floor(newTotalBytes);
-        } else if (clientAny.totalGB !== undefined && clientAny.totalGB !== null && clientAny.totalGB !== '') {
-          const num = Number(clientAny.totalGB);
-          if (!isNaN(num)) {
-            parsedTotalGB = Math.floor(num);
-          }
-        }
-
-        let parsedReset = 0;
-        if (clientAny.reset !== undefined && clientAny.reset !== null && clientAny.reset !== '') {
-          const num = Number(clientAny.reset);
-          if (!isNaN(num)) {
-            parsedReset = Math.floor(num);
-          }
-        }
-
-        const clientPayload = {
-          ...c,
-          id: String(c.id),
-          email: String(c.email || ''),
-          flow: String(clientAny.flow || ''),
-          subId: String(c.subId || ''),
-          limitIp: parsedLimitIp,
-          totalGB: parsedTotalGB,
-          expiryTime: Math.floor(new_expiryTime),
-          enable: c.enable !== undefined ? Boolean(c.enable) : true,
-          tgId: parsedTgId,
-          reset: parsedReset
-        };
-
-        // Remove subId to prevent duplicate subId errors on 3X-UI panel during update
-        const { subId, ...finalPayload } = clientPayload;
-
-        const maskedPayload = {
-          ...finalPayload,
-          id: finalPayload.id ? `${finalPayload.id.substring(0, 8)}...` : undefined,
-          email: finalPayload.email ? `${finalPayload.email.substring(0, 4)}...` : undefined
-        };
-
-        console.log('[updateClientExpiry] Final JSON payload immediately before 3X-UI API request (sensitive data masked):');
-        console.log(JSON.stringify(maskedPayload, null, 2));
-
-        for (const ep of updateEndpoints) {
-          try {
-            await requestApi<any>(ep, 'POST', finalPayload);
-            updated = true;
-            break;
-          } catch (e: any) {
-            console.warn(`[updateClientExpiry] Update endpoint ${ep} failed:`, e?.message || e);
-            lastErr = e;
-          }
-        }
-
-        if (!updated && lastErr) {
-          throw lastErr;
-        }
-        
-        return { new_expiryMs: new_expiryTime, newTotalBytes };
       }
+
+      const currentTotalBytes = Number(c.totalGB || 0);
+      let newTotalBytes = currentTotalBytes; // default fallback if no plan specified
+
+      if (planName) {
+        if (isLimitedPlan) {
+          newTotalBytes = currentTotalBytes + packageDataLimitBytes;
+        } else {
+          newTotalBytes = 0; // Unlimited
+        }
+      }
+
+      const clientAny = c as any;
+
+      // Ensure all numeric fields match 3X-UI Go Client struct types (int64 / int):
+      let parsedTgId = 0;
+      if (clientAny.tgId !== undefined && clientAny.tgId !== null && clientAny.tgId !== '') {
+        const num = Number(clientAny.tgId);
+        if (!isNaN(num)) {
+          parsedTgId = Math.floor(num);
+        }
+      }
+
+      let parsedLimitIp = 0;
+      if (clientAny.limitIp !== undefined && clientAny.limitIp !== null && clientAny.limitIp !== '') {
+        const num = Number(clientAny.limitIp);
+        if (!isNaN(num)) {
+          parsedLimitIp = Math.floor(num);
+        }
+      }
+
+      let parsedTotalGB = 0;
+      if (newTotalBytes !== undefined && newTotalBytes !== null) {
+        parsedTotalGB = Math.floor(newTotalBytes);
+      } else if (clientAny.totalGB !== undefined && clientAny.totalGB !== null && clientAny.totalGB !== '') {
+        const num = Number(clientAny.totalGB);
+        if (!isNaN(num)) {
+          parsedTotalGB = Math.floor(num);
+        }
+      }
+
+      let parsedReset = 0;
+      if (clientAny.reset !== undefined && clientAny.reset !== null && clientAny.reset !== '') {
+        const num = Number(clientAny.reset);
+        if (!isNaN(num)) {
+          parsedReset = Math.floor(num);
+        }
+      }
+
+      const expectedExpiryTime = Math.floor(new_expiryTime);
+
+      // IMPORTANT: Always set enable: true on renewal approval so expired/disabled 3X-UI clients are reactivated,
+      // while preserving all other existing client properties (UUID, email, password, flow, security, subId, etc.).
+      const clientPayload = {
+        ...c,
+        id: String(c.id),
+        email: String(c.email || ''),
+        flow: String(clientAny.flow || ''),
+        subId: String(c.subId || ''),
+        limitIp: parsedLimitIp,
+        totalGB: parsedTotalGB,
+        expiryTime: expectedExpiryTime,
+        enable: true,
+        tgId: parsedTgId,
+        reset: parsedReset
+      };
+
+      // Remove subId only for direct client struct endpoints to avoid duplicate subId errors on 3X-UI panel
+      const { subId, ...finalPayload } = clientPayload;
+
+      const rawFinal = finalPayload as Record<string, any>;
+      const maskedPayload = {
+        ...finalPayload,
+        id: finalPayload.id ? `${finalPayload.id.substring(0, 8)}...` : undefined,
+        email: finalPayload.email ? `${finalPayload.email.substring(0, 4)}...` : undefined,
+        ...(rawFinal.password !== undefined ? { password: '[REDACTED]' } : {}),
+        ...(rawFinal.privateKey !== undefined ? { privateKey: '[REDACTED]' } : {}),
+        ...(rawFinal.secret !== undefined ? { secret: '[REDACTED]' } : {}),
+      };
+
+      console.log(
+        `[updateClientExpiry] Updating client on inbound ${inbound.id} (previous enable=${c.enable}, new enable=${finalPayload.enable}, new expiryTime=${expectedExpiryTime}):`
+      );
+      console.log(JSON.stringify(maskedPayload, null, 2));
+
+      const updateClientSettingsPayload = {
+        id: Number(inbound.id),
+        settings: JSON.stringify({
+          clients: [clientPayload]
+        })
+      };
+
+      const updateEndpoints: Array<{ ep: string; body: any }> = [
+        { ep: `/panel/api/inbounds/updateClient/${c.id}`, body: updateClientSettingsPayload },
+        { ep: `/panel/api/inbounds/updateClient/${c.id}`, body: finalPayload },
+        { ep: `/panel/api/inbounds/updateClient/${c.email}`, body: finalPayload },
+        { ep: `/panel/api/clients/update/${c.email}`, body: finalPayload }
+      ];
+
+      let updated = false;
+      let lastErr: any = null;
+
+      for (const { ep, body } of updateEndpoints) {
+        try {
+          await requestApiFn<any>(ep, 'POST', body);
+          updated = true;
+          break;
+        } catch (e: any) {
+          console.warn(`[updateClientExpiry] Update endpoint ${ep} failed:`, e?.message || e);
+          lastErr = e;
+        }
+      }
+
+      let usedInboundUpdateFallback = false;
+      const applyInboundUpdateFallback = async () => {
+        usedInboundUpdateFallback = true;
+        const updatedClients = [...clients];
+        updatedClients[clientIndex] = {
+          ...clients[clientIndex],
+          ...clientPayload,
+          enable: true,
+          expiryTime: expectedExpiryTime
+        };
+        const updatedSettingsObj = {
+          ...settingsObj,
+          clients: updatedClients
+        };
+        const updateInboundPayload: any = {
+          ...inbound,
+          id: Number(inbound.id),
+          settings: JSON.stringify(updatedSettingsObj)
+        };
+        delete updateInboundPayload.up;
+        delete updateInboundPayload.down;
+        delete updateInboundPayload.clientStats;
+        delete updateInboundPayload.trafficReset;
+        delete updateInboundPayload.lastTrafficResetTime;
+
+        await requestApiFn<any>(`/panel/api/inbounds/update/${inbound.id}`, 'POST', updateInboundPayload);
+      };
+
+      if (!updated) {
+        try {
+          await applyInboundUpdateFallback();
+          updated = true;
+        } catch (fallbackErr: any) {
+          console.error(`[updateClientExpiry] Inbound update fallback failed for inbound ${inbound.id}:`, fallbackErr?.message || fallbackErr);
+          throw lastErr || fallbackErr;
+        }
+      }
+
+      // Fetch the client again from 3X-UI and verify that enable === true and expiryTime is in the future
+      const verifyClientState = async (): Promise<{ verified: boolean; client: XuiClient | null }> => {
+        const freshInbounds = await getInboundsFn(true);
+        const targetInbound =
+          freshInbounds.find((ib) => Number(ib.id) === Number(inbound.id)) ||
+          freshInbounds.find((ib) => {
+            try {
+              const rawS: any = ib.settings;
+              const s = typeof rawS === 'string' ? JSON.parse(rawS) : rawS;
+              return (s?.clients || []).some(
+                (cl: any) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
+              );
+            } catch {
+              return false;
+            }
+          });
+
+        if (!targetInbound) {
+          return { verified: false, client: null };
+        }
+
+        let freshSettings: { clients?: XuiClient[] } = {};
+        try {
+          const rawFreshS: any = targetInbound.settings;
+          freshSettings =
+            typeof rawFreshS === 'string'
+              ? JSON.parse(rawFreshS)
+              : rawFreshS || {};
+        } catch {
+          return { verified: false, client: null };
+        }
+
+        const freshClient =
+          (freshSettings.clients || []).find(
+            (cl) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
+          ) || null;
+
+        if (!freshClient) {
+          return { verified: false, client: null };
+        }
+
+        const freshExpiry = Number(freshClient.expiryTime || 0);
+        const isEnabled = freshClient.enable === true;
+        const isFutureExpiry = freshExpiry > now && Math.abs(freshExpiry - expectedExpiryTime) <= 1000;
+
+        return {
+          verified: isEnabled && isFutureExpiry,
+          client: freshClient
+        };
+      };
+
+      let verification = await verifyClientState();
+
+      // If the initial endpoint returned 200 but did not persist enable: true or the new expiryTime,
+      // apply the full inbound update fallback and re-verify once.
+      if (!verification.verified && !usedInboundUpdateFallback) {
+        console.warn(
+          `[updateClientExpiry] Initial update did not confirm enable=true & expiryTime=${expectedExpiryTime} (got enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}). Applying inbound update fallback...`
+        );
+        await applyInboundUpdateFallback();
+        verification = await verifyClientState();
+      }
+
+      if (!verification.verified) {
+        const errMsg = `Failed to verify 3X-UI client reactivation for UUID ${uuid} on inbound ${inbound.id}: enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}, expectedExpiryTime=${expectedExpiryTime}`;
+        console.error(`[updateClientExpiry] ${errMsg}`);
+        throw new Error(errMsg);
+      }
+
+      console.log(
+        `[updateClientExpiry] Verified 3X-UI client ${uuid} on inbound ${inbound.id}: enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}`
+      );
+
+      return {
+        new_expiryMs: expectedExpiryTime,
+        newTotalBytes,
+        verifiedEnable: true,
+        inboundId: Number(inbound.id)
+      };
     }
   }
-  
+
   throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbounds`);
 };
 
 export const findProvisioningTemplate = async (
-  query: string | { templateId?: string; packageName?: string }
+  query: string | { templateId?: string; packageName?: string; server?: string }
 ): Promise<any | null> => {
   let templateId = '';
   let packageName = '';
+  let requestedServer = '';
 
   if (typeof query === 'string') {
     packageName = query;
   } else if (query && typeof query === 'object') {
     templateId = query.templateId || '';
     packageName = query.packageName || '';
+    requestedServer = query.server || '';
   }
 
-  console.log(`[Provisioning Template Lookup] Searching for template - ID: '${templateId}', Package Name: '${packageName}'`);
+  const normalizedServerNode = (() => {
+    const raw = String(requestedServer || '').trim().toLowerCase();
+    if (!raw || raw.includes('singapore') || raw === 'sg' || raw.includes('(sg)')) {
+      return 'singapore';
+    }
+    return raw;
+  })();
+
+  console.log(`[Provisioning Template Lookup] Searching for template - ID: '${templateId}', Package Name: '${packageName}', Server Node: '${normalizedServerNode}'`);
 
   try {
     const { data: snapshot, error: fetchErr } = await supabase.from('provision_templates').select('*');
@@ -722,6 +975,14 @@ export const findProvisioningTemplate = async (
         console.warn('[Provisioning Template Lookup] No enabled templates found in provision_templates.');
         return null;
       }
+
+      const matchesServerNode = (item: any) => {
+        const tplServer = String(item.server || 'Singapore').trim().toLowerCase();
+        if (normalizedServerNode === 'singapore') {
+          return !tplServer || tplServer.includes('singapore') || tplServer === 'sg';
+        }
+        return tplServer === normalizedServerNode;
+      };
 
       // 1. Exact match by template ID
       if (templateId) {
@@ -737,8 +998,12 @@ export const findProvisioningTemplate = async (
         const targetLower = targetStr.toLowerCase();
         const targetNormalized = targetLower.replace(/[^a-z0-9]/g, '');
 
-        // 2. Exact match on package_name or name or id
-        const exact = enabledTemplates.find(item => {
+        // 2. Exact match on package_name or name (preferring matching server node)
+        const exactWithServer = enabledTemplates.find(item => {
+          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+          return (docName === targetLower || docName.replace(/_/g, ' ') === targetLower.replace(/_/g, ' ')) && matchesServerNode(item);
+        });
+        const exact = exactWithServer || enabledTemplates.find(item => {
           const docName = String(item.package_name || item.name || '').trim().toLowerCase();
           return docName === targetLower || docName.replace(/_/g, ' ') === targetLower.replace(/_/g, ' ');
         });
@@ -748,25 +1013,39 @@ export const findProvisioningTemplate = async (
         }
 
         // 3. Normalized match (handles typos or formatting differences)
-        const alphaMatch = enabledTemplates.find(item => {
-          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
-          const docNormalized = docName.replace(/[^a-z0-9]/g, '');
-          if (docNormalized === targetNormalized) return true;
-          if (docNormalized.length > 5 && targetNormalized.length > 5) {
-            return docNormalized.includes(targetNormalized) || targetNormalized.includes(docNormalized);
-          }
-          return false;
-        });
+        const alphaMatch =
+          enabledTemplates.find(item => {
+            const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+            const docNormalized = docName.replace(/[^a-z0-9]/g, '');
+            const isNameMatch =
+              docNormalized === targetNormalized ||
+              (docNormalized.length > 5 && targetNormalized.length > 5 && (docNormalized.includes(targetNormalized) || targetNormalized.includes(docNormalized)));
+            return isNameMatch && matchesServerNode(item);
+          }) ||
+          enabledTemplates.find(item => {
+            const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+            const docNormalized = docName.replace(/[^a-z0-9]/g, '');
+            if (docNormalized === targetNormalized) return true;
+            if (docNormalized.length > 5 && targetNormalized.length > 5) {
+              return docNormalized.includes(targetNormalized) || targetNormalized.includes(docNormalized);
+            }
+            return false;
+          });
         if (alphaMatch) {
           console.log(`[Provisioning Template Lookup] Found normalized/fuzzy match for '${packageName}': '${alphaMatch.package_name || alphaMatch.name}' (ID: ${alphaMatch.id})`);
           return { id: alphaMatch.id, ...alphaMatch };
         }
 
         // 4. Substring / Partial match
-        const partial = enabledTemplates.find(item => {
-          const docName = String(item.package_name || item.name || '').trim().toLowerCase();
-          return targetLower.includes(docName) || docName.includes(targetLower);
-        });
+        const partial =
+          enabledTemplates.find(item => {
+            const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+            return (targetLower.includes(docName) || docName.includes(targetLower)) && matchesServerNode(item);
+          }) ||
+          enabledTemplates.find(item => {
+            const docName = String(item.package_name || item.name || '').trim().toLowerCase();
+            return targetLower.includes(docName) || docName.includes(targetLower);
+          });
         if (partial) {
           console.log(`[Provisioning Template Lookup] Found substring match for '${packageName}': '${partial.package_name || partial.name}' (ID: ${partial.id})`);
           return { id: partial.id, ...partial };
@@ -976,6 +1255,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     };
   }
   activeProvisionings.add(orderId);
+  let canonicalOrderLockKey = '';
 
   try {
     const dbClient = supabaseAdmin;
@@ -991,9 +1271,21 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     order = queryOrder;
   }
 
+  // Acquire canonical lock on order.id to prevent concurrent approval via order_id vs UUID
+  if (order.id && String(order.id) !== String(orderId)) {
+    canonicalOrderLockKey = String(order.id);
+    if (activeProvisionings.has(canonicalOrderLockKey)) {
+      console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] Canonical order ${canonicalOrderLockKey} is already provisioning.`);
+      return {
+        success: true,
+        message: 'Provisioning is already in progress for this order. Skipping duplicate assignment.'
+      };
+    }
+    activeProvisionings.add(canonicalOrderLockKey);
+  }
 
   // Idempotency Check: If order is already completed/active with existing VPN link, return existing details
-  const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active') && order.vless_url;
+  const isAlreadyCompleted = (order.status === 'completed' || order.status === 'active' || order.status === 'approved') && order.vless_url;
   if (isAlreadyCompleted) {
     const { data: existingVpnAcc } = await dbClient.from('vpn_accounts').select('*').eq('order_id', order.id).maybeSingle();
     return {
@@ -1035,7 +1327,8 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('[Purchase Flow] Backend received template ID:', templateId || '(none provided)', '| Package Name:', packageName);
 
   // Step 1: Find the provisioning template (returns null if not found; NO fallback to template[0])
-  const template = await findProvisioningTemplate({ templateId, packageName });
+  const selectedServerNode = extra.server_node || extra.server || order.server || 'Singapore';
+  const template = await findProvisioningTemplate({ templateId, packageName, server: selectedServerNode });
   if (!template) {
     console.error(`[Purchase Flow] Error: Provisioning template not found for package '${packageName}' (Template ID: '${templateId}').`);
     throw new Error(`Provisioning template not found for package '${packageName || templateId}'.`);
@@ -1300,7 +1593,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log(`- Email: ${remark}`);
   console.log(`- Inbound ID: ${inboundId}`);
   console.log(`- Template ID: ${template.id}`);
-  console.log(`- Existing client lookup result: ${existingClient ? JSON.stringify(existingClient) : 'None'}`);
+  console.log(`- Existing client lookup result: ${existingClient ? 'Found' : 'None'}`);
   console.log(`- Existing inbound assignment lookup result: ${alreadyAssignedToTarget ? 'Already assigned' : 'Not assigned'}`);
   console.log('================================================');
 
@@ -1366,6 +1659,37 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   const existingClients: any[] = settingsObj.clients;
   const clientCountBefore = existingClients.length;
 
+  // Check whether the UUID already exists on this inbound (or by email for trial orders)
+  const existingIndex = existingClients.findIndex((c: any) =>
+    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+    (isTrialOrder && c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+  );
+
+  const matchedExistingClient = existingIndex >= 0 ? existingClients[existingIndex] : existingClient;
+  const isExistingClientRecord = existingIndex >= 0 || Boolean(existingClient);
+
+  const generateRandom16CharCredential = (): string => {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let out = '';
+    for (let i = 0; i < 16; i++) {
+      out += alphabet[crypto.randomInt(0, alphabet.length)];
+    }
+    return out;
+  };
+
+  const clientCredentialFields: Record<string, string> = {};
+  if (isExistingClientRecord) {
+    if (matchedExistingClient?.password !== undefined) {
+      clientCredentialFields.password = String(matchedExistingClient.password);
+    }
+    if (matchedExistingClient?.auth !== undefined) {
+      clientCredentialFields.auth = String(matchedExistingClient.auth);
+    }
+  } else {
+    clientCredentialFields.password = generateRandom16CharCredential();
+    clientCredentialFields.auth = generateRandom16CharCredential();
+  }
+
   const newClientRecord: any = {
     id: uuid,
     email: remark,
@@ -1378,7 +1702,8 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     subId: subId,
     reset: 0,
     comment: '',
-    group: ''
+    group: '',
+    ...clientCredentialFields
   };
 
   // Add protocol-specific fields if defined on target inbound (e.g., security, password, auth for VLESS/Reality)
@@ -1387,6 +1712,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
       newClientRecord.security = security;
     }
   }
+
+  const redactClientSecrets = (record: any) => ({
+    ...record,
+    ...(record?.password ? { password: '[REDACTED]' } : {}),
+    ...(record?.auth ? { auth: '[REDACTED]' } : {}),
+  });
 
   // Direct addClient payload format for 3X-UI /panel/api/inbounds/addClient
   const addClientDirectPayload = {
@@ -1399,22 +1730,21 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   console.log('=== [3X-UI ADD CLIENT REQUEST BODY LOGGING] ===');
   console.log('Target Inbound ID:', inboundId);
   console.log('Client Record (Matches Manual Client Structure):');
-  console.log(JSON.stringify(newClientRecord, null, 2));
+  console.log(JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
   console.log('Direct addClient Payload:');
-  console.log(JSON.stringify(addClientDirectPayload, null, 2));
+  console.log(JSON.stringify({
+    id: Number(inboundId),
+    settings: JSON.stringify({
+      clients: [redactClientSecrets(newClientRecord)]
+    })
+  }, null, 2));
   console.log('==============================================');
 
   console.log('=== [DIAGNOSTIC] 1. Before update ===');
   console.log(`Target inbound ID: ${inboundId}`);
   console.log(`settingsObj.clients.length: ${settingsObj.clients.length}`);
   console.log(`New UUID already exists in settingsObj.clients: ${settingsObj.clients.some((c: any) => c.id === uuid)}`);
-  console.log('New client object being appended/updated:', JSON.stringify(newClientRecord, null, 2));
-
-  // Check whether the UUID already exists on this inbound (or by email for trial orders)
-  const existingIndex = existingClients.findIndex((c: any) =>
-    (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
-    (isTrialOrder && c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
-  );
+  console.log('New client object being appended/updated:', JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
 
   if (existingIndex >= 0) {
     skipMsg = 'Client already exists on this inbound. Updated existing client settings.';
@@ -1446,11 +1776,6 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   delete updateInboundPayload.trafficReset;
   delete updateInboundPayload.lastTrafficResetTime;
 
-  console.log(`[3X-UI Provisioning] Clean update payload for POST /panel/api/inbounds/update/${inboundId}:`, JSON.stringify(updateInboundPayload, null, 2));
-
-  console.log('=== [DIAGNOSTIC] 2. Immediately before requestApi ===');
-  console.log('settingsObj.clients payload:', JSON.stringify(settingsObj.clients, null, 2));
-
   console.log(`[3X-UI Provisioning] Sending POST /panel/api/inbounds/update/${inboundId}`);
   console.log(`[3X-UI Provisioning] Detailed Logs:`);
   console.log(`  - Client count before update: ${clientCountBefore}`);
@@ -1460,9 +1785,12 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   const updateRes = await requestApi<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
 
-  console.log(`[3X-UI Provisioning] Inbound update HTTP response:`, JSON.stringify(updateRes, null, 2));
+  if (updateRes && updateRes.success === false) {
+    const panelMsg = updateRes.msg || updateRes.message || '3X-UI panel rejected inbound update';
+    console.error(`[3X-UI Provisioning] Inbound update failed on panel: ${panelMsg}`);
+    throw new Error(`3X-UI provisioning failed: ${panelMsg}`);
+  }
 
-  console.log('=== [DIAGNOSTIC] 3. Post-update verification ===');
   let afterInboundObj: any = null;
   try {
     const getRes = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
@@ -1481,7 +1809,7 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
     if (typeof afterInboundObj.settings === 'string') {
       try {
         afterSettingsObj = JSON.parse(afterInboundObj.settings);
-      } catch (e) {
+      } catch (_e) {
         afterSettingsObj = { clients: [] };
       }
     } else if (afterInboundObj.settings && typeof afterInboundObj.settings === 'object') {
@@ -1491,32 +1819,19 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
 
   const afterClients: any[] = Array.isArray(afterSettingsObj.clients) ? afterSettingsObj.clients : [];
 
-  console.log('=== [DIAGNOSTIC] 4. Length comparison ===');
-  console.log(`BEFORE update settings.clients.length: ${clientCountBefore}`);
-  console.log(`AFTER update settings.clients.length: ${afterClients.length}`);
-
-  console.log('=== [DIAGNOSTIC] 5, 6, 7. UUID Search ===');
   const foundClient = afterClients.find((c: any) =>
     (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
     (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
   );
 
-  if (foundClient) {
-    console.log('UUID Search Result: FOUND');
-    console.log('Complete returned client object:', JSON.stringify(foundClient, null, 2));
-  } else {
-    console.log('UUID Search Result: NOT FOUND');
-    const firstFive = afterClients.slice(0, 5).map((c: any) => c.id || c.email);
-    console.log('First 5 client IDs/emails currently present in inbound:', JSON.stringify(firstFive, null, 2));
-  }
-
-  // Immediately read back the created client from 3X-UI to get the exact UUID returned
+  // Immediately read back the created client from 3X-UI to verify persistence and exact UUID
   const readBackClient = await getClientByEmail(remark);
   if (readBackClient && readBackClient.uuid) {
     uuid = readBackClient.uuid;
     if (readBackClient.subId) subId = readBackClient.subId;
-  } else {
-    console.warn(`[3X-UI Provisioning] Read back client returned null for remark '${remark}', using UUID: ${uuid}`);
+  } else if (!foundClient) {
+    console.error(`[3X-UI Provisioning] Verification failed: client '${remark}' (UUID: ${uuid}) was not persisted in inbound ${inboundId}. Aborting order completion.`);
+    throw new Error(`3X-UI panel update did not persist client configuration on inbound ${inboundId}. Order was not marked completed.`);
   }
 
   // Step 3: Generate the VLESS URL and subscription URL
@@ -1771,6 +2086,9 @@ export const provisionOrderClient = async (orderId: string, token?: string): Pro
   };
   } finally {
     activeProvisionings.delete(orderId);
+    if (canonicalOrderLockKey) {
+      activeProvisionings.delete(canonicalOrderLockKey);
+    }
   }
 };
 

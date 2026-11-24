@@ -43,7 +43,9 @@ export const getPublicActiveDiscountsHandler = async (_req: Request, res: Respon
     });
   } catch (error: any) {
     console.error('[DiscountController] Error fetching active discounts:', error?.message || error);
-    res.status(500).json({ error: error?.message || 'Failed to fetch active discounts' });
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch active discounts' : (error?.message || 'Failed to fetch active discounts')
+    });
   }
 };
 
@@ -151,7 +153,9 @@ export const validateOrderPriceHandler = async (req: Request, res: Response): Pr
     res.status(isClientErr ? 400 : 500).json({
       valid: false,
       priceChanged: false,
-      error: error?.message || 'Failed to validate order price',
+      error: isClientErr
+        ? (error?.message || 'Invalid order pricing request')
+        : (process.env.NODE_ENV === 'production' ? 'Failed to validate order price' : (error?.message || 'Failed to validate order price')),
     });
   }
 };
@@ -183,7 +187,9 @@ export const getAdminDiscountsHandler = async (req: AuthRequest, res: Response):
     });
   } catch (error: any) {
     console.error('[DiscountController] Error fetching admin discounts:', error?.message || error);
-    res.status(500).json({ error: error?.message || 'Failed to fetch discounts' });
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch discounts' : (error?.message || 'Failed to fetch discounts')
+    });
   }
 };
 
@@ -237,7 +243,10 @@ export const invalidateAdminPricingHandler = async (req: AuthRequest, res: Respo
       packages,
     });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to refresh pricing cache' });
+    console.error('[DiscountController] Error refreshing pricing cache:', error?.message || error);
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to refresh pricing cache' : (error?.message || 'Failed to refresh pricing cache')
+    });
   }
 };
 

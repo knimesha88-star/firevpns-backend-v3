@@ -9,6 +9,11 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
     const email = req.user?.email || '';
     const uid = req.user?.uid || '';
     const targetUuid = (req.query.uuid as string) || undefined;
+    const authHeader = req.headers.authorization || (req.headers as any)?.Authorization;
+    const token =
+      authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.split(' ')[1]
+        : undefined;
 
     if (!email && !uid) {
       const totalTime = Date.now() - reqStart;
@@ -18,7 +23,7 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
     }
 
     const dbStart = Date.now();
-    const client = await clientService.getClientStatus(email, targetUuid, uid);
+    const client = await clientService.getClientStatus(email, targetUuid, uid, token);
     const dbTime = Date.now() - dbStart;
 
     const totalTime = Date.now() - reqStart;
@@ -27,7 +32,9 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
   } catch (error: any) {
     const totalTime = Date.now() - reqStart;
     console.error(`[API Performance] [GET /api/client/status] Request failed after ${totalTime}ms:`, error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch client VPN status.' : (error?.message || 'Failed to fetch client VPN status.')
+    });
   }
 };
 
@@ -41,6 +48,9 @@ export const getSubscription = async (req: AuthRequest, res: Response): Promise<
     const uri = await clientService.getSubscriptionUri(email);
     res.json({ success: true, subscriptionUri: uri });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('[ClientController] getSubscription error:', error?.message || error);
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch subscription link.' : (error?.message || 'Failed to fetch subscription link.')
+    });
   }
 };

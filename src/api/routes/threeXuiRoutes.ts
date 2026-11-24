@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getServerStatus, testConnection, saveSettings, deleteSettings, syncClients } from '../controllers/xuiController.js';
+import { getSettings, getServerStatus, testConnection, saveSettings, deleteSettings, syncClients } from '../controllers/xuiController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { adminMiddleware } from '../middleware/adminMiddleware.js';
 
@@ -8,6 +8,7 @@ const router = Router();
 router.use(authMiddleware);
 router.use(adminMiddleware);
 
+router.get('/settings', getSettings);
 router.get('/status', getServerStatus);
 router.post('/test', testConnection);
 router.post('/settings', saveSettings);
@@ -15,3 +16,4 @@ router.delete('/settings', deleteSettings);
 router.post('/sync', syncClients);
 
 export default router;
+

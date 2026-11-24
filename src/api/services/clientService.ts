@@ -1,16 +1,17 @@
 import { getClientByEmail } from './xuiService.js';
 import * as vpnService from './vpnService.js';
-import { supabase } from '../../lib/supabase.js';
+import { getSupabaseClient } from '../../lib/supabase.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-export const getClientStatus = async (email: string, targetUuid?: string, uid?: string): Promise<any | null> => {
+export const getClientStatus = async (email: string, targetUuid?: string, uid?: string, token?: string): Promise<any | null> => {
   let activeUuid = targetUuid;
+  const db = getSupabaseClient(token);
 
   if (!activeUuid && uid) {
     try {
-      const { data: profile } = await supabase.from('profiles').select('active_vpn_uuid, uuid').eq('id', uid).maybeSingle();
+      const { data: profile } = await db.from('profiles').select('active_vpn_uuid, uuid').eq('id', uid).maybeSingle();
       if (profile?.active_vpn_uuid) {
         activeUuid = profile.active_vpn_uuid;
       } else if (profile?.uuid) {
@@ -21,19 +22,40 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
     }
   }
 
-  // Fetch all user configs
-  const myConfigsRes = await vpnService.getMyConfigs(uid || '', email);
-  const myConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
+  // Fetch all real user configs from Supabase
+  const myConfigsRes = await vpnService.getMyConfigs(uid || '', email, token);
+  const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
 
-  if (myConfigs && myConfigs.length > 0) {
+  // Only include configurations that have a real UUID, configUrl, and are not pending/rejected/deleted
+  const myConfigs = rawConfigs.filter((c: any) => {
+    if (!c || !c.uuid || !c.configUrl) return false;
+    const st = String(c.status || '').toLowerCase();
+    if (st === 'pending' || st === 'rejected' || st === 'deleted' || st === 'cancelled') return false;
+    return true;
+  });
+
+  if (myConfigs.length > 0) {
+    // Prefer active (non-expired) configs when selecting a default
+    const now = Date.now();
+    const activeOnly = myConfigs.filter((c: any) => {
+      const st = String(c.status || '').toLowerCase();
+      if (st === 'expired' || st === 'disabled' || c.enableStatus === false) return false;
+      if (c.expiryDate) {
+        const expMs = new Date(c.expiryDate).getTime();
+        if (!isNaN(expMs) && expMs > 0 && expMs <= now) return false;
+      }
+      return true;
+    });
+
     let activeConfig = null;
 
     if (activeUuid) {
-      activeConfig = myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
+      activeConfig = activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase())
+        || myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
     }
 
     if (!activeConfig) {
-      activeConfig = myConfigs[0];
+      activeConfig = activeOnly[0] || null;
     }
 
     if (activeConfig) {
@@ -52,6 +74,7 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
         remainingGB: activeConfig.remainingGB,
         trafficLimit: activeConfig.trafficLimit,
         expiryTime: activeConfig.expiryDate || activeConfig.expiryTime || 0,
+        expiryDate: activeConfig.expiryDate || activeConfig.expiryTime || '',
         enableStatus: activeConfig.enableStatus,
         onlineStatus: activeConfig.onlineStatus,
         lastOnline: activeConfig.lastOnline || 0,
@@ -62,23 +85,19 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
         security: activeConfig.security || 'none',
         serverAddress: activeConfig.serverAddress || 'singapore.firevpn.com',
         serverName: activeConfig.serverNode || 'Singapore',
-        subscriptionName: activeConfig.packageName || 'Active Plan',
-        name: activeConfig.packageName || 'Active Plan',
+        subscriptionName: activeConfig.packageName || 'FIREVPN Package',
+        packageName: activeConfig.packageName || 'FIREVPN Package',
+        name: activeConfig.packageName || 'FIREVPN Package',
         connectionUri: activeConfig.configUrl,
+        configUrl: activeConfig.configUrl,
         uri: activeConfig.configUrl,
         status: activeConfig.status
       };
-    } else {
-      console.warn(`[clientService] Active config not found for email: ${email}, targetUuid: ${targetUuid}, uid: ${uid}`);
     }
   }
 
-  // Fallback to legacy lookup
-  const legacyClient = await getClientByEmail(email);
-  if (!legacyClient) {
-    throw new Error(`VPN client not found for user: ${email}`);
-  }
-  return legacyClient;
+  // Do not fall back to unlinked 3X-UI email lookup; return null when customer has no real active VPN configurations in Supabase
+  return null;
 };
 
 export const getSubscriptionUri = async (email: string): Promise<string | null> => {

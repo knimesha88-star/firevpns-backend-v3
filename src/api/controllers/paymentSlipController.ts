@@ -67,7 +67,10 @@ export const getPaymentSlipSignedUrlHandler = async (
     console.error('[PaymentSlipController] Signed URL error:', error?.message || error);
     res.status(500).json({
       success: false,
-      error: error?.message || 'Failed to generate signed URL for payment slip.',
+      error:
+        process.env.NODE_ENV === 'production'
+          ? 'Failed to generate signed URL for payment slip.'
+          : error?.message || 'Failed to generate signed URL for payment slip.',
     });
   }
 };
@@ -110,7 +113,10 @@ export const uploadPaymentSlipHandler = async (
     console.error('[PaymentSlipController] Upload error:', error?.message || error);
     res.status(500).json({
       success: false,
-      error: error?.message || 'Failed to upload payment slip.',
+      error:
+        process.env.NODE_ENV === 'production'
+          ? 'Failed to upload payment slip.'
+          : error?.message || 'Failed to upload payment slip.',
     });
   }
 };

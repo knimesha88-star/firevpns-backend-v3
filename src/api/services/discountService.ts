@@ -23,6 +23,20 @@ export interface DiscountRecord {
   updated_at: string;
 }
 
+export interface PackageVariantOption {
+  id: string;
+  label: string;
+  packageName: string;
+}
+
+export const DEFAULT_AIRTEL_VARIANTS: PackageVariantOption[] = [
+  { id: 'airtel_148', label: 'AIRTEL 148', packageName: 'AIRTEL 148' },
+  { id: 'airtel_498', label: 'AIRTEL 498', packageName: 'AIRTEL 498' },
+  { id: 'airtel_909', label: 'AIRTEL 909', packageName: 'AIRTEL 909' },
+];
+
+export const AIRTEL_VARIANT_SLUGS = new Set(['airtel_148', 'airtel_498', 'airtel_909']);
+
 export interface StorePackageDefinition {
   id: string;
   name: string;
@@ -33,6 +47,7 @@ export interface StorePackageDefinition {
   templateId?: string;
   aliases?: string[];
   enabled?: boolean;
+  variants?: PackageVariantOption[];
 }
 
 export interface PlanPricingConfig {
@@ -135,19 +150,56 @@ export const DEFAULT_STORE_PACKAGES: StorePackageDefinition[] = [
     ],
   },
   {
+    id: 'airtel_social',
+    name: 'AIRTEL SOCIAL 148/498/909',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 250,
+    templateId: 'fe0dc35d-d565-48a3-9b80-a51487e71602',
+    aliases: [
+      'airtel_social',
+      'airtel social 148/498/909',
+      'airtel_social_148/498/909',
+      'airtel_social_148_498_909',
+      'airtel social',
+      'airtel social package',
+      'airtel_social_package',
+      'airtel',
+      'airtel package',
+      'airtel_package',
+      'airtel_148',
+      'airtel 148',
+      'airtel 148 package',
+      'airtel_148_package',
+      'airtel_498',
+      'airtel 498',
+      'airtel 498 package',
+      'airtel_498_package',
+      'airtel_909',
+      'airtel 909',
+      'airtel 909 package',
+      'airtel_909_package',
+      'fe0dc35d-d565-48a3-9b80-a51487e71602',
+      'a1480000-d565-48a3-9b80-a51487e70148',
+      'a4980000-d565-48a3-9b80-a51487e70498',
+      'a9090000-d565-48a3-9b80-a51487e70909',
+    ],
+  },
+  {
     id: 'airtel_tiktok',
     name: 'AIRTEL TIKTOK',
     category: 'SIM',
     packageType: 'SIM Unlimited',
     tierKey: 'simUnlimited',
     basePrice: 400,
-    templateId: 'fe0dc35d-d565-48a3-9b80-a51487e71602',
+    templateId: 'a71ef0dc-35d0-48a3-9b80-a51487e71601',
     aliases: [
       'airtel_tiktok',
       'airtel tiktok',
       'airtel tiktok package',
       'airtel_tiktok_package',
-      'fe0dc35d-d565-48a3-9b80-a51487e71602',
+      'a71ef0dc-35d0-48a3-9b80-a51487e71601',
     ],
   },
   {
@@ -177,9 +229,8 @@ export const DEFAULT_STORE_PACKAGES: StorePackageDefinition[] = [
     aliases: [
       'airtel_zoom',
       'airtel zoom',
-      'airtel zoom 225',
-      'airtel_zoom_225',
       'airtel zoom package',
+      'airtel_zoom_package',
       'dc98d60e-6d25-452c-8115-611acd0621ce',
     ],
   },
@@ -203,12 +254,37 @@ export const DEFAULT_STORE_PACKAGES: StorePackageDefinition[] = [
   },
   {
     id: 'hutch_social',
-    name: 'HUTCH SOCIAL MEDIA',
+    name: 'HUTCH SOCIAL',
     category: 'SIM',
-    packageType: 'SIM Unlimited',
-    tierKey: 'simUnlimited',
-    basePrice: 400,
-    aliases: ['hutch_social', 'hutch social', 'hutch social media', 'hutch_social_media'],
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 250,
+    templateId: 'c481f92a-7b3d-4e91-8a62-9f40d1e2b315',
+    aliases: [
+      'hutch_social',
+      'hutch social',
+      'hutch social package',
+      'hutch_social_package',
+      'hutch social media',
+      'hutch_social_media',
+      'c481f92a-7b3d-4e91-8a62-9f40d1e2b315',
+    ],
+  },
+  {
+    id: 'dialog_youtube',
+    name: 'DIALOG YOUTUBE',
+    category: 'SIM',
+    packageType: 'SIM 100GB',
+    tierKey: 'sim100',
+    basePrice: 250,
+    templateId: 'd917e204-5c8b-4a36-9f12-7e30b8c4d921',
+    aliases: [
+      'dialog_youtube',
+      'dialog youtube',
+      'dialog youtube package',
+      'dialog_youtube_package',
+      'd917e204-5c8b-4a36-9f12-7e30b8c4d921',
+    ],
   },
   // Router Unlimited Packages
   {
@@ -458,10 +534,16 @@ export async function getLivePlanPricing(forceRefresh = false, authToken?: strin
           const num = Number(v);
           if (Number.isFinite(num) && num > 0) {
             const cleanKey = String(k).trim();
+            const slugKey = normalizePackageSlug(cleanKey);
             packagePrices[cleanKey] = Math.round(num);
-            const canonicalId = resolveCanonicalPackageId(cleanKey);
-            if (canonicalId && canonicalId !== '*') {
-              packagePrices[canonicalId] = Math.round(num);
+            if (slugKey) {
+              packagePrices[slugKey] = Math.round(num);
+            }
+            if (!AIRTEL_VARIANT_SLUGS.has(slugKey)) {
+              const canonicalId = resolveCanonicalPackageId(cleanKey);
+              if (canonicalId && canonicalId !== '*') {
+                packagePrices[canonicalId] = Math.round(num);
+              }
             }
           }
         }
@@ -524,14 +606,22 @@ export async function saveLivePlanPricing(
     for (const [k, v] of Object.entries(updates.packagePrices)) {
       const num = Number(v);
       const cleanKey = String(k).trim();
-      const canonicalId = resolveCanonicalPackageId(cleanKey);
+      const slugKey = normalizePackageSlug(cleanKey);
+      const isAirtelVariant = AIRTEL_VARIANT_SLUGS.has(slugKey);
+      const canonicalId = isAirtelVariant ? slugKey : resolveCanonicalPackageId(cleanKey);
       if (Number.isFinite(num) && num > 0) {
         mergedPackagePrices[cleanKey] = Math.round(num);
+        if (slugKey) {
+          mergedPackagePrices[slugKey] = Math.round(num);
+        }
         if (canonicalId && canonicalId !== '*') {
           mergedPackagePrices[canonicalId] = Math.round(num);
         }
       } else {
         delete mergedPackagePrices[cleanKey];
+        if (slugKey) {
+          delete mergedPackagePrices[slugKey];
+        }
         if (canonicalId && canonicalId !== '*') {
           delete mergedPackagePrices[canonicalId];
         }
@@ -1217,11 +1307,13 @@ export async function deleteDiscount(id: string, authToken?: string): Promise<vo
   await persistAllDiscounts(filtered, authToken);
 }
 
-function parseDurationMonths(duration?: string): number {
+export function parseDurationMonths(duration?: string): number {
   const norm = String(duration || '1 Month').trim();
   const durationMap: Record<string, number> = {
     '1 Month': 1,
+    '2 Months': 2,
     '3 Months': 3,
+    '4 Months': 4,
     '6 Months': 6,
     '12 Months': 12,
   };
@@ -1243,7 +1335,13 @@ export function getBaseOriginalPriceWithConfig(
     packageType?: string;
     duration?: string;
   }
-): { originalPrice: number; matchedPackage?: StorePackageDefinition; resolvedTier: 'sim100' | 'simUnlimited' | 'routerUnlimited' } {
+): {
+  originalPrice: number;
+  baseMonthly: number;
+  months: number;
+  matchedPackage?: StorePackageDefinition;
+  resolvedTier: 'sim100' | 'simUnlimited' | 'routerUnlimited';
+} {
   const normCategory = String(params.category || '').toUpperCase().trim();
   const normPkgType = String(params.packageType || '').toLowerCase().trim();
 
@@ -1252,7 +1350,6 @@ export function getBaseOriginalPriceWithConfig(
 
   // Determine the tier key ('sim100' | 'simUnlimited' | 'routerUnlimited')
   let resolvedTier: 'sim100' | 'simUnlimited' | 'routerUnlimited' = matchedPkg?.tierKey || 'sim100';
-
   if (normCategory === 'ROUTER' || normPkgType.includes('router')) {
     resolvedTier = 'routerUnlimited';
   } else if (normPkgType.includes('100gb') || normPkgType.includes('100 gb')) {
@@ -1264,9 +1361,10 @@ export function getBaseOriginalPriceWithConfig(
   }
 
   const candidatePkgIds = [
-    matchedPkg?.id,
     params.packageId ? String(params.packageId).trim() : undefined,
+    params.packageId ? normalizePackageSlug(params.packageId) : undefined,
     params.packageName ? normalizePackageSlug(params.packageName) : undefined,
+    matchedPkg?.id,
   ].filter(Boolean) as string[];
 
   let customOverridePrice: number | null = null;
@@ -1298,6 +1396,8 @@ export function getBaseOriginalPriceWithConfig(
   const months = parseDurationMonths(params.duration);
   return {
     originalPrice: Math.round(baseMonthly * months),
+    baseMonthly,
+    months,
     matchedPackage: matchedPkg,
     resolvedTier,
   };
@@ -1333,18 +1433,21 @@ export interface PriceVerificationResult {
 }
 
 /**
- * Pure helper to calculate discounted price given an original price and an active discount record.
- * Ensures Fixed and Percentage discounts are never applied twice and finalPrice >= 0.
+ * Pure helper to calculate discounted price given an original price, active discount record,
+ * and duration in months.
+ * Guarantees Total = (Effective Monthly Package Price) * Number of Months.
  */
 export function applySingleDiscount(
   originalPrice: number,
-  matchedDiscount: DiscountRecord | null
+  matchedDiscount: DiscountRecord | null,
+  durationMonths: number = 1
 ): {
   originalPrice: number;
   discountAmount: number;
   discountPercentage: number;
   finalPrice: number;
 } {
+  const safeMonths = Number.isFinite(durationMonths) && durationMonths > 0 ? Math.round(durationMonths) : 1;
   const safeOriginal = Math.max(0, Math.round(Number(originalPrice) || 0));
   if (!matchedDiscount) {
     return {
@@ -1358,16 +1461,20 @@ export function applySingleDiscount(
   const discountType: DiscountType =
     matchedDiscount.discount_type === 'percentage' ? 'percentage' : 'fixed';
 
-  let rawDiscount = 0;
+  const monthlyOriginal = safeMonths > 1 ? Math.round(safeOriginal / safeMonths) : safeOriginal;
+  let monthlyDiscount = 0;
   if (discountType === 'percentage') {
     const pct = Math.min(100, Math.max(0, Number(matchedDiscount.discount_amount) || 0));
-    rawDiscount = Math.round((safeOriginal * pct) / 100);
+    monthlyDiscount = Math.round((monthlyOriginal * pct) / 100);
   } else {
-    rawDiscount = Math.max(0, Math.round(Number(matchedDiscount.discount_amount) || 0));
+    monthlyDiscount = Math.max(0, Math.round(Number(matchedDiscount.discount_amount) || 0));
   }
 
-  const discountAmount = Math.min(safeOriginal, rawDiscount);
-  const finalPrice = Math.max(0, safeOriginal - discountAmount);
+  const clampedMonthlyDiscount = Math.min(monthlyOriginal, monthlyDiscount);
+  const effectiveMonthlyPrice = Math.max(0, monthlyOriginal - clampedMonthlyDiscount);
+  const finalPrice = Math.max(0, Math.round(effectiveMonthlyPrice * safeMonths));
+  const discountAmount = Math.max(0, safeOriginal - finalPrice);
+
   const discountPercentage =
     discountType === 'percentage'
       ? Math.min(100, Math.max(0, Math.round(Number(matchedDiscount.discount_amount) || 0)))
@@ -1434,7 +1541,7 @@ export async function calculateVerifiedOrderPrice(params: {
     }
   }
 
-  const { originalPrice, matchedPackage } = getBaseOriginalPriceWithConfig(livePlans, params);
+  const { originalPrice, months, matchedPackage } = getBaseOriginalPriceWithConfig(livePlans, params);
 
   const resolvedPkgId = matchedPackage?.id || String(params.packageId || '').trim();
   const resolvedPkgName = matchedPackage?.name || String(params.packageName || '').trim();
@@ -1463,7 +1570,7 @@ export async function calculateVerifiedOrderPrice(params: {
     ) || null;
 
   const matchedDiscount = specificDiscount || globalDiscount;
-  const calc = applySingleDiscount(originalPrice, matchedDiscount);
+  const calc = applySingleDiscount(originalPrice, matchedDiscount, months);
 
   return {
     packageId: resolvedPkgId,

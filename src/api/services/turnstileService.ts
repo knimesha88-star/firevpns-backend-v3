@@ -58,17 +58,47 @@ function cleanupExpiredTokenHashes(): void {
   }
 }
 
+function expandWithWwwCounterpart(hostnames: string[]): string[] {
+  const expanded = new Set<string>();
+  for (const host of hostnames) {
+    if (!host) continue;
+    expanded.add(host);
+    const isLocalOrIp =
+      host === 'localhost' ||
+      /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
+      host.includes(':');
+    if (isLocalOrIp || !host.includes('.')) continue;
+
+    if (host.startsWith('www.')) {
+      const apex = host.slice(4);
+      if (apex && apex.includes('.')) {
+        expanded.add(apex);
+      }
+    } else {
+      expanded.add(`www.${host}`);
+    }
+  }
+  return Array.from(expanded);
+}
+
 export function getAllowedHostnames(overrideHostnames?: string[]): string[] {
   if (overrideHostnames && overrideHostnames.length > 0) {
-    return overrideHostnames.map(normalizeHostname).filter(Boolean);
+    return expandWithWwwCounterpart(overrideHostnames.map(normalizeHostname).filter(Boolean));
   }
-  const raw = sanitizeEnvValue(process.env.TURNSTILE_ALLOWED_HOSTNAME) || 'firevpnsvip.qzz.io';
-  const parsed = raw
+  const rawList = [
+    sanitizeEnvValue(process.env.TURNSTILE_ALLOWED_HOSTNAME) || 'firevpnsvip.qzz.io',
+    sanitizeEnvValue(process.env.APP_URL),
+    sanitizeEnvValue(process.env.SHARED_APP_URL),
+  ]
+    .filter(Boolean)
+    .join(',');
+
+  const parsed = rawList
     .split(',')
     .map(normalizeHostname)
     .filter(Boolean);
 
-  return parsed.length > 0 ? parsed : ['firevpnsvip.qzz.io'];
+  return expandWithWwwCounterpart(parsed.length > 0 ? parsed : ['firevpnsvip.qzz.io']);
 }
 
 export function extractTurnstileToken(req: Request): string | null {

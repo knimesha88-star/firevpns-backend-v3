@@ -44,7 +44,9 @@ export const getPublicActiveSpecialOffersHandler = async (_req: Request, res: Re
     });
   } catch (error: any) {
     console.error('[SpecialOfferController] Error fetching active special offers:', error?.message || error);
-    res.status(500).json({ error: error?.message || 'Failed to fetch active special offers' });
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch active special offers' : (error?.message || 'Failed to fetch active special offers')
+    });
   }
 };
 
@@ -134,7 +136,9 @@ export const getAdminSpecialOffersHandler = async (req: AuthRequest, res: Respon
     });
   } catch (error: any) {
     console.error('[SpecialOfferController] Error fetching admin special offers:', error?.message || error);
-    res.status(500).json({ error: error?.message || 'Failed to fetch special offers' });
+    res.status(500).json({
+      error: process.env.NODE_ENV === 'production' ? 'Failed to fetch special offers' : (error?.message || 'Failed to fetch special offers')
+    });
   }
 };
 

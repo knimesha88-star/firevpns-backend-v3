@@ -1,4 +1,4 @@
-import { supabase } from '../../lib/supabase.js';
+import { supabase, getSupabaseClient } from '../../lib/supabase.js';
 import { getCachedInbounds, getLiveInbound, getInbounds, resetClientTraffic } from './xuiService.js';
 import { createCustomerNotification } from './notificationService.js';
 import crypto from 'crypto';
@@ -7,51 +7,147 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const dbStart = Date.now();
   const userEmail = email ? email.toLowerCase().trim() : '';
   const userUid = uid ? uid.trim() : '';
+  const db = getSupabaseClient(_token);
 
-  // Query vpn_configs to obtain inbound_id correctly
-  const { data: vpnConfigsData } = await supabase.from('vpn_configs').select('*');
-  const inboundMap = new Map<string, number>();
-  if (vpnConfigsData && Array.isArray(vpnConfigsData)) {
-    vpnConfigsData.forEach(cfg => {
-      const ibId = Number(cfg.inbound_id);
-      if (!isNaN(ibId) && ibId > 0) {
-        if (cfg.order_id) inboundMap.set(String(cfg.order_id), ibId);
-        if (cfg.uuid) inboundMap.set(String(cfg.uuid).toLowerCase(), ibId);
-      }
-    });
+  if (!userUid && !userEmail) {
+    return { configs: [], dbTime: 0 };
   }
+
+  // Query vpn_configs scoped strictly to this customer (no full-table scan)
+  const vpnConfigsMap = new Map<string, any>();
+  if (userUid) {
+    try {
+      const { data: cfgsByCustomerUid } = await db
+        .from('vpn_configs')
+        .select('*')
+        .eq('customer_uid', userUid);
+      if (Array.isArray(cfgsByCustomerUid)) {
+        cfgsByCustomerUid.forEach((cfg: any) => {
+          const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
+          vpnConfigsMap.set(key, cfg);
+        });
+      }
+    } catch (_e) {}
+  }
+  const vpnConfigsData = Array.from(vpnConfigsMap.values());
+  const inboundMap = new Map<string, number>();
+  const deletedOrInactiveUuids = new Set<string>();
+  vpnConfigsData.forEach(cfg => {
+    const cfgStatus = String(cfg.status || '').toLowerCase().trim();
+    if (cfgStatus === 'deleted' || cfgStatus === 'rejected' || cfgStatus === 'cancelled' || cfgStatus === 'pending') {
+      if (cfg.uuid) deletedOrInactiveUuids.add(String(cfg.uuid).trim().toLowerCase());
+    }
+    const ibId = Number(cfg.inbound_id);
+    if (!isNaN(ibId) && ibId > 0) {
+      if (cfg.order_id) inboundMap.set(String(cfg.order_id), ibId);
+      if (cfg.uuid) inboundMap.set(String(cfg.uuid).toLowerCase(), ibId);
+    }
+  });
+
+  // Query orders table scoped strictly to this customer (by customer_id and legacy email fallback)
+  const ordersById = new Map<string, any>();
+  if (userUid) {
+    try {
+      const { data: ordersByUid } = await db
+        .from('orders')
+        .select('*')
+        .eq('customer_id', userUid);
+      if (Array.isArray(ordersByUid)) {
+        ordersByUid.forEach((ord: any) => {
+          const key = String(ord.id || ord.order_id || Math.random());
+          ordersById.set(key, ord);
+        });
+      }
+    } catch (_e) {}
+  }
+  if (userEmail) {
+    try {
+      const { data: ordersByEmail } = await db
+        .from('orders')
+        .select('*')
+        .ilike('email', userEmail);
+      if (Array.isArray(ordersByEmail)) {
+        ordersByEmail.forEach((ord: any) => {
+          const docUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || '').trim();
+          // Only include email-matched rows when they belong to this UID or have no UID recorded
+          if (!userUid || !docUid || docUid === userUid) {
+            const key = String(ord.id || ord.order_id || Math.random());
+            ordersById.set(key, ord);
+          }
+        });
+      }
+    } catch (_e) {}
+  }
+  const allOrders: any[] = Array.from(ordersById.values());
+
+  const nonApprovedOrderIds = new Set<string>();
+  const nonApprovedOrderUuids = new Set<string>();
+
+  allOrders.forEach(ord => {
+    const rawStatus = String(ord.status || '').toLowerCase().trim();
+    if (
+      rawStatus === 'pending' ||
+      rawStatus === 'rejected' ||
+      rawStatus === 'cancelled' ||
+      rawStatus === 'deleted' ||
+      rawStatus === 'expired' ||
+      rawStatus === 'provisioning'
+    ) {
+      if (ord.id) nonApprovedOrderIds.add(String(ord.id).trim());
+      if (ord.order_id) nonApprovedOrderIds.add(String(ord.order_id).trim());
+      const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || '').trim().toLowerCase();
+      if (cUuid) nonApprovedOrderUuids.add(cUuid);
+    }
+  });
 
   const configs: any[] = [];
 
-  // 1. Query vpn_accounts table
+  // 1. Query vpn_accounts table using authenticated UID first
   try {
-    let query = supabase.from('vpn_accounts').select('*');
-    if (userEmail) {
-      query = query.eq('email', userEmail);
-    } else if (userUid) {
-      query = query.eq('user_id', userUid);
+    let vpnAccs: any[] = [];
+    if (userUid) {
+      const { data: byUid } = await db.from('vpn_accounts').select('*').eq('user_id', userUid).order('created_at', { ascending: false });
+      if (Array.isArray(byUid)) vpnAccs = byUid;
     }
-    
-    const { data: vpnAccs } = await query.order('created_at', { ascending: false });
+    if (vpnAccs.length === 0 && userEmail) {
+      const { data: byEmail } = await db.from('vpn_accounts').select('*').eq('email', userEmail).order('created_at', { ascending: false });
+      if (Array.isArray(byEmail)) {
+        // Only accept records that either match userUid or have no conflicting user_id
+        vpnAccs = byEmail.filter(acc => {
+          const docUserId = String(acc.user_id || '').trim();
+          return !userUid || !docUserId || docUserId === userUid;
+        });
+      }
+    }
 
     if (vpnAccs && Array.isArray(vpnAccs)) {
       vpnAccs.forEach(acc => {
         const docUserId = String(acc.user_id || '').trim();
         const docEmail = String(acc.email || '').toLowerCase().trim();
-        const matchesUser = (userUid && docUserId === userUid) || (userEmail && docEmail === userEmail);
-        const isActive = !acc.status || acc.status === 'active' || acc.status === 'enabled';
-        
-        if (matchesUser && isActive && acc.vless_url) {
-          const isTrialAcc = !!(acc.is_trial || String(acc.order_id || '').startsWith('TRIAL-'));
-          const orderId = acc.order_id || acc.id;
-          const configUuid = acc.uuid;
-          const inboundId = inboundMap.get(String(orderId)) || (configUuid ? inboundMap.get(String(configUuid).toLowerCase()) : null) || null;
+        const matchesUser = userUid
+          ? (docUserId === userUid || (!docUserId && userEmail && docEmail === userEmail))
+          : (userEmail && docEmail === userEmail);
+
+        const accStatus = String(acc.status || 'active').toLowerCase().trim();
+        const isApprovedStatus = accStatus === 'active' || accStatus === 'enabled' || accStatus === 'approved';
+        const configUuid = String(acc.uuid || '').trim();
+        const normUuid = configUuid.toLowerCase();
+        const orderId = String(acc.order_id || acc.id || '').trim();
+
+        const isBlockedByOrder =
+          (orderId && nonApprovedOrderIds.has(orderId)) ||
+          (normUuid && nonApprovedOrderUuids.has(normUuid)) ||
+          (normUuid && deletedOrInactiveUuids.has(normUuid));
+
+        if (matchesUser && isApprovedStatus && !isBlockedByOrder && configUuid && acc.vless_url) {
+          const isTrialAcc = !!(acc.is_trial || orderId.startsWith('TRIAL-'));
+          const inboundId = inboundMap.get(orderId) || inboundMap.get(normUuid) || null;
 
           configs.push({
-            orderId,
+            orderId: acc.order_id || acc.id,
             packageName: acc.remark || 'FIREVPN Package',
             configUrl: acc.vless_url,
-            uuid: acc.uuid,
+            uuid: configUuid,
             expiryDate: acc.expiry_date || (acc.expiry_time ? new Date(acc.expiry_time).toISOString() : ''),
             inboundId,
             trafficLimit: isTrialAcc ? '1GB' : (acc.total_bytes > 0 ? `${acc.total_bytes / (1024 * 1024 * 1024)}GB` : 'Unlimited'),
@@ -66,38 +162,44 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   } catch (err) {
   }
 
-  // 2. Query orders table
-  const { data: snapshot } = await supabase.from('orders').select('*');
-  const allOrders: any[] = snapshot || [];
-
+  // 2. Match approved orders for this authenticated user
   const matchedDocs = allOrders.filter(doc => {
     const data = doc;
     const docUid = String(data.customer_id || data.customerUid || data.customerId || data.uid || data.userId || '').trim();
     const docEmail = String(data.email || data.customerEmail || data.userEmail || '').toLowerCase().trim();
-    const statusVal = String(data.status || data.payment_status || '').toLowerCase();
+    const orderStatus = String(data.status || '').toLowerCase().trim();
 
-    const matchesUser = (userUid && docUid === userUid) || (userEmail && docEmail === userEmail);
-    const isApproved = statusVal === 'approved' || statusVal === 'completed' || statusVal === 'paid' || statusVal === 'active';
+    const matchesUser = userUid
+      ? (docUid === userUid || (!docUid && userEmail && docEmail === userEmail))
+      : (userEmail && docEmail === userEmail);
+
+    // Order must be explicitly approved/completed/active (never pending, rejected, cancelled, deleted, or expired)
+    const isApproved = orderStatus === 'approved' || orderStatus === 'completed' || orderStatus === 'active';
 
     return matchesUser && isApproved;
   });
 
   matchedDocs.forEach(data => {
-    const vlessUrl = data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '';
-    const clientUuid = data.client_uuid || data.vpn_credentials?.password || data.uuid || '';
+    const vlessUrl = String(data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || '').trim();
+    const clientUuid = String(data.client_uuid || data.vpn_credentials?.password || data.uuid || '').trim();
+    const normUuid = clientUuid.toLowerCase();
 
-    if (vlessUrl) {
-      const exists = configs.some(c => c.uuid && clientUuid && c.uuid.toLowerCase() === clientUuid.toLowerCase());
-      if (!exists) {
-        let pmJson: any = {};
-        try {
-          pmJson = typeof data.payment_method === 'string' ? JSON.parse(data.payment_method) : (data.payment_method || {});
-        } catch(e) {}
+    if (vlessUrl && clientUuid && !deletedOrInactiveUuids.has(normUuid)) {
+      let pmJson: any = {};
+      try {
+        pmJson = typeof data.payment_method === 'string' ? JSON.parse(data.payment_method) : (data.payment_method || {});
+      } catch(e) {}
 
+      const existingIdx = configs.findIndex(c => c.uuid && c.uuid.toLowerCase() === normUuid);
+      if (existingIdx >= 0) {
+        if ((!configs[existingIdx].serverNode || configs[existingIdx].serverNode === 'Singapore') && (data.server || pmJson.server)) {
+          configs[existingIdx].serverNode = data.server || pmJson.server;
+        }
+      } else {
         const isTrialOrd = !!(pmJson.is_trial || pmJson.isTrial || pmJson.paymentMethod === 'Free Trial' || String(data.order_id || data.id || '').startsWith('TRIAL-'));
         const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
         const orderId = data.id || data.order_id;
-        const inboundId = inboundMap.get(String(orderId)) || (clientUuid ? inboundMap.get(String(clientUuid).toLowerCase()) : null) || data.inbound_id || null;
+        const inboundId = inboundMap.get(String(orderId)) || inboundMap.get(normUuid) || data.inbound_id || null;
 
         configs.push({
           orderId,
@@ -107,7 +209,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           expiryDate: data.expiry_date || data.expiryDate || '',
           inboundId,
           trafficLimit: isTrialOrd ? '1GB' : (data.traffic_limit || 'Unlimited'),
-          serverNode: data.server || 'Singapore',
+          serverNode: data.server || pmJson.server || 'Singapore',
           _rawLimit: isTrialOrd ? 1 * 1024 * 1024 * 1024 : (data.traffic_limit && String(data.traffic_limit).toLowerCase() !== 'unlimited' ? ((parseFloat(String(data.traffic_limit)) || 0) * 1024 * 1024 * 1024) : 0),
           isTrial: isTrialOrd,
           templateId: tplId,
@@ -208,7 +310,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           if (String(c.id || '').toLowerCase() === String(config.uuid).toLowerCase()) {
             matchedInbound = ib;
             foundClient = c;
-            console.log(`[Provisioning Audit] Matched Inbound ID: ${ib.id}, Raw Client JSON: ${JSON.stringify(c)}`);
             break;
           }
         }
@@ -233,7 +334,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       if (config.uuid) {
         stat = clientStats.find((s: any) => String(s.id || '').toLowerCase() === String(config.uuid).toLowerCase()) ||
                clientStats.find((s: any) => String(s.email || '').toLowerCase() === String(clientEmail).toLowerCase());
-        console.log(`[Provisioning Audit] Raw Client Stats JSON: ${JSON.stringify(stat)}`);
       }
 
       const extractTraffic = (obj: any, type: 'up' | 'down') => {
@@ -563,16 +663,27 @@ export const verifyVpnOwnership = async (
 
   if (!normUuid) return { owned: false, source: null, record: null };
 
-  // 1. Check vpn_accounts table
+  const matchesOwner = (recUid: string, recEmail: string): boolean => {
+    const cleanUid = (recUid || '').trim();
+    const cleanEmail = (recEmail || '').trim().toLowerCase();
+    if (normUid) {
+      if (cleanUid) return cleanUid === normUid;
+      return Boolean(normEmail && cleanEmail && cleanEmail === normEmail);
+    }
+    return Boolean(normEmail && cleanEmail && cleanEmail === normEmail);
+  };
+
+  // 1. Check vpn_accounts table filtered directly by UUID
   try {
-    const { data: vpnAccs } = await supabase.from('vpn_accounts').select('*');
-    if (vpnAccs && Array.isArray(vpnAccs)) {
+    const { data: vpnAccs } = await supabase
+      .from('vpn_accounts')
+      .select('*')
+      .ilike('uuid', normUuid);
+    if (vpnAccs && Array.isArray(vpnAccs) && vpnAccs.length > 0) {
       for (const acc of vpnAccs) {
         const accUuid = String(acc.uuid || '').trim().toLowerCase();
         if (accUuid === normUuid) {
-          const accUid = String(acc.user_id || '').trim();
-          const accEmail = String(acc.email || '').trim().toLowerCase();
-          if ((normUid && accUid === normUid) || (normEmail && accEmail === normEmail)) {
+          if (matchesOwner(String(acc.user_id || ''), String(acc.email || ''))) {
             return { owned: true, source: 'vpn_accounts', record: acc };
           }
           // UUID exists in vpn_accounts but belongs to another user
@@ -580,18 +691,21 @@ export const verifyVpnOwnership = async (
         }
       }
     }
-  } catch (e) {}
+  } catch (_e) {}
 
-  // 2. Check orders table
+  // 2. Check orders table filtered directly by client_uuid
   try {
-    const { data: orders } = await supabase.from('orders').select('*');
-    if (orders && Array.isArray(orders)) {
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('*')
+      .ilike('client_uuid', normUuid);
+    if (orders && Array.isArray(orders) && orders.length > 0) {
       for (const ord of orders) {
         const clientUuid = String(ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
         if (clientUuid === normUuid) {
           const ordUid = String(ord.customer_id || ord.customerUid || ord.customerId || '').trim();
           const ordEmail = String(ord.email || ord.customerEmail || '').trim().toLowerCase();
-          if ((normUid && ordUid === normUid) || (normEmail && ordEmail === normEmail)) {
+          if (matchesOwner(ordUid, ordEmail)) {
             return { owned: true, source: 'orders', record: ord };
           }
           // UUID exists in orders but belongs to another user
@@ -599,27 +713,30 @@ export const verifyVpnOwnership = async (
         }
       }
     }
-  } catch (e) {}
+  } catch (_e) {}
 
-  // 3. Check vpn_configs table
+  // 3. Check vpn_configs table filtered directly by UUID
   try {
-    const { data: vpnCfgs } = await supabase.from('vpn_configs').select('*');
-    if (vpnCfgs && Array.isArray(vpnCfgs)) {
+    const { data: vpnCfgs } = await supabase
+      .from('vpn_configs')
+      .select('*')
+      .ilike('uuid', normUuid);
+    if (vpnCfgs && Array.isArray(vpnCfgs) && vpnCfgs.length > 0) {
       for (const cfg of vpnCfgs) {
         const cfgUuid = String(cfg.uuid || '').trim().toLowerCase();
         if (cfgUuid === normUuid) {
           const cfgUid = String(cfg.customer_uid || cfg.user_id || cfg.userId || '').trim();
           const cfgEmail = String(cfg.customer_email || cfg.user_email || cfg.email || '').trim().toLowerCase();
-          if ((normUid && cfgUid === normUid) || (normEmail && cfgEmail === normEmail)) {
+          if (matchesOwner(cfgUid, cfgEmail)) {
             return { owned: true, source: 'vpn_configs', record: cfg };
           }
           return { owned: false, source: 'vpn_configs', record: null };
         }
       }
     }
-  } catch (e) {}
+  } catch (_e) {}
 
-  // 4. Check 3X-UI panel clients directly as authoritative fallback
+  // 4. Check 3X-UI panel clients directly as fallback (strict exact email match only; never substring)
   try {
     const cached = await getCachedInbounds();
     if (Array.isArray(cached)) {
@@ -627,14 +744,13 @@ export const verifyVpnOwnership = async (
         let settingsObj: any = {};
         try {
           if (ib.settings) settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
-        } catch (e) {}
+        } catch (_e) {}
         const clients = settingsObj.clients || [];
         for (const c of clients) {
           const cUuid = String(c.id || '').trim().toLowerCase();
           const cEmail = String(c.email || '').trim().toLowerCase();
           if (cUuid === normUuid) {
-            // Check if email matches customer email or user identifier
-            if (normEmail && (cEmail === normEmail || cEmail.includes(normEmail) || normEmail.includes(cEmail))) {
+            if (normEmail && cEmail === normEmail) {
               return {
                 owned: true,
                 source: '3xui' as any,
@@ -654,7 +770,7 @@ export const verifyVpnOwnership = async (
         }
       }
     }
-  } catch (e) {}
+  } catch (_e) {}
 
   return { owned: false, source: null, record: null };
 };

@@ -692,13 +692,16 @@ export async function getAllSpecialOffers(authToken?: string): Promise<SpecialOf
   }
 
   const mergedMap = new Map<string, SpecialOfferRecord>();
-  const sourceLists =
-    settingsRecords !== null || tableRecords !== null
-      ? [settingsRecords || [], tableRecords || [], localRecords]
-      : [localRecords];
-
-  for (const list of sourceLists) {
-    for (const item of list) {
+  for (const item of localRecords) {
+    mergedMap.set(item.id, item);
+  }
+  if (settingsRecords) {
+    for (const item of settingsRecords) {
+      mergedMap.set(item.id, item);
+    }
+  }
+  if (tableRecords) {
+    for (const item of tableRecords) {
       const existing = mergedMap.get(item.id);
       if (
         !existing ||
@@ -710,9 +713,7 @@ export async function getAllSpecialOffers(authToken?: string): Promise<SpecialOf
   }
 
   const records = deduplicateSpecialOffersByPackageAndDuration(Array.from(mergedMap.values()));
-  if (records.length > 0) {
-    writeLocalSpecialOffers(records);
-  }
+  writeLocalSpecialOffers(records);
 
   return records;
 }

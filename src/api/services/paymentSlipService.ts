@@ -166,6 +166,21 @@ export function parsePaymentSlipReference(rawInput: string | null | undefined): 
     // Keep as-is if already decoded
   }
 
+  // Reject path traversal or null-byte sequences
+  if (
+    normalizedPath.includes('..') ||
+    normalizedPath.includes('\\') ||
+    normalizedPath.includes('\0')
+  ) {
+    return {
+      kind: 'empty',
+      bucket: PAYMENT_SLIPS_BUCKET,
+      objectPath: '',
+      rawInput: trimmed,
+      isPdf: false,
+    };
+  }
+
   return {
     kind: 'storage',
     bucket,
@@ -176,13 +191,9 @@ export function parsePaymentSlipReference(rawInput: string | null | undefined): 
 }
 
 /**
- * Checks whether a user is an admin in `profiles` or `users`, or is the primary admin email.
+ * Checks whether a user is an admin strictly via database role (`profiles`, `user_roles`, or `users`).
  */
-export async function checkIsUserAdmin(userUid?: string, userEmail?: string): Promise<boolean> {
-  if (!userUid && !userEmail) return false;
-  if (userEmail && userEmail.toLowerCase().trim() === 'madushannimesha16@gmail.com') {
-    return true;
-  }
+export async function checkIsUserAdmin(userUid?: string, _userEmail?: string): Promise<boolean> {
   if (!userUid) return false;
 
   try {
@@ -193,6 +204,16 @@ export async function checkIsUserAdmin(userUid?: string, userEmail?: string): Pr
       .maybeSingle();
 
     if (profileData?.role === 'admin' || profileData?.role === 'super_admin') {
+      return true;
+    }
+
+    const { data: roleData } = await supabase
+      .from('user_roles')
+      .select('role')
+      .eq('user_id', userUid)
+      .maybeSingle();
+
+    if (roleData?.role === 'admin' || roleData?.role === 'super_admin') {
       return true;
     }
 
@@ -431,9 +452,41 @@ export async function uploadPaymentSlipViaBackend(params: {
     ? params.folder
     : 'orders';
 
-  const cleanFileName = String(params.fileName || 'receipt.png').replace(/[^a-zA-Z0-9.-]/g, '_');
+  const normalizedContentType = String(params.contentType || '')
+    .trim()
+    .toLowerCase()
+    .split(';')[0];
+
+  const MIME_TO_EXTENSION: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'application/pdf': '.pdf',
+  };
+
+  if (!ALLOWED_MIME_TYPES.includes(normalizedContentType) || !MIME_TO_EXTENSION[normalizedContentType]) {
+    return {
+      success: false,
+      bucket: PAYMENT_SLIPS_BUCKET,
+      filePath: '',
+      storedUrl: '',
+      signedUrl: '',
+      error: 'Unsupported payment slip file type. Only JPG, PNG, WEBP, and PDF files are allowed.',
+    };
+  }
+
+  const expectedExt = MIME_TO_EXTENSION[normalizedContentType];
+  const rawBaseName = String(params.fileName || 'receipt')
+    .replace(/^.*[\\/]/, '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 64) || 'receipt';
+  const cleanFileName = `${rawBaseName}${expectedExt}`;
+
   const safeUserFolder = String(params.userEmailOrId || 'customer')
     .trim()
+    .replace(/\.\./g, '_')
     .replace(/[^a-zA-Z0-9@._-]/g, '_');
   const filePath = `${folder}/${safeUserFolder}/${Date.now()}_${cleanFileName}`;
 
@@ -441,6 +494,17 @@ export async function uploadPaymentSlipViaBackend(params: {
     ? params.base64Data.split(',')[1]
     : params.base64Data;
   const fileBuffer = Buffer.from(cleanBase64, 'base64');
+
+  if (fileBuffer.byteLength === 0) {
+    return {
+      success: false,
+      bucket: PAYMENT_SLIPS_BUCKET,
+      filePath: '',
+      storedUrl: '',
+      signedUrl: '',
+      error: 'Payment slip file is empty or invalid.',
+    };
+  }
 
   if (fileBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
     return {
@@ -465,7 +529,7 @@ export async function uploadPaymentSlipViaBackend(params: {
     const { data, error } = await client.storage
       .from(PAYMENT_SLIPS_BUCKET)
       .upload(filePath, fileBuffer, {
-        contentType: params.contentType || 'image/png',
+        contentType: normalizedContentType,
         cacheControl: '3600',
         upsert: true,
       });

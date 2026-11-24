@@ -7,15 +7,48 @@ export const getUserProfile = async (uid: string): Promise<any> => {
   return user || null;
 };
 
+const MAX_AVATAR_DATA_URL_LENGTH = 2 * 1024 * 1024; // 2 MB
+const SAFE_AVATAR_DATA_URL_REGEX = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/i;
+
+export const validateAvatarUrl = (rawUrl: unknown): string => {
+  const trimmed = String(rawUrl ?? '').trim();
+  if (!trimmed) return '';
+
+  if (trimmed.length > MAX_AVATAR_DATA_URL_LENGTH) {
+    const err: any = new Error('Avatar URL or image data is too large.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (SAFE_AVATAR_DATA_URL_REGEX.test(trimmed)) {
+    return trimmed;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return trimmed;
+    }
+  } catch {
+    // Fall through to validation error
+  }
+
+  const err: any = new Error(
+    'Invalid avatar URL. Only HTTP(S) URLs or standard PNG/JPG/WEBP/GIF image data URLs are allowed.'
+  );
+  err.statusCode = 400;
+  throw err;
+};
+
 export const updateUserProfile = async (uid: string, data: any): Promise<any> => {
   const allowedData: any = {
     updated_at: new Date().toISOString()
   };
-  if (data.full_name !== undefined) allowedData.full_name = String(data.full_name || '').trim();
-  if (data.phone !== undefined) allowedData.phone = String(data.phone || '').trim();
-  if (data.country !== undefined) allowedData.country = String(data.country || '').trim();
-  if (data.address !== undefined) allowedData.address = String(data.address || '').trim();
-  if (data.avatar_url !== undefined) allowedData.avatar_url = String(data.avatar_url || '').trim();
+  if (data.full_name !== undefined) allowedData.full_name = String(data.full_name || '').trim().slice(0, 120);
+  if (data.phone !== undefined) allowedData.phone = String(data.phone || '').trim().slice(0, 40);
+  if (data.country !== undefined) allowedData.country = String(data.country || '').trim().slice(0, 80);
+  if (data.address !== undefined) allowedData.address = String(data.address || '').trim().slice(0, 300);
+  if (data.avatar_url !== undefined) allowedData.avatar_url = validateAvatarUrl(data.avatar_url);
 
   let { data: updated, error } = await supabase.from('profiles').update(allowedData).eq('id', uid).select().maybeSingle();
 

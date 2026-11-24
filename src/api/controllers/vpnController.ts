@@ -2,7 +2,8 @@ import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as vpnService from '../services/vpnService.js';
 import * as xuiService from '../services/xuiService.js';
-import { supabase } from '../../lib/supabase.js';
+import { supabase, supabaseAdmin } from '../../lib/supabase.js';
+import { isUserAdminInDb } from '../middleware/authMiddleware.js';
 import { sendTrialRequestNotification } from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
 import { sendTrialApprovedEmail } from '../services/emailService.js';
@@ -44,8 +45,26 @@ export const getClaimedTrials = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const { data: snapshot } = await supabase.from('orders').select('*');
-    const allOrders: any[] = snapshot || [];
+    const db = supabaseAdmin || supabase;
+    const selectCols = 'id, order_id, customer_id, email, package_name, payment_method, status, payment_status';
+    const cleanEmail = email ? email.trim().toLowerCase() : '';
+
+    const [byUidRes, byEmailRes] = await Promise.all([
+      uid
+        ? db.from('orders').select(selectCols).eq('customer_id', uid)
+        : Promise.resolve({ data: [] as any[] }),
+      cleanEmail
+        ? db.from('orders').select(selectCols).ilike('email', cleanEmail)
+        : Promise.resolve({ data: [] as any[] }),
+    ]);
+
+    const seenIds = new Set<string>();
+    const allOrders: any[] = [...(byUidRes.data || []), ...(byEmailRes.data || [])].filter((row) => {
+      const key = String(row?.id || row?.order_id || '');
+      if (!key || seenIds.has(key)) return false;
+      seenIds.add(key);
+      return true;
+    });
 
     const claimedPackages: string[] = [];
     const claimedTemplates: string[] = [];
@@ -124,12 +143,10 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
 
     if (!uid || !email) {
       const errText = 'Please log in with a verified email to request your free trial.';
-      console.warn(`[vpnController] ${errText} at ${file}:${line}`);
+      console.warn(`[vpnController] ${errText}`);
       res.status(401).json({
         success: false,
         error: errText,
-        file,
-        line
       });
       return;
     }
@@ -138,12 +155,10 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     const { packageName, templateId, configurationName, customerName } = req.body;
     if (!packageName && !templateId) {
       const errText = 'Package Name or Template ID is required.';
-      console.warn(`[vpnController] ${errText} at ${file}:${line}`);
+      console.warn(`[vpnController] ${errText}`);
       res.status(400).json({
         success: false,
         error: errText,
-        file,
-        line
       });
       return;
     }
@@ -156,10 +171,7 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       console.error('[vpnController] Database error while fetching templates:', fetchTemplatesErr);
       res.status(500).json({
         success: false,
-        error: `Database Fetch Error (Templates): ${fetchTemplatesErr.message}`,
-        databaseError: fetchTemplatesErr,
-        file,
-        line
+        error: 'Unable to load available trial packages right now. Please try again shortly.',
       });
       return;
     }
@@ -370,8 +382,6 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
       res.status(400).json({
         success: false,
         error: provResult?.error || 'Provisioning timed out or order was cancelled. Please try again.',
-        file,
-        line
       });
       return;
     }
@@ -448,13 +458,12 @@ export const claimTrial = async (req: AuthRequest, res: Response): Promise<void>
     });
 
   } catch (error: any) {
-    console.error(`[vpnController] Unhandled claimTrial Exception at ${file}:${line}:`, error);
+    console.error(`[vpnController] Unhandled claimTrial Exception:`, error);
     res.status(500).json({
       success: false,
-      error: error.message || 'An unhandled exception occurred.',
-      stack: error.stack,
-      file,
-      line
+      error: process.env.NODE_ENV === 'production'
+        ? 'Unable to activate free trial right now. Please try again shortly.'
+        : (error?.message || 'An unhandled exception occurred.'),
     });
   }
 };
@@ -581,8 +590,9 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
 
     const ownerUid = String(orderRecord.customer_id || '').trim();
     const ownerEmail = String(orderRecord.email || '').toLowerCase().trim();
+    const callerIsAdmin = await isUserAdminInDb(uid);
     const isOwner =
-      role === 'admin' ||
+      callerIsAdmin ||
       (uid && ownerUid === uid) ||
       (email && ownerEmail === email);
 
