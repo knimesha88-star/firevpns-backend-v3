@@ -8487,18 +8487,76 @@ async function renewDurableProvisioningOperationLock(params) {
 }
 async function finalizeDurableProvisioningOperationLock(params) {
   const { dbClient, operationKey, lockOwnerId, status, clientUuid, errorMessage, metadata } = params;
-  if (!dbClient || typeof dbClient.rpc !== "function") return;
-  try {
-    await dbClient.rpc("release_provisioning_lock", {
-      p_operation_key: operationKey,
-      p_lock_owner_id: lockOwnerId,
-      p_status: status,
-      p_client_uuid: clientUuid || null,
-      p_error_message: errorMessage || null,
-      p_metadata: metadata || null
-    });
-  } catch (_err) {
+  if (!dbClient || typeof dbClient.rpc !== "function") {
+    console.warn(
+      `[xuiService] Cannot release durable lock '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}): RPC client unavailable.`
+    );
+    return { released: false, attempts: 0, reason: "unavailable" };
   }
+  const maxRetries = params.maxRetries !== void 0 && Number.isInteger(params.maxRetries) && params.maxRetries >= 0 ? Math.min(params.maxRetries, 5) : 2;
+  const maxAttempts = maxRetries + 1;
+  const retryBaseDelayMs = params.retryBaseDelayMs !== void 0 && Number.isFinite(params.retryBaseDelayMs) && params.retryBaseDelayMs >= 0 ? Math.min(params.retryBaseDelayMs, 2e3) : 250;
+  let lastErrMsg;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { data, error } = await dbClient.rpc("release_provisioning_lock", {
+        p_operation_key: operationKey,
+        p_lock_owner_id: lockOwnerId,
+        p_status: status,
+        p_client_uuid: clientUuid || null,
+        p_error_message: errorMessage || null,
+        p_metadata: metadata || null
+      });
+      if (!error) {
+        if (data === true) {
+          if (attempt > 1) {
+            console.log(
+              `[xuiService] Released durable lock '${operationKey}' (owner=${lockOwnerId}, status=${status}) on retry attempt ${attempt}/${maxAttempts}.`
+            );
+          }
+          return { released: true, attempts: attempt, reason: "released" };
+        }
+        console.warn(
+          `[xuiService] Durable lock release returned FALSE for '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}, attempt=${attempt}/${maxAttempts}): lease expired, already finalized, or lock ownership changed to another worker. Preserving existing lock state.`
+        );
+        return { released: false, attempts: attempt, reason: "ownership_lost_or_expired" };
+      }
+      lastErrMsg = error?.message || String(error);
+      const transient = isTransientLockReleaseError(error);
+      if (transient && attempt < maxAttempts) {
+        const delayMs = retryBaseDelayMs * Math.pow(2, attempt - 1);
+        console.warn(
+          `[xuiService] Transient RPC error releasing durable lock '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}, attempt=${attempt}/${maxAttempts}): ${lastErrMsg}. Retrying in ${delayMs}ms with original owner...`
+        );
+        if (delayMs > 0) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+        continue;
+      }
+      console.error(
+        `[xuiService] Failed to release durable lock '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}) after ${attempt}/${maxAttempts} attempt(s): ${lastErrMsg}`
+      );
+      return { released: false, attempts: attempt, reason: "rpc_error", error: lastErrMsg };
+    } catch (err) {
+      lastErrMsg = err?.message || String(err);
+      const transient = isTransientLockReleaseError(err);
+      if (transient && attempt < maxAttempts) {
+        const delayMs = retryBaseDelayMs * Math.pow(2, attempt - 1);
+        console.warn(
+          `[xuiService] Transient exception releasing durable lock '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}, attempt=${attempt}/${maxAttempts}): ${lastErrMsg}. Retrying in ${delayMs}ms with original owner...`
+        );
+        if (delayMs > 0) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+        continue;
+      }
+      console.error(
+        `[xuiService] Exception releasing durable lock '${operationKey}' (owner=${lockOwnerId}, targetStatus=${status}) after ${attempt}/${maxAttempts} attempt(s): ${lastErrMsg}`
+      );
+      return { released: false, attempts: attempt, reason: "rpc_error", error: lastErrMsg };
+    }
+  }
+  return { released: false, attempts: maxAttempts, reason: "rpc_error", error: lastErrMsg };
 }
 async function withInboundWriteLock(params, fn) {
   const inboundId = Number(params.inboundId);
@@ -8574,9 +8632,13 @@ async function withInboundWriteLock(params, fn) {
     try {
       return await fn(assertInboundLockStillHeld);
     } catch (err) {
-      const msgLower = String(err?.message || "").toLowerCase();
-      const isUncertainTransportErr = msgLower.includes("timeout") || msgLower.includes("etimedout") || msgLower.includes("econnreset") || msgLower.includes("econnrefused") || msgLower.includes("socket hang up") || msgLower.includes("network error");
-      opOutcome = isUncertainTransportErr ? "uncertain" : "failed";
+      if (params.noExternalXuiWrite === true) {
+        opOutcome = "failed";
+      } else {
+        const msgLower = String(err?.message || "").toLowerCase();
+        const isUncertainTransportErr = msgLower.includes("timeout") || msgLower.includes("etimedout") || msgLower.includes("econnreset") || msgLower.includes("econnrefused") || msgLower.includes("socket hang up") || msgLower.includes("network error");
+        opOutcome = isUncertainTransportErr ? "uncertain" : "failed";
+      }
       opErr = err?.message || String(err);
       throw err;
     } finally {
@@ -8587,7 +8649,8 @@ async function withInboundWriteLock(params, fn) {
           lockOwnerId: acquiredLock.lockOwnerId,
           status: opOutcome,
           clientUuid: params.clientUuid || null,
-          errorMessage: opErr
+          errorMessage: opErr,
+          retryBaseDelayMs: params.releaseRetryBaseDelayMs
         });
       }
     }
@@ -8681,7 +8744,7 @@ async function withClientMutationLock(params, fn) {
   try {
     return await fn(assertClientLockStillHeld);
   } catch (err) {
-    outcome = err?.xuiUncertain === true ? "uncertain" : "failed";
+    outcome = err?.xuiUncertain === true || err?.mutationUncertain === true ? "uncertain" : "failed";
     errMsg = err?.message || String(err);
     throw err;
   } finally {
@@ -8692,7 +8755,8 @@ async function withClientMutationLock(params, fn) {
         lockOwnerId: lockRes.lockOwnerId,
         status: outcome,
         clientUuid: cleanUuid,
-        errorMessage: errMsg
+        errorMessage: errMsg,
+        retryBaseDelayMs: params.releaseRetryBaseDelayMs
       });
     }
   }
@@ -10130,7 +10194,7 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
     }
   );
 }
-var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, lastInboundsCacheTime, cachedXuiConfig, XUI_CONFIG_TTL_MS, cachedXuiAuth, XUI_AUTH_TTL_MS, invalidateXuiConfigCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isMissingSchemaOrRpcError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, triggerBackgroundSyncIfNeeded, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundById, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
+var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, lastInboundsCacheTime, cachedXuiConfig, XUI_CONFIG_TTL_MS, cachedXuiAuth, XUI_AUTH_TTL_MS, invalidateXuiConfigCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isPanelDeletionSyncFlagEnabled, isMissingSchemaOrRpcError, isTransientLockReleaseError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, triggerBackgroundSyncIfNeeded, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundById, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, isDefinitivePreCommitDeletionRpcError, isAmbiguousDeletionRpcError, runWithStrictTimeout, reconcileClientPanelDeletionState, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
 var init_xuiService = __esm({
   "src/api/services/xuiService.ts"() {
     "use strict";
@@ -10300,7 +10364,7 @@ var init_xuiService = __esm({
         validateStatus: (status) => status < 500
       });
     };
-    getXuiAuthHeaders = async (config, forceRefresh = false) => {
+    getXuiAuthHeaders = async (config, forceRefresh = false, timeoutMs = 6e3) => {
       const now = Date.now();
       if (!forceRefresh && cachedXuiAuth && cachedXuiAuth.panelUrl === config.panelUrl && cachedXuiAuth.expiresAt > now) {
         return { ...cachedXuiAuth.headers };
@@ -10311,7 +10375,8 @@ var init_xuiService = __esm({
         throw new Error("API token or password is missing in 3X-UI settings");
       }
       const { baseUrl } = parseUrl(config.panelUrl);
-      const client = createAxiosInstance(baseUrl, 6e3);
+      const authTimeoutMs = Math.max(1e3, Math.min(timeoutMs, 6e3));
+      const client = createAxiosInstance(baseUrl, authTimeoutMs);
       const headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "X-Requested-With": "XMLHttpRequest"
@@ -10365,11 +10430,12 @@ var init_xuiService = __esm({
       }
       return headers;
     };
-    requestApi = async (endpoint, method = "GET", data) => {
+    requestApi = async (endpoint, method = "GET", data, options) => {
+      const effectiveTimeoutMs = options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1e3, Math.min(Math.floor(options.timeoutMs), 3e4)) : 1e4;
       const config = await getXuiConfig();
-      let headers = await getXuiAuthHeaders(config);
+      let headers = await getXuiAuthHeaders(config, false, effectiveTimeoutMs);
       const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-      const client = createAxiosInstance(baseUrl, 1e4);
+      const client = createAxiosInstance(baseUrl, effectiveTimeoutMs);
       try {
         let response = await client.request({
           url: fullPath,
@@ -10379,7 +10445,7 @@ var init_xuiService = __esm({
         });
         if (response.status === 401 || response.status === 403 || response.status === 302 || response.status === 307) {
           cachedXuiAuth = null;
-          headers = await getXuiAuthHeaders(config, true);
+          headers = await getXuiAuthHeaders(config, true, effectiveTimeoutMs);
           response = await client.request({
             url: fullPath,
             method,
@@ -11135,10 +11201,31 @@ var init_xuiService = __esm({
     INBOUND_LOCK_LEASE_SECONDS = 45;
     isAutoActivateNewOrdersFlagEnabled = () => String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || "false").trim().toLowerCase() === "true";
     isAutoActivateRenewalsFlagEnabled = () => String(process.env.AUTO_ACTIVATE_RENEWALS_ENABLED || "false").trim().toLowerCase() === "true";
+    isPanelDeletionSyncFlagEnabled = () => String(process.env.PANEL_DELETION_SYNC_ENABLED || "false").trim().toLowerCase() === "true";
     isMissingSchemaOrRpcError = (err) => {
       const code = String(err?.code || "");
       const msg = String(err?.message || "").toLowerCase();
       return code === "PGRST202" || code === "PGRST205" || code === "42883" || code === "42P01" || msg.includes("could not find the function") || msg.includes("does not exist");
+    };
+    isTransientLockReleaseError = (err) => {
+      const code = String(err?.code || "").trim().toUpperCase();
+      const status = Number(err?.status ?? err?.statusCode ?? 0);
+      const name = String(err?.name || "").toLowerCase();
+      const msg = String(err?.message || err || "").toLowerCase();
+      if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
+        return true;
+      }
+      if (code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ECONNABORTED" || code === "EAI_AGAIN" || code === "40001" || // PostgreSQL serialization_failure
+      code === "40P01" || // PostgreSQL deadlock_detected
+      code === "57P01" || // admin_shutdown
+      code === "57P02" || // crash_shutdown
+      code === "57P03") {
+        return true;
+      }
+      if (name === "aborterror" || name === "timeouterror") {
+        return true;
+      }
+      return msg.includes("timeout") || msg.includes("timed out") || msg.includes("aborted") || msg.includes("etimedout") || msg.includes("econnreset") || msg.includes("econnrefused") || msg.includes("socket hang up") || msg.includes("fetch failed") || msg.includes("network error") || msg.includes("failed to fetch") || msg.includes("bad gateway") || msg.includes("service unavailable") || msg.includes("gateway timeout") || msg.includes("connection terminated") || msg.includes("deadlock detected") || msg.includes("could not serialize access");
     };
     provisionOrderClient = async (orderId, token, options) => {
       const isProvisionalActivation = Boolean(options?.provisional);
@@ -12998,13 +13085,13 @@ var init_xuiService = __esm({
       }
       return { ok: true, inboundId, clients, clientUuidSet };
     };
-    fetchUncachedLiveInboundById = async (inboundId) => {
+    fetchUncachedLiveInboundById = async (inboundId, options) => {
       const normalizedId = Number(inboundId);
       if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
         return { status: "error", reason: "invalid_inbound_id" };
       }
       try {
-        const res = await requestApi(`/panel/api/inbounds/get/${normalizedId}`, "GET");
+        const res = await requestApi(`/panel/api/inbounds/get/${normalizedId}`, "GET", void 0, options);
         const inbound = res && typeof res === "object" && "obj" in res ? res.obj : res;
         if (inbound === null || inbound === void 0) {
           return { status: "not_found" };
@@ -13032,9 +13119,9 @@ var init_xuiService = __esm({
         };
       }
     };
-    fetchUncachedLiveInboundsList = async () => {
+    fetchUncachedLiveInboundsList = async (options) => {
       try {
-        const rawList = await requestApi("/panel/api/inbounds/list", "GET");
+        const rawList = await requestApi("/panel/api/inbounds/list", "GET", void 0, options);
         if (!Array.isArray(rawList)) {
           return {
             ok: false,
@@ -13207,7 +13294,126 @@ var init_xuiService = __esm({
         return false;
       }
     };
+    isDefinitivePreCommitDeletionRpcError = (err) => {
+      if (!err) return false;
+      if (isMissingSchemaOrRpcError(err)) return true;
+      const code = String(err?.code || "").trim().toUpperCase();
+      const status = Number(err?.status ?? err?.statusCode ?? 0);
+      if (code === "42501" || // insufficient_privilege
+      code === "22P02" || // invalid_text_representation
+      code === "22003" || // numeric_value_out_of_range
+      code === "23502" || // not_null_violation
+      code === "23503" || // foreign_key_violation
+      code === "23505" || // unique_violation
+      code === "23514" || // check_violation
+      code === "P0001" || // explicit RAISE EXCEPTION in PL/pgSQL
+      code === "PGRST301" || // JWT / auth error
+      code === "PGRST204") {
+        return true;
+      }
+      if (status === 400 || status === 401 || status === 403 || status === 404 || status === 422) {
+        return true;
+      }
+      return false;
+    };
+    isAmbiguousDeletionRpcError = (err) => {
+      if (!err) return false;
+      if (isDefinitivePreCommitDeletionRpcError(err)) return false;
+      const code = String(err?.code || "").trim().toUpperCase();
+      const status = Number(err?.status ?? err?.statusCode ?? 0);
+      const name = String(err?.name || "").toLowerCase();
+      const msg = String(err?.message || err || "").toLowerCase();
+      if (status === 502 || status === 503 || status === 504 || status === 408) {
+        return true;
+      }
+      if (name === "aborterror" || name === "timeouterror" || code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ECONNABORTED" || code === "EPIPE" || code === "57014") {
+        return true;
+      }
+      if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("aborted") || msg.includes("etimedout") || msg.includes("econnreset") || msg.includes("econnrefused") || msg.includes("socket hang up") || msg.includes("fetch failed") || msg.includes("network error") || msg.includes("failed to fetch") || msg.includes("bad gateway") || msg.includes("service unavailable") || msg.includes("gateway timeout") || msg.includes("connection closed") || msg.includes("connection terminated") || msg.includes("unexpected end of json")) {
+        return true;
+      }
+      return true;
+    };
+    runWithStrictTimeout = async (promise, timeoutMs, label) => {
+      let timer = null;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              const err = new Error(`${label} timed out after ${timeoutMs}ms`);
+              err.code = "LOCKED_READ_TIMEOUT";
+              reject(err);
+            }, timeoutMs);
+          })
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    reconcileClientPanelDeletionState = async (params) => {
+      const { dbClient, clientUuid, userId } = params;
+      const normUuid = String(clientUuid || "").trim().toLowerCase();
+      const normUserId = String(userId || "").trim().toLowerCase();
+      if (!dbClient || typeof dbClient.from !== "function") {
+        return { status: "inconclusive", reason: "reconcile_db_client_unavailable" };
+      }
+      try {
+        const [accRes, cfgRes] = await Promise.all([
+          dbClient.from("vpn_accounts").select("id, user_id, uuid, status, enable, deleted_from_panel_at, reconciliation_required").ilike("uuid", normUuid),
+          dbClient.from("vpn_configs").select("id, customer_uid, user_id, uuid, status, enabled, deleted_from_panel_at, reconciliation_required").ilike("uuid", normUuid)
+        ]);
+        if (accRes?.error) {
+          return { status: "inconclusive", reason: `reconcile_vpn_accounts_error:${accRes.error.message || "unknown"}` };
+        }
+        let cfgRows = [];
+        if (cfgRes?.error) {
+          const cfgErrMsg = String(cfgRes.error.message || "").toLowerCase();
+          if (cfgErrMsg.includes("user_id") && cfgErrMsg.includes("does not exist")) {
+            const retryCfg = await dbClient.from("vpn_configs").select("id, customer_uid, uuid, status, enabled, deleted_from_panel_at, reconciliation_required").ilike("uuid", normUuid);
+            if (retryCfg?.error) {
+              return { status: "inconclusive", reason: `reconcile_vpn_configs_error:${retryCfg.error.message || "unknown"}` };
+            }
+            cfgRows = Array.isArray(retryCfg?.data) ? retryCfg.data : [];
+          } else {
+            return { status: "inconclusive", reason: `reconcile_vpn_configs_error:${cfgRes.error.message || "unknown"}` };
+          }
+        } else {
+          cfgRows = Array.isArray(cfgRes?.data) ? cfgRes.data : [];
+        }
+        const accRows = Array.isArray(accRes?.data) ? accRes.data : [];
+        const matchedAccs = normUserId ? accRows.filter((r) => String(r?.user_id || "").trim().toLowerCase() === normUserId) : accRows;
+        const matchedCfgs = normUserId ? cfgRows.filter((r) => {
+          const cuid = String(r?.customer_uid || "").trim().toLowerCase();
+          const uid = String(r?.user_id || "").trim().toLowerCase();
+          return cuid === normUserId || uid === normUserId;
+        }) : cfgRows;
+        if (matchedAccs.length === 0 && matchedCfgs.length === 0) {
+          return { status: "inconclusive", reason: "reconcile_no_matching_customer_rows" };
+        }
+        const allAccsCommitted = matchedAccs.every(
+          (r) => String(r?.status || "").trim().toLowerCase() === "deleted" && Boolean(r?.deleted_from_panel_at) && r?.enable === false
+        );
+        const allCfgsCommitted = matchedCfgs.every(
+          (r) => String(r?.status || "").trim().toLowerCase() === "deleted" && Boolean(r?.deleted_from_panel_at) && r?.enabled === false
+        );
+        if (allAccsCommitted && allCfgsCommitted) {
+          const reconciliationRequired = matchedAccs.some((r) => Boolean(r?.reconciliation_required)) || matchedCfgs.some((r) => Boolean(r?.reconciliation_required));
+          return { status: "confirmed_committed", reconciliationRequired };
+        }
+        return { status: "inconclusive", reason: "reconcile_rows_not_confirmed_deleted" };
+      } catch (err) {
+        return { status: "inconclusive", reason: `reconcile_exception:${err?.message || "unknown"}` };
+      }
+    };
     verifyAndMarkClientDeletedIfConfirmed = async (params) => {
+      if (!isPanelDeletionSyncFlagEnabled()) {
+        return {
+          confirmedDeleted: false,
+          dbWrites: 0,
+          reason: "panel_deletion_sync_disabled"
+        };
+      }
       const normUuid = String(params.clientUuid || "").trim().toLowerCase();
       if (!normUuid) {
         return { confirmedDeleted: false, dbWrites: 0, reason: "missing_client_uuid" };
@@ -13287,8 +13493,10 @@ var init_xuiService = __esm({
       const readInbound = params.fetchUncachedInbound || fetchUncachedLiveInboundById;
       const readList = params.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
       const reReadDelayMs = params.reReadDelayMs ?? 150;
-      const performSingleAuthoritativeAbsenceRead = async (readLabel) => {
-        const directRes = await readInbound(inboundId);
+      const lockedReadTimeoutMs = params.lockedReadTimeoutMs !== void 0 && Number.isFinite(params.lockedReadTimeoutMs) && params.lockedReadTimeoutMs > 0 ? Math.min(Math.floor(params.lockedReadTimeoutMs), 15e3) : 8e3;
+      const performSingleAuthoritativeAbsenceRead = async (readLabel, timeoutMs) => {
+        const readOpts = timeoutMs ? { timeoutMs } : void 0;
+        const directRes = timeoutMs ? await runWithStrictTimeout(readInbound(inboundId, readOpts), timeoutMs, `${readLabel}_direct_inbound_read`) : await readInbound(inboundId);
         if (directRes.status === "error") {
           return { absent: false, reason: `${readLabel}_error:${directRes.reason}` };
         }
@@ -13298,7 +13506,7 @@ var init_xuiService = __esm({
           }
           return { absent: true, reason: `${readLabel}_confirmed_absent_from_inbound` };
         }
-        const listRes = await readList();
+        const listRes = timeoutMs ? await runWithStrictTimeout(readList(readOpts), timeoutMs, `${readLabel}_inbounds_list_read`) : await readList();
         if (!listRes.ok || !listRes.allInboundsCleanlyParsed || listRes.inbounds.length === 0) {
           return {
             absent: false,
@@ -13317,6 +13525,64 @@ var init_xuiService = __esm({
         }
         return { absent: true, inboundMissing: true, reason: `${readLabel}_inbound_and_client_confirmed_absent` };
       };
+      let read1;
+      try {
+        read1 = await performSingleAuthoritativeAbsenceRead("read1");
+      } catch (read1Err) {
+        return {
+          confirmedDeleted: false,
+          dbWrites: 0,
+          reason: `read1_error:${read1Err?.message || "panel_read_failed"}`
+        };
+      }
+      if (!read1.absent) {
+        return {
+          confirmedDeleted: false,
+          dbWrites: 0,
+          reason: read1.reason
+        };
+      }
+      if (reReadDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, reReadDelayMs));
+      }
+      if (dbClient && typeof dbClient.from === "function") {
+        try {
+          const { data: activeOps, error: precheckErr } = await dbClient.from("provisioning_operations").select("operation_key, status, operation_type").in("operation_key", [`client:${normUuid}`, `inbound:${inboundId}`]).in("status", ["in_progress", "uncertain"]);
+          if (precheckErr && !isMissingSchemaOrRpcError(precheckErr)) {
+            console.warn(
+              `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid}: read-only lock pre-check failed (${precheckErr.message || "unknown"}).`
+            );
+            return {
+              confirmedDeleted: false,
+              dbWrites: 0,
+              reason: `lock_precheck_error:${precheckErr.message || "unknown"}`
+            };
+          }
+          if (Array.isArray(activeOps) && activeOps.length > 0) {
+            const uncertainOp = activeOps.find((op) => String(op?.status || "").toLowerCase() === "uncertain");
+            const blockingOp = uncertainOp || activeOps[0];
+            const blockStatus = String(blockingOp?.status || "in_progress").toLowerCase();
+            const blockKey = String(blockingOp?.operation_key || "unknown");
+            console.log(
+              `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid}: read-only pre-check found ${blockStatus} lock on ${blockKey}.`
+            );
+            return {
+              confirmedDeleted: false,
+              dbWrites: 0,
+              reason: `lock_precheck_${blockStatus}:${blockKey}`
+            };
+          }
+        } catch (precheckExc) {
+          console.warn(
+            `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid}: read-only lock pre-check threw (${precheckExc?.message || "unknown"}).`
+          );
+          return {
+            confirmedDeleted: false,
+            dbWrites: 0,
+            reason: `lock_precheck_error:${precheckExc?.message || "unknown"}`
+          };
+        }
+      }
       try {
         return await withClientMutationLock(
           {
@@ -13326,6 +13592,7 @@ var init_xuiService = __esm({
             targetId: `panel-delete-sync:${normUuid}`,
             requireDurableLock: true,
             allowUncertainRecovery: false,
+            releaseRetryBaseDelayMs: params.releaseRetryBaseDelayMs,
             metadata: {
               syncSource: params.source || "background_sync",
               inboundId,
@@ -13341,25 +13608,22 @@ var init_xuiService = __esm({
                 clientUuid: normUuid,
                 requireDurableLock: true,
                 allowUncertainRecovery: false,
+                noExternalXuiWrite: true,
+                releaseRetryBaseDelayMs: params.releaseRetryBaseDelayMs,
                 maxWaitMs: 2e3
               },
               async (assertInboundLockStillHeld) => {
                 await assertClientLockStillHeld();
                 await assertInboundLockStillHeld();
-                const read1 = await performSingleAuthoritativeAbsenceRead("read1");
-                if (!read1.absent) {
-                  return {
-                    confirmedDeleted: false,
-                    dbWrites: 0,
-                    reason: read1.reason
-                  };
+                let read2;
+                try {
+                  read2 = await performSingleAuthoritativeAbsenceRead("read2", lockedReadTimeoutMs);
+                } catch (read2Err) {
+                  const preRpcReadErr = new Error(`read2_error:${read2Err?.message || "locked_read_failed"}`);
+                  preRpcReadErr.code = "READ_ONLY_PANEL_FAILURE";
+                  preRpcReadErr.nonUncertainDeletionError = true;
+                  throw preRpcReadErr;
                 }
-                if (reReadDelayMs > 0) {
-                  await new Promise((r) => setTimeout(r, reReadDelayMs));
-                }
-                await assertClientLockStillHeld();
-                await assertInboundLockStillHeld();
-                const read2 = await performSingleAuthoritativeAbsenceRead("read2");
                 if (!read2.absent) {
                   return {
                     confirmedDeleted: false,
@@ -13367,6 +13631,8 @@ var init_xuiService = __esm({
                     reason: read2.reason
                   };
                 }
+                await assertClientLockStillHeld();
+                await assertInboundLockStillHeld();
                 const reason = "confirmed_absent_two_fresh_uncached_reads";
                 const details = {
                   source: params.source || "background_sync",
@@ -13379,12 +13645,10 @@ var init_xuiService = __esm({
                   console.error(
                     `[3X-UI Sync] Fail closed for ${normUuid}: atomic deletion RPC client is unavailable.`
                   );
-                  return {
-                    confirmedDeleted: false,
-                    applied: false,
-                    dbWrites: 0,
-                    reason: "rpc_unavailable"
-                  };
+                  const unavailErr = new Error("rpc_unavailable");
+                  unavailErr.code = "DEFINITIVE_RPC_NO_WRITE";
+                  unavailErr.nonUncertainDeletionError = true;
+                  throw unavailErr;
                 }
                 let rpcData = null;
                 let rpcErr = null;
@@ -13403,28 +13667,75 @@ var init_xuiService = __esm({
                   rpcErr = rpcException;
                 }
                 if (rpcErr) {
-                  console.error(
-                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted RPC unavailable or failed for ${normUuid}:`,
-                    rpcErr?.message || rpcErr
+                  if (!isAmbiguousDeletionRpcError(rpcErr)) {
+                    console.error(
+                      `[3X-UI Sync] Fail closed (definitive no-write RPC error) for ${normUuid}:`,
+                      rpcErr?.message || rpcErr
+                    );
+                    const defErr = new Error(
+                      isMissingSchemaOrRpcError(rpcErr) ? `rpc_missing:${rpcErr?.message || "not_installed"}` : `rpc_error:${rpcErr?.message || "unknown"}`
+                    );
+                    defErr.code = "DEFINITIVE_RPC_NO_WRITE";
+                    defErr.nonUncertainDeletionError = true;
+                    throw defErr;
+                  }
+                  console.warn(
+                    `[3X-UI Sync] Ambiguous mark_vpn_client_panel_deleted RPC error for ${normUuid} (${rpcErr?.message || rpcErr}). Running authoritative DB reconciliation...`
                   );
-                  return {
-                    confirmedDeleted: false,
-                    applied: false,
-                    dbWrites: 0,
-                    reason: isMissingSchemaOrRpcError(rpcErr) ? `rpc_missing:${rpcErr?.message || "not_installed"}` : `rpc_error:${rpcErr?.message || "unknown"}`
-                  };
+                  const recon = await reconcileClientPanelDeletionState({
+                    dbClient,
+                    clientUuid: normUuid,
+                    userId: params.userId || null
+                  });
+                  if (recon.status === "confirmed_committed") {
+                    console.log(
+                      `[3X-UI Sync] Authoritative reconciliation confirmed deletion commit for ${normUuid}; releasing locks cleanly.`
+                    );
+                    invalidateInboundCache(inboundId);
+                    return {
+                      confirmedDeleted: true,
+                      applied: true,
+                      reconciledAfterAmbiguousRpc: true,
+                      reconciliationRequired: recon.reconciliationRequired,
+                      dbWrites: 1,
+                      reason: "confirmed_committed_after_rpc_reconciliation"
+                    };
+                  }
+                  console.error(
+                    `[3X-UI Sync] Authoritative reconciliation inconclusive for ${normUuid} (${recon.reason}) after ambiguous RPC error (${rpcErr?.message || "unknown"}). Preserving client lock as uncertain.`
+                  );
+                  const uncErr = new Error(
+                    `rpc_outcome_uncertain:${rpcErr?.message || "ambiguous_rpc_error"}|${recon.reason}`
+                  );
+                  uncErr.code = "RPC_OUTCOME_UNCERTAIN";
+                  uncErr.mutationUncertain = true;
+                  throw uncErr;
                 }
                 const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
                 if (!row || typeof row !== "object") {
-                  console.error(
-                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted returned empty response for ${normUuid}.`
+                  console.warn(
+                    `[3X-UI Sync] Empty response from mark_vpn_client_panel_deleted for ${normUuid}. Running authoritative DB reconciliation...`
                   );
-                  return {
-                    confirmedDeleted: false,
-                    applied: false,
-                    dbWrites: 0,
-                    reason: "rpc_empty_response"
-                  };
+                  const recon = await reconcileClientPanelDeletionState({
+                    dbClient,
+                    clientUuid: normUuid,
+                    userId: params.userId || null
+                  });
+                  if (recon.status === "confirmed_committed") {
+                    invalidateInboundCache(inboundId);
+                    return {
+                      confirmedDeleted: true,
+                      applied: true,
+                      reconciledAfterAmbiguousRpc: true,
+                      reconciliationRequired: recon.reconciliationRequired,
+                      dbWrites: 1,
+                      reason: "confirmed_committed_after_empty_rpc_reconciliation"
+                    };
+                  }
+                  const emptyUncErr = new Error(`rpc_empty_response_uncertain:${recon.reason}`);
+                  emptyUncErr.code = "RPC_OUTCOME_UNCERTAIN";
+                  emptyUncErr.mutationUncertain = true;
+                  throw emptyUncErr;
                 }
                 if (row.skip_reason && !row.already_deleted) {
                   console.warn(
@@ -13469,9 +13780,26 @@ var init_xuiService = __esm({
           }
         );
       } catch (lockErr) {
+        if (lockErr?.mutationUncertain === true) {
+          return {
+            confirmedDeleted: false,
+            applied: false,
+            mutationUncertain: true,
+            dbWrites: 0,
+            reason: lockErr?.message || "rpc_outcome_uncertain"
+          };
+        }
+        if (lockErr?.nonUncertainDeletionError === true) {
+          return {
+            confirmedDeleted: false,
+            applied: false,
+            dbWrites: 0,
+            reason: lockErr?.message || "deletion_verification_failed"
+          };
+        }
         const code = String(lockErr?.code || "").trim();
         console.log(
-          `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid} due to active/uncertain lock (${code || lockErr?.message || "busy"}).`
+          `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid} due to active/uncertain lock or lost lease (${code || lockErr?.message || "busy"}).`
         );
         return {
           confirmedDeleted: false,
@@ -13561,6 +13889,21 @@ var init_xuiService = __esm({
       return true;
     };
     syncDeleted3XUiClients = async (options) => {
+      if (!isPanelDeletionSyncFlagEnabled()) {
+        console.log(
+          "[3X-UI Sync] Panel deletion synchronization is disabled (PANEL_DELETION_SYNC_ENABLED !== true). Skipping cycle with zero panel reads and zero lock acquisitions."
+        );
+        return {
+          synced: false,
+          skippedDisabled: true,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0,
+          details: []
+        };
+      }
       console.log("[3X-UI Sync] Starting authoritative VPN client synchronization with 3X-UI panel...");
       const dbClient = options?.dbClient || supabaseAdmin;
       const readList = options?.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
@@ -13851,6 +14194,8 @@ var init_xuiService = __esm({
             fetchUncachedInbound: readInbound,
             fetchUncachedInboundsList: readList,
             reReadDelayMs: options?.reReadDelayMs,
+            lockedReadTimeoutMs: options?.lockedReadTimeoutMs,
+            releaseRetryBaseDelayMs: options?.releaseRetryBaseDelayMs,
             nowMs
           });
           if (verifyRes.confirmedDeleted) {
@@ -15806,7 +16151,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
     const expectedInboundCleanlyFetched = Boolean(
       inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId)) || liveFullListFetched && liveFullListCleanlyParsed
     );
-    if (!matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
+    if (isPanelDeletionSyncFlagEnabled() && !matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
       const delCheck = await verifyDeleted({
         clientUuid: normUuid,
         inboundId,

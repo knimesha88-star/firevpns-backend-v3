@@ -23,6 +23,19 @@ const PAST_CREATED_AT = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 const FUTURE_EXPIRY_MS = Date.now() + 15 * 24 * 60 * 60 * 1000;
 const EXPIRED_EXPIRY_MS = Date.now() - 2 * 24 * 60 * 60 * 1000;
 
+let prevDeletionSyncEnv: string | undefined;
+test.beforeEach(() => {
+  prevDeletionSyncEnv = process.env.PANEL_DELETION_SYNC_ENABLED;
+  process.env.PANEL_DELETION_SYNC_ENABLED = 'true';
+});
+test.afterEach(() => {
+  if (prevDeletionSyncEnv === undefined) {
+    delete process.env.PANEL_DELETION_SYNC_ENABLED;
+  } else {
+    process.env.PANEL_DELETION_SYNC_ENABLED = prevDeletionSyncEnv;
+  }
+});
+
 interface MockDbState {
   vpn_accounts: any[];
   vpn_configs: any[];

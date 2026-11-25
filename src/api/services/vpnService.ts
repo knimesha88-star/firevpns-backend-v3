@@ -6,6 +6,7 @@ import {
   resetClientTraffic,
   parseInboundSettingsClientsStrict,
   verifyAndMarkClientDeletedIfConfirmed,
+  isPanelDeletionSyncFlagEnabled,
   isSafeToRestoreActiveStatus,
   getCurrentPanelIdentity,
 } from './xuiService.js';
@@ -877,9 +878,10 @@ export const getMyConfigs = async (
       (liveFullListFetched && liveFullListCleanlyParsed)
     );
 
-    // If client was NOT found on a cleanly-parsed live inbound, perform authoritative two-read locked verification
-    // before excluding it from customer views. Never exclude on timeout, malformed JSON, wrong panel, or lock contention!
-    if (!matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
+    // If panel deletion sync is explicitly enabled AND client was NOT found on a cleanly-parsed live inbound,
+    // perform authoritative two-read locked verification before excluding it from customer views.
+    // Never exclude on timeout, malformed JSON, wrong panel, or lock contention.
+    if (isPanelDeletionSyncFlagEnabled() && !matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
       const delCheck = await verifyDeleted({
         clientUuid: normUuid,
         inboundId,
