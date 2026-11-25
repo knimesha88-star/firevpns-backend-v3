@@ -437,18 +437,101 @@ export const getInbounds = async (forceRefresh: boolean = false): Promise<XuiInb
   }
 };
 
-export const getLiveInbound = async (inboundId: number): Promise<XuiInbound | null> => {
-  try {
-    console.log(`[XUI Service] Fetching live inbound ${inboundId} directly for dashboard query...`);
-    const res = await requestApi<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
-    const inbound = res?.obj || res;
-    if (inbound && typeof inbound === 'object' && inbound.id !== undefined) {
-      return inbound as XuiInbound;
-    }
-  } catch (err: any) {
-    console.warn(`[XUI Service] Failed to fetch live inbound ${inboundId} directly:`, err.message || err);
+const LIVE_INBOUND_CACHE_TTL_MS = 10 * 1000; // 10 seconds short TTL for near-real-time status without excessive 3X-UI load
+const liveInboundCache = new Map<number, { inbound: XuiInbound; fetchedAt: number }>();
+const liveInboundInFlight = new Map<number, { generation: number; promise: Promise<XuiInbound | null> }>();
+let liveInboundCacheGeneration = 0;
+
+/**
+ * Invalidate cached 3X-UI inbound snapshots immediately after provisioning, revocation,
+ * renewal, disable, or traffic reset operations so stale Active status is never returned.
+ */
+export const invalidateInboundCache = (inboundId?: number | null): void => {
+  liveInboundCacheGeneration += 1;
+  const numericId = inboundId !== undefined && inboundId !== null ? Number(inboundId) : NaN;
+  if (!Number.isNaN(numericId) && numericId > 0) {
+    liveInboundCache.delete(numericId);
+    liveInboundInFlight.delete(numericId);
+  } else {
+    liveInboundCache.clear();
+    liveInboundInFlight.clear();
   }
-  return null;
+  // Force next getInbounds() call to refresh from 3X-UI rather than serving pre-mutation metadata
+  lastInboundsCacheTime = 0;
+};
+
+export const getLiveInbound = async (
+  inboundId: number,
+  options?: boolean | { forceRefresh?: boolean; fetcher?: (id: number) => Promise<XuiInbound | null> }
+): Promise<XuiInbound | null> => {
+  const normalizedId = Number(inboundId);
+  if (Number.isNaN(normalizedId) || normalizedId <= 0) {
+    return null;
+  }
+
+  const forceRefresh = typeof options === 'boolean' ? options : Boolean(options?.forceRefresh);
+  const customFetcher = typeof options === 'object' ? options?.fetcher : undefined;
+  const now = Date.now();
+
+  if (!forceRefresh) {
+    const cachedEntry = liveInboundCache.get(normalizedId);
+    if (cachedEntry && now - cachedEntry.fetchedAt < LIVE_INBOUND_CACHE_TTL_MS) {
+      return cachedEntry.inbound;
+    }
+
+    const inFlight = liveInboundInFlight.get(normalizedId);
+    if (inFlight && inFlight.generation === liveInboundCacheGeneration) {
+      return inFlight.promise;
+    }
+  }
+
+  const requestGeneration = liveInboundCacheGeneration;
+
+  const fetchPromise = (async (): Promise<XuiInbound | null> => {
+    try {
+      let inbound: any = null;
+      if (customFetcher) {
+        inbound = await customFetcher(normalizedId);
+      } else {
+        console.log(`[XUI Service] Fetching live inbound ${normalizedId} directly for dashboard query...`);
+        const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET');
+        inbound = res?.obj || res;
+      }
+
+      if (inbound && typeof inbound === 'object' && inbound.id !== undefined) {
+        // Only populate cache if no invalidation occurred while this request was in-flight
+        if (requestGeneration === liveInboundCacheGeneration) {
+          liveInboundCache.set(normalizedId, {
+            inbound: inbound as XuiInbound,
+            fetchedAt: Date.now(),
+          });
+        }
+        return inbound as XuiInbound;
+      }
+    } catch (err: any) {
+      console.warn(`[XUI Service] Failed to fetch live inbound ${normalizedId} directly:`, err?.message || err);
+    }
+
+    // Do not retain stale cached inbound when live panel check fails
+    if (requestGeneration === liveInboundCacheGeneration) {
+      liveInboundCache.delete(normalizedId);
+    }
+    return null;
+  })();
+
+  liveInboundInFlight.set(normalizedId, {
+    generation: requestGeneration,
+    promise: fetchPromise,
+  });
+
+  try {
+    return await fetchPromise;
+  } finally {
+    const currentInFlight = liveInboundInFlight.get(normalizedId);
+    if (currentInFlight && currentInFlight.promise === fetchPromise) {
+      liveInboundInFlight.delete(normalizedId);
+    }
+  }
 };
 
 export const getClientByEmail = async (email: string): Promise<any | null> => {
@@ -968,6 +1051,8 @@ export const updateClientExpiry = async (
       console.log(
         `[updateClientExpiry] Verified 3X-UI client ${uuid} on inbound ${inbound.id}: enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}`
       );
+
+      invalidateInboundCache(Number(inbound.id));
 
       return {
         new_expiryMs: expectedExpiryTime,
@@ -2658,6 +2743,7 @@ export const provisionOrderClient = async (
       }
 
       xuiWriteConfirmed = true;
+      invalidateInboundCache(Number(inboundId));
     }
   );
 
@@ -3389,6 +3475,7 @@ export const revokeProvisionalOrderClient = async (
                 `Read-back verification failed for provisional client ${clientUuid} on inbound ${inboundId}: expected enable=false, got ${String(verifiedClient?.enable)}.`
               );
             }
+            invalidateInboundCache(inboundId);
           } else if (dbGrant.status !== 'provisioning') {
             // Client missing on expected inbound; double-check across all inbounds so we don't miss a moved client
             const allFresh = await getInboundsCall(true);
@@ -3459,6 +3546,7 @@ export const revokeProvisionalOrderClient = async (
       .eq('id', order.id);
 
     await releaseOwnedLock('completed', null, { revoked: true, inboundId, reason });
+    invalidateInboundCache(inboundId);
 
     return {
       revoked: true,
@@ -3528,6 +3616,7 @@ export const disable3XUiClient = async (inboundId: number | null, uuid: string, 
 
           if (endpoint.includes('delClient')) {
             await client.post(fullPath, {}, { headers: { Authorization: `Bearer ${token}` } });
+            invalidateInboundCache(inboundId);
             return true;
           } else {
             const payload = {
@@ -3543,7 +3632,10 @@ export const disable3XUiClient = async (inboundId: number | null, uuid: string, 
               })
             };
             const res = await client.post(fullPath, payload, { headers: { Authorization: `Bearer ${token}` } });
-            if (res.data && (res.data.success || res.status === 200)) return true;
+            if (res.data && (res.data.success || res.status === 200)) {
+              invalidateInboundCache(inboundId);
+              return true;
+            }
           }
         } catch (e) {
           // Continue to next endpoint
@@ -4258,6 +4350,7 @@ export const resetClientTraffic = async (
     }
 
     // Invalidate inbounds cache so that subsequent queries immediately retrieve updated 0 byte traffic stats
+    invalidateInboundCache(resolvedInboundId || inboundId || null);
     try {
       await getInbounds(true);
     } catch (refreshErr: any) {

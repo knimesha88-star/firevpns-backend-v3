@@ -26,20 +26,27 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
   const myConfigsRes = await vpnService.getMyConfigs(uid || '', email, token);
   const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
 
-  // Only include configurations that have a real UUID, configUrl, and are not pending/rejected/deleted
+  // Only include configurations that have a real UUID, configUrl, and are not pending/rejected/deleted/revoked
   const myConfigs = rawConfigs.filter((c: any) => {
     if (!c || !c.uuid || !c.configUrl) return false;
-    const st = String(c.status || '').toLowerCase();
-    if (st === 'pending' || st === 'rejected' || st === 'deleted' || st === 'cancelled') return false;
+    const st = String(c.status || '').toLowerCase().trim();
+    if (st === 'pending' || st === 'rejected' || st === 'deleted' || st === 'cancelled' || st === 'revoked') return false;
     return true;
   });
 
   if (myConfigs.length > 0) {
-    // Prefer active (non-expired) configs when selecting a default
+    // Prefer verified active configs when selecting a default, while keeping disabled/expired/unavailable configs visible
     const now = Date.now();
     const activeOnly = myConfigs.filter((c: any) => {
-      const st = String(c.status || '').toLowerCase();
-      if (st === 'expired' || st === 'disabled' || c.enableStatus === false) return false;
+      const st = String(c.status || '').toLowerCase().trim();
+      if (
+        st !== 'active' ||
+        c.enableStatus !== true ||
+        c.enable === false ||
+        c.panelStatusVerified === false
+      ) {
+        return false;
+      }
       if (c.expiryDate) {
         const expMs = new Date(c.expiryDate).getTime();
         if (!isNaN(expMs) && expMs > 0 && expMs <= now) return false;
@@ -47,56 +54,65 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
       return true;
     });
 
-    let activeConfig = null;
+    let selectedConfig = null;
 
     if (activeUuid) {
-      activeConfig = activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase())
+      selectedConfig = activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase())
         || myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
     }
 
-    if (!activeConfig) {
-      activeConfig = activeOnly[0] || null;
+    if (!selectedConfig) {
+      selectedConfig = activeOnly[0] || myConfigs[0] || null;
     }
 
-    if (activeConfig) {
+    if (selectedConfig) {
       return {
         email,
-        uuid: activeConfig.uuid,
-        inboundId: activeConfig.inboundId,
-        remark: activeConfig.serverNode || 'FIREVPN Server',
-        upload: activeConfig.upload !== undefined ? activeConfig.upload : (activeConfig.upBytes || 0),
-        download: activeConfig.download !== undefined ? activeConfig.download : (activeConfig.downBytes || 0),
-        upBytes: activeConfig.upBytes !== undefined ? activeConfig.upBytes : (activeConfig.upload || 0),
-        downBytes: activeConfig.downBytes !== undefined ? activeConfig.downBytes : (activeConfig.download || 0),
-        totalTraffic: activeConfig.totalTrafficBytes !== undefined ? activeConfig.totalTrafficBytes : (activeConfig.totalTraffic || 0),
-        remainingTraffic: activeConfig.remainingTrafficBytes !== undefined ? activeConfig.remainingTrafficBytes : (activeConfig.remainingTraffic || 0),
-        usedGB: activeConfig.usedGB,
-        remainingGB: activeConfig.remainingGB,
-        trafficLimit: activeConfig.trafficLimit,
-        expiryTime: activeConfig.expiryDate || activeConfig.expiryTime || 0,
-        expiryDate: activeConfig.expiryDate || activeConfig.expiryTime || '',
-        enableStatus: activeConfig.enableStatus,
-        onlineStatus: activeConfig.onlineStatus,
-        lastOnline: activeConfig.lastOnline || 0,
+        uuid: selectedConfig.uuid,
+        orderId: selectedConfig.orderId,
+        inboundId: selectedConfig.inboundId,
+        remark: selectedConfig.serverNode || 'FIREVPN Server',
+        upload: selectedConfig.upload !== undefined ? selectedConfig.upload : (selectedConfig.upBytes || 0),
+        download: selectedConfig.download !== undefined ? selectedConfig.download : (selectedConfig.downBytes || 0),
+        upBytes: selectedConfig.upBytes !== undefined ? selectedConfig.upBytes : (selectedConfig.upload || 0),
+        downBytes: selectedConfig.downBytes !== undefined ? selectedConfig.downBytes : (selectedConfig.download || 0),
+        totalTraffic: selectedConfig.totalTrafficBytes !== undefined ? selectedConfig.totalTrafficBytes : (selectedConfig.totalTraffic || 0),
+        totalTrafficBytes: selectedConfig.totalTrafficBytes !== undefined ? selectedConfig.totalTrafficBytes : (selectedConfig.totalTraffic || 0),
+        remainingTraffic: selectedConfig.remainingTrafficBytes !== undefined ? selectedConfig.remainingTrafficBytes : (selectedConfig.remainingTraffic || 0),
+        remainingTrafficBytes: selectedConfig.remainingTrafficBytes !== undefined ? selectedConfig.remainingTrafficBytes : (selectedConfig.remainingTraffic || 0),
+        usedGB: selectedConfig.usedGB,
+        remainingGB: selectedConfig.remainingGB,
+        trafficLimit: selectedConfig.trafficLimit,
+        expiryTime: selectedConfig.expiryDate || selectedConfig.expiryTime || 0,
+        expiryDate: selectedConfig.expiryDate || selectedConfig.expiryTime || '',
+        enable: selectedConfig.enable,
+        enableStatus: selectedConfig.enableStatus,
+        panelStatusVerified: selectedConfig.panelStatusVerified,
+        statusReason: selectedConfig.statusReason,
+        onlineStatus: selectedConfig.onlineStatus,
+        lastOnline: selectedConfig.lastOnline || 0,
         subId: '',
-        port: activeConfig.port || 443,
-        protocol: activeConfig.protocol || 'vless',
-        network: activeConfig.network || 'tcp',
-        security: activeConfig.security || 'none',
-        serverAddress: activeConfig.serverAddress || 'singapore.firevpn.com',
-        serverName: activeConfig.serverNode || 'Singapore',
-        subscriptionName: activeConfig.packageName || 'FIREVPN Package',
-        packageName: activeConfig.packageName || 'FIREVPN Package',
-        name: activeConfig.packageName || 'FIREVPN Package',
-        connectionUri: activeConfig.configUrl,
-        configUrl: activeConfig.configUrl,
-        uri: activeConfig.configUrl,
-        status: activeConfig.status
+        port: selectedConfig.port || 443,
+        protocol: selectedConfig.protocol || 'vless',
+        network: selectedConfig.network || 'tcp',
+        security: selectedConfig.security || 'none',
+        serverAddress: selectedConfig.serverAddress || 'singapore.firevpn.com',
+        serverName: selectedConfig.serverNode || 'Singapore',
+        serverNode: selectedConfig.serverNode || 'Singapore',
+        subscriptionName: selectedConfig.packageName || 'FIREVPN Package',
+        packageName: selectedConfig.packageName || 'FIREVPN Package',
+        name: selectedConfig.packageName || 'FIREVPN Package',
+        connectionUri: selectedConfig.configUrl,
+        configUrl: selectedConfig.configUrl,
+        uri: selectedConfig.configUrl,
+        status: selectedConfig.status,
+        paymentStatus: selectedConfig.paymentStatus || null,
+        provisioningStatus: selectedConfig.provisioningStatus || null,
       };
     }
   }
 
-  // Do not fall back to unlinked 3X-UI email lookup; return null when customer has no real active VPN configurations in Supabase
+  // Do not fall back to unlinked 3X-UI email lookup; return null when customer has no real valid VPN configurations in Supabase
   return null;
 };
 

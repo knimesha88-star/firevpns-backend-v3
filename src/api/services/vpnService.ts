@@ -1,7 +1,116 @@
-import { supabase, getSupabaseClient } from '../../lib/supabase.js';
+import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.js';
 import { getCachedInbounds, getLiveInbound, getInbounds, resetClientTraffic } from './xuiService.js';
 import { createCustomerNotification } from './notificationService.js';
 import crypto from 'crypto';
+
+export type VpnObservedStatus =
+  | 'Active'
+  | 'Disabled'
+  | 'Expired'
+  | 'Data Limit Reached'
+  | 'Status Unavailable';
+
+export interface EvaluateVpnClientStatusInput {
+  panelReachable: boolean;
+  inboundFound: boolean;
+  inboundEnable?: boolean | null;
+  clientFound: boolean;
+  clientEnable?: boolean | null;
+  statEnable?: boolean | null;
+  upBytes?: number;
+  downBytes?: number;
+  totalLimitBytes?: number;
+  expiryTimeMs?: number | null;
+  nowMs?: number;
+}
+
+export interface EvaluateVpnClientStatusResult {
+  status: VpnObservedStatus;
+  panelStatusVerified: boolean;
+  effectiveEnable: boolean | null;
+  enableStatus: boolean;
+  isExpiredByTime: boolean;
+  isDataLimitReached: boolean;
+  isManuallyDisabled: boolean;
+  isInboundDisabled: boolean;
+  isUnlimited: boolean;
+  statusReason: string;
+}
+
+/**
+ * Pure deterministic evaluator for observed 3X-UI VPN client status.
+ * Never lets stale clientStats.enable=true override settings.clients[].enable=false
+ * or a disabled inbound, and never reports unverified/unreachable state as Active.
+ */
+export const evaluateVpnClientStatus = (
+  input: EvaluateVpnClientStatusInput
+): EvaluateVpnClientStatusResult => {
+  const nowMs = input.nowMs ?? Date.now();
+  const up = Math.max(0, Number(input.upBytes || 0) || 0);
+  const down = Math.max(0, Number(input.downBytes || 0) || 0);
+  const totalUsed = up + down;
+  const totalLimit = Math.max(0, Number(input.totalLimitBytes || 0) || 0);
+  const isUnlimited = totalLimit <= 0;
+  const isDataLimitReached = !isUnlimited && totalUsed >= totalLimit;
+  const expMs = input.expiryTimeMs ?? 0;
+  const isExpiredByTime = (expMs > 0 && expMs <= nowMs) || expMs < 0;
+
+  if (!input.panelReachable || !input.inboundFound || !input.clientFound) {
+    return {
+      status: 'Status Unavailable',
+      panelStatusVerified: false,
+      effectiveEnable: null,
+      enableStatus: false,
+      isExpiredByTime,
+      isDataLimitReached,
+      isManuallyDisabled: false,
+      isInboundDisabled: false,
+      isUnlimited,
+      statusReason: !input.panelReachable
+        ? 'panel_unreachable'
+        : !input.inboundFound
+          ? 'inbound_unavailable'
+          : 'client_unverified',
+    };
+  }
+
+  const isInboundDisabled = input.inboundEnable === false;
+  const isClientSettingDisabled = input.clientEnable === false;
+  const isStatDisabled = input.statEnable === false;
+  const effectiveEnable = !isInboundDisabled && !isClientSettingDisabled && !isStatDisabled;
+  const isManuallyDisabled = isInboundDisabled || isClientSettingDisabled || isStatDisabled;
+
+  let status: VpnObservedStatus = 'Active';
+  let statusReason = 'active';
+
+  if (isExpiredByTime) {
+    status = 'Expired';
+    statusReason = 'expired';
+  } else if (isDataLimitReached) {
+    status = 'Data Limit Reached';
+    statusReason = 'data_limit_reached';
+  } else if (!effectiveEnable) {
+    status = 'Disabled';
+    statusReason = isInboundDisabled
+      ? 'inbound_disabled'
+      : isClientSettingDisabled
+        ? 'client_disabled'
+        : 'traffic_disabled';
+  }
+
+  return {
+    status,
+    panelStatusVerified: true,
+    effectiveEnable,
+    enableStatus: status === 'Active',
+    isExpiredByTime,
+    isDataLimitReached,
+    isManuallyDisabled,
+    isInboundDisabled,
+    isUnlimited,
+    statusReason,
+  };
+};
 
 export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
   const dbStart = Date.now();
@@ -13,20 +122,22 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     return { configs: [], dbTime: 0 };
   }
 
-  // Query vpn_configs scoped strictly to this customer (no full-table scan)
+  // Query vpn_configs scoped strictly to this customer by customer_uid and user_id (no full-table scan)
   const vpnConfigsMap = new Map<string, any>();
   if (userUid) {
     try {
-      const { data: cfgsByCustomerUid } = await db
-        .from('vpn_configs')
-        .select('*')
-        .eq('customer_uid', userUid);
-      if (Array.isArray(cfgsByCustomerUid)) {
-        cfgsByCustomerUid.forEach((cfg: any) => {
-          const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
-          vpnConfigsMap.set(key, cfg);
-        });
-      }
+      const [byCustomerUidRes, byUserIdRes] = await Promise.all([
+        db.from('vpn_configs').select('*').eq('customer_uid', userUid),
+        db.from('vpn_configs').select('*').eq('user_id', userUid),
+      ]);
+      const combinedCfgs = [
+        ...(Array.isArray(byCustomerUidRes.data) ? byCustomerUidRes.data : []),
+        ...(Array.isArray(byUserIdRes.data) ? byUserIdRes.data : []),
+      ];
+      combinedCfgs.forEach((cfg: any) => {
+        const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
+        vpnConfigsMap.set(key, cfg);
+      });
     } catch (_e) {}
   }
   const vpnConfigsData = Array.from(vpnConfigsMap.values());
@@ -118,18 +229,63 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const nonApprovedOrderIds = new Set<string>();
   const nonApprovedOrderUuids = new Set<string>();
 
+  // Defense-in-depth: also inspect vpn_entitlement_grants for this customer's orders
+  // so revoked / revoke_failed grants are strictly excluded and authoritative inbound_id is available.
+  const customerOrderRowIds = allOrders
+    .map(ord => (ord?.id ? String(ord.id).trim() : ''))
+    .filter(Boolean);
+  if (customerOrderRowIds.length > 0 && supabaseAdmin) {
+    try {
+      const { data: grants } = await supabaseAdmin
+        .from('vpn_entitlement_grants')
+        .select('order_id, client_uuid, inbound_id, status')
+        .in('order_id', customerOrderRowIds);
+      if (Array.isArray(grants)) {
+        grants.forEach((g: any) => {
+          const gStatus = String(g.status || '').toLowerCase().trim();
+          const gUuid = String(g.client_uuid || '').trim().toLowerCase();
+          const gOrderId = String(g.order_id || '').trim();
+          const gIbId = Number(g.inbound_id);
+          if (!Number.isNaN(gIbId) && gIbId > 0) {
+            if (gOrderId && !inboundMap.has(gOrderId)) inboundMap.set(gOrderId, gIbId);
+            if (gUuid && !inboundMap.has(gUuid)) inboundMap.set(gUuid, gIbId);
+          }
+          if (
+            gStatus === 'revoked' ||
+            gStatus === 'revoke_failed' ||
+            gStatus === 'rejected' ||
+            gStatus === 'cancelled' ||
+            gStatus === 'deleted'
+          ) {
+            if (gOrderId) nonApprovedOrderIds.add(gOrderId);
+            if (gUuid) {
+              nonApprovedOrderUuids.add(gUuid);
+              deletedOrInactiveUuids.add(gUuid);
+            }
+          }
+        });
+      }
+    } catch (_grantErr) {
+      // Non-blocking if table or rows are absent
+    }
+  }
+
   allOrders.forEach(ord => {
     const rawStatus = String(ord.status || '').toLowerCase().trim();
     if (isOrderProvisionallyActive(ord)) {
       return;
     }
+    const provStatus = String(ord.provisioning_status || '').toLowerCase().trim();
     if (
       rawStatus === 'pending' ||
       rawStatus === 'rejected' ||
       rawStatus === 'cancelled' ||
       rawStatus === 'deleted' ||
       rawStatus === 'expired' ||
-      rawStatus === 'provisioning'
+      rawStatus === 'provisioning' ||
+      provStatus === 'revoked' ||
+      provStatus === 'revoke_failed' ||
+      provStatus === 'rejected'
     ) {
       if (ord.id) nonApprovedOrderIds.add(String(ord.id).trim());
       if (ord.order_id) nonApprovedOrderIds.add(String(ord.order_id).trim());
@@ -264,19 +420,13 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     }
   });
 
-  // Retrieve fast in-memory cached inbounds metadata from background worker if available
-  // To restore TRUE live traffic without cached delays, fetch the customer's specific inbounds directly from 3X-UI in parallel.
+  // Use cached inbounds metadata ONLY to resolve missing inboundIds (never to claim Active status when 3X-UI is unreachable).
   const cached = await getCachedInbounds();
-  const inboundsMap = new Map<number, any>();
-  if (Array.isArray(cached)) {
-    cached.forEach(ib => {
-      if (ib && ib.id) inboundsMap.set(Number(ib.id), ib);
-    });
-
-    // Resolve any missing inboundId from cached inbounds list in memory for faster lookups
+  const resolveMissingInboundIds = (inboundList: any[]) => {
+    if (!Array.isArray(inboundList) || inboundList.length === 0) return;
     configs.forEach(config => {
       if (config.uuid && (config.inboundId === null || config.inboundId === undefined || Number(config.inboundId) <= 0)) {
-        for (const ib of cached) {
+        for (const ib of inboundList) {
           let settingsObj: any = {};
           try {
             if (ib.settings) {
@@ -287,35 +437,69 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
           const found = clients.some((c: any) => String(c.id || '').toLowerCase() === String(config.uuid).toLowerCase());
           if (found) {
             config.inboundId = Number(ib.id);
-            console.log(`[Live Traffic Engine] Found missing inboundId ${ib.id} for UUID ${config.uuid} from cached list.`);
+            console.log(`[Live Traffic Engine] Found missing inboundId ${ib.id} for UUID ${config.uuid} from inbound list.`);
             break;
           }
         }
       }
     });
+  };
+  resolveMissingInboundIds(cached);
+
+  // Track ONLY live-verified inbounds fetched from 3X-UI (with short-TTL deduplicated cache in xuiService)
+  const liveInboundsMap = new Map<number, any>();
+  let liveFullListFetched = false;
+
+  const hasMissingInboundId = configs.some(
+    c => c.uuid && (c.inboundId === null || c.inboundId === undefined || Number(c.inboundId) <= 0)
+  );
+
+  // Cold-start recovery: if any config has no inboundId yet, fetch fresh inbounds once with timeout
+  if (hasMissingInboundId && configs.length > 0) {
+    try {
+      const freshList = await Promise.race([
+        getInbounds(true),
+        new Promise<null>((resolve) =>
+          setTimeout(() => {
+            console.warn('[Live Traffic Engine] Fresh full inbound list fetch timed out after 5s.');
+            resolve(null);
+          }, 5000)
+        )
+      ]);
+      if (Array.isArray(freshList) && freshList.length > 0) {
+        liveFullListFetched = true;
+        freshList.forEach(ib => {
+          if (ib && ib.id) liveInboundsMap.set(Number(ib.id), ib);
+        });
+        resolveMissingInboundIds(freshList);
+      }
+    } catch (err: any) {
+      console.warn('[Live Traffic Engine] Cold-start inbound lookup failed:', err?.message || err);
+    }
   }
 
   const userInboundIds = Array.from(new Set(
     configs
       .map(c => c.inboundId)
       .filter(id => id !== null && id !== undefined && Number(id) > 0)
-  ));
+      .map(id => Number(id))
+  )).filter(id => !liveInboundsMap.has(id));
 
   if (userInboundIds.length > 0) {
     try {
-      console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds directly from 3X-UI...`);
+      console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds from 3X-UI...`);
       const liveResults = await Promise.race([
-        Promise.all(userInboundIds.map(id => getLiveInbound(Number(id)))),
+        Promise.all(userInboundIds.map(id => getLiveInbound(id))),
         new Promise<null[]>((resolve) =>
           setTimeout(() => {
-            console.warn('[Live Traffic Engine] Live inbound fetch timed out after 5s; using cached inbounds.');
+            console.warn('[Live Traffic Engine] Live inbound fetch timed out after 5s; panel status unverified.');
             resolve([]);
           }, 5000)
         )
       ]);
       liveResults.forEach(ib => {
         if (ib && ib.id) {
-          inboundsMap.set(Number(ib.id), ib);
+          liveInboundsMap.set(Number(ib.id), ib);
         }
       });
     } catch (err: any) {
@@ -323,7 +507,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     }
   }
 
-  const inbounds = Array.from(inboundsMap.values());
+  const liveInbounds = Array.from(liveInboundsMap.values());
 
   const resultConfigs = configs.map(config => {
     let up = 0;
@@ -331,8 +515,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     let total = config._rawLimit || 0;
     let expiryTime = 0;
     let lastOnline = 0;
-    let enable = true;
-    let inboundId = config.inboundId;
+    let inboundId = config.inboundId ? Number(config.inboundId) : null;
     console.log(`[Provisioning Audit] Database inbound_id after reload: ${config.inboundId}`);
     console.log(`[Provisioning Audit] UUID to match: ${config.uuid}`);
     let clientEmail = userEmail;
@@ -342,8 +525,8 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
     const checkedUuids: string[] = [];
 
-    if (inbounds.length > 0 && config.uuid) {
-      for (const ib of inbounds) {
+    if (liveInbounds.length > 0 && config.uuid) {
+      for (const ib of liveInbounds) {
         let settingsObj: any = {};
         try {
           if (ib.settings) {
@@ -365,15 +548,17 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
     if (matchedInbound && foundClient) {
       if (!inboundId) {
-        inboundId = matchedInbound.id;
+        inboundId = Number(matchedInbound.id);
       }
       clientEmail = foundClient.email || userEmail;
-      enable = foundClient.enable !== false;
       expiryTime = foundClient.expiryTime || 0;
-      if (foundClient.totalBytes !== undefined) {
-        total = foundClient.totalBytes;
+
+      if (foundClient.totalGB !== undefined && Number(foundClient.totalGB) >= 0) {
+        total = Number(foundClient.totalGB) || 0;
+      } else if (foundClient.totalBytes !== undefined) {
+        total = Number(foundClient.totalBytes) || 0;
       } else if (foundClient.total !== undefined) {
-        total = foundClient.total;
+        total = Number(foundClient.total) || 0;
       }
 
       const clientStats = matchedInbound.clientStats || [];
@@ -394,18 +579,15 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       if (stat) {
         const statUp = extractTraffic(stat, 'up');
         const statDown = extractTraffic(stat, 'down');
-        
+
         up = Math.max(statUp, clientUp, up);
         down = Math.max(statDown, clientDown, down);
-        
-        if (stat.total !== undefined && stat.total > 0) {
-          total = stat.total;
+
+        if (stat.total !== undefined && Number(stat.total) > 0) {
+          total = Number(stat.total);
         }
-        if (stat.expiryTime !== undefined && stat.expiryTime > 0) {
-          expiryTime = stat.expiryTime;
-        }
-        if (stat.enable !== undefined) {
-          enable = stat.enable;
+        if (stat.expiryTime !== undefined && Number(stat.expiryTime) > 0) {
+          expiryTime = Number(stat.expiryTime);
         }
         lastOnline = stat.lastOnline || stat.online || stat.time || 0;
       } else {
@@ -414,7 +596,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
         lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
-      console.log(`[Provisioning Audit] No live stats found for UUID: ${config.uuid}. Using DB values.`);
+      console.log(`[Provisioning Audit] No live 3X-UI state verified for UUID: ${config.uuid}. Marking status unverified.`);
     }
 
     let lastOnlineMs = lastOnline;
@@ -424,7 +606,6 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
     const totalUsed = up + down;
     const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
-
 
     const usedGB = parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2));
     const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : 'Unlimited';
@@ -439,13 +620,22 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       if (!isNaN(parsed)) expTimeMs = parsed;
     }
 
-    const isExpiredByTime = (expTimeMs > 0 && expTimeMs <= now) || (expTimeMs < 0);
-    const isClientDisabled = enable === false;
-
-    let status = 'Active';
-    if (isClientDisabled || isExpiredByTime) {
-      status = 'Expired';
-    }
+    const expectedInboundWasLive = Boolean(
+      (inboundId && liveInboundsMap.has(Number(inboundId))) || liveFullListFetched
+    );
+    const evaluated = evaluateVpnClientStatus({
+      panelReachable: expectedInboundWasLive || Boolean(matchedInbound),
+      inboundFound: Boolean(matchedInbound),
+      inboundEnable: matchedInbound ? matchedInbound.enable : null,
+      clientFound: Boolean(foundClient),
+      clientEnable: foundClient ? foundClient.enable : null,
+      statEnable: stat ? stat.enable : undefined,
+      upBytes: up,
+      downBytes: down,
+      totalLimitBytes: total,
+      expiryTimeMs: expTimeMs,
+      nowMs: now,
+    });
 
     let currentExpiryDate = config.expiryDate;
     if (expTimeMs > 0) {
@@ -471,7 +661,7 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       } catch(e) {}
     }
 
-    console.log(`[Provisioning Audit] API response inboundId: ${inboundId}`);
+    console.log(`[Provisioning Audit] API response inboundId: ${inboundId} | observedStatus: ${evaluated.status} (${evaluated.statusReason})`);
     return {
       orderId: config.orderId,
       packageName: config.packageName,
@@ -486,13 +676,16 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       upload: up,
       download: down,
       liveUsageFound: !!matchedInbound && !!foundClient,
+      panelStatusVerified: evaluated.panelStatusVerified,
+      statusReason: evaluated.statusReason,
       totalTrafficBytes: total,
       remainingTrafficBytes: remainingTraffic,
       expiryDate: currentExpiryDate,
       expiryTime: currentExpiryDate,
-      status,
-      enableStatus: status === 'Active',
-      onlineStatus: status === 'Active' && (lastOnline > 0 || up > 0 || down > 0),
+      status: evaluated.status,
+      enable: evaluated.effectiveEnable,
+      enableStatus: evaluated.enableStatus,
+      onlineStatus: evaluated.status === 'Active' && (lastOnline > 0 || up > 0 || down > 0),
       lastOnline: lastOnlineMs,
       serverNode: config.serverNode,
       port,
@@ -504,43 +697,47 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
       name: config.packageName,
       isTrial: !!config.isTrial,
       templateId: config.templateId || null,
+      paymentStatus: config.paymentStatus || null,
+      provisioningStatus: config.provisioningStatus || null,
+      _expectedInboundWasLive: expectedInboundWasLive,
     };
   });
 
   const dbTime = Date.now() - dbStart;
 
-  if (inbounds && inbounds.length > 0) {
-    const liveUuids = new Set<string>();
-    for (const ib of inbounds) {
-      let settingsObj: any = {};
-      try {
-        if (ib.settings) {
-          settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
-        }
-      } catch (e) {}
-      const clients = settingsObj.clients || [];
-      for (const c of clients) {
-        if (c.id) liveUuids.add(String(c.id).trim().toLowerCase());
+  // Exclude clients confirmed deleted ONLY when their expected inbound (or full inbound list) was fetched live.
+  // When 3X-UI is unreachable, never hide or delete customer configs — preserve them as Status Unavailable.
+  const liveUuids = new Set<string>();
+  for (const ib of liveInbounds) {
+    let settingsObj: any = {};
+    try {
+      if (ib.settings) {
+        settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
       }
-      const clientStats = ib.clientStats || [];
-      for (const s of clientStats) {
-        if (s.id) liveUuids.add(String(s.id).trim().toLowerCase());
-      }
+    } catch (e) {}
+    const clients = settingsObj.clients || [];
+    for (const c of clients) {
+      if (c.id) liveUuids.add(String(c.id).trim().toLowerCase());
     }
-
-    const filtered = resultConfigs.filter(cfg => {
-      if (!cfg.uuid) return false;
-      const isLive = liveUuids.has(String(cfg.uuid).trim().toLowerCase());
-      if (!isLive) {
-        console.log(`[3X-UI Sync] Excluding deleted configuration (UUID: ${cfg.uuid}) from user response.`);
-      }
-      return isLive;
-    });
-
-    return { configs: filtered, dbTime };
+    const clientStats = ib.clientStats || [];
+    for (const s of clientStats) {
+      if (s.id) liveUuids.add(String(s.id).trim().toLowerCase());
+    }
   }
 
-  return { configs: resultConfigs, dbTime };
+  const finalConfigs = resultConfigs
+    .filter(cfg => {
+      if (!cfg.uuid) return false;
+      const normUuid = String(cfg.uuid).trim().toLowerCase();
+      if (cfg._expectedInboundWasLive && liveInbounds.length > 0 && !liveUuids.has(normUuid)) {
+        console.log(`[3X-UI Sync] Excluding deleted configuration (UUID: ${cfg.uuid}) confirmed absent from live 3X-UI inbound.`);
+        return false;
+      }
+      return true;
+    })
+    .map(({ _expectedInboundWasLive, ...publicCfg }) => publicCfg);
+
+  return { configs: finalConfigs, dbTime };
 };
 
 export interface TrafficResetPolicy {
