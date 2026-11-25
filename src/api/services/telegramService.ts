@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '../../lib/supabase.js';
 
 export interface RenewNotificationData {
+  requestId?: string;
   email?: string;
   userEmail?: string;
   planName?: string;
@@ -11,6 +12,15 @@ export interface RenewNotificationData {
   receiptNumber?: string;
   message?: string;
   paymentDate?: string;
+  slipUrl?: string;
+  status?: string;
+  provisional?: boolean;
+  provisioningStatus?: string;
+  newExpiry?: string;
+  oldExpiry?: string;
+  autoRenewalBlockedReason?: string;
+  dbClient?: any;
+  fetchFn?: typeof fetch;
 }
 
 export interface RenewApprovedNotificationData {
@@ -40,12 +50,39 @@ const formatDateTime = (val: any): string => {
   return String(val);
 };
 
+interface StoredTelegramRenewMessage {
+  chatId: string;
+  messageId: number;
+  text: string;
+}
+
+const renewTelegramMessageCache = new Map<string, StoredTelegramRenewMessage>();
+
 export const sendRenewNotification = async (data: RenewNotificationData): Promise<void> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+  const dbClient = data.dbClient || supabaseAdmin;
+  const fetchCall = data.fetchFn || fetch;
 
   if (!botToken || !chatId) {
     console.warn('[TelegramService] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Skipping Telegram notification.');
+    return;
+  }
+
+  const canonicalRef = String(data.requestId || '').trim();
+  const dispatchClaim = canonicalRef
+    ? await claimTelegramDispatch({
+        dbClient,
+        eventType: 'renew_created',
+        referenceId: canonicalRef,
+        recipient: String(chatId),
+      })
+    : { proceed: true, dispatchId: null, duplicatePrevented: false };
+
+  if (!dispatchClaim.proceed) {
+    console.log(
+      `[TelegramService] Duplicate renew_created Telegram notification prevented for ${canonicalRef} (status=${dispatchClaim.existingStatus}).`
+    );
     return;
   }
 
@@ -56,10 +93,19 @@ export const sendRenewNotification = async (data: RenewNotificationData): Promis
   const receiptNumber = data.receiptNumber || 'N/A';
   const message = data.message && data.message.trim() ? data.message.trim() : 'None';
   const paymentDate = data.paymentDate || 'N/A';
+  const isProvisional = Boolean(data.provisional || data.provisioningStatus === 'provisional');
+  const blockedNote = data.autoRenewalBlockedReason
+    ? `\n⚠️ Auto-Renewal Held (${data.autoRenewalBlockedReason}) — Manual Review Required`
+    : '';
+  const statusDisplayBlock = isProvisional
+    ? `🟡 Pending Verification\n⚡ VPN Status: Renewed & Active (Full Package - Provisional)${
+        data.newExpiry ? `\n📆 Provisional Expiry: ${formatDateTime(data.newExpiry)}` : ''
+      }`
+    : `🟡 Pending Verification${blockedNote}`;
 
   const text = `🔔 FIREVPNs
 
-New Renewal Request
+New Renewal Request${canonicalRef ? `\n\n🆔 Request ID:\n${canonicalRef}` : ''}
 
 👤 Customer:
 ${email}
@@ -80,26 +126,93 @@ ${receiptNumber}
 ${message}
 
 🕒 Date:
-${paymentDate}`;
+${paymentDate}
+
+Status:
+${statusDisplayBlock}`;
+
+  const canAttachInlineButtons =
+    Boolean(canonicalRef) &&
+    canonicalRef !== 'N/A' &&
+    Buffer.byteLength(`approve_renew:${canonicalRef}`, 'utf8') <= 64 &&
+    Buffer.byteLength(`reject_renew:${canonicalRef}`, 'utf8') <= 64;
+
+  const replyMarkup = canAttachInlineButtons
+    ? {
+        inline_keyboard: [
+          [
+            {
+              text: '✓ Approve Renewal',
+              callback_data: `approve_renew:${canonicalRef}`,
+            },
+            {
+              text: '✕ Reject Renewal',
+              callback_data: `reject_renew:${canonicalRef}`,
+            },
+          ],
+        ],
+      }
+    : undefined;
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const response = await fetch(url, {
+    const payload: Record<string, any> = {
+      chat_id: chatId,
+      text: text,
+    };
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
+    }
+
+    const response = await fetchCall(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(8000),
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-      }),
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
       const errText = await response.text();
       console.error(`[TelegramService] Telegram API error (${response.status}):`, errText);
-    } else {
+      await finalizeTelegramDispatch({
+        dbClient,
+        dispatchId: dispatchClaim.dispatchId,
+        status: 'failed',
+        errorMessage: `HTTP ${response.status}`,
+      });
+      return;
+    }
+
+    const resJson: any = await response.json().catch(() => null);
+    const sentMsg = resJson?.result;
+    const sentChatId = sentMsg?.chat?.id ? String(sentMsg.chat.id) : String(chatId);
+    const sentMessageId = sentMsg?.message_id ? Number(sentMsg.message_id) : null;
+
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'sent',
+      chatId: sentChatId,
+      messageId: sentMessageId,
+      metadata: {
+        requestId: canonicalRef || null,
+      },
+    });
+
+    if (sentMessageId && sentChatId && canonicalRef) {
+      renewTelegramMessageCache.set(canonicalRef, {
+        chatId: sentChatId,
+        messageId: sentMessageId,
+        text,
+      });
     }
   } catch (err: any) {
+    await finalizeTelegramDispatch({
+      dbClient,
+      dispatchId: dispatchClaim.dispatchId,
+      status: 'uncertain',
+      errorMessage: err?.message || String(err),
+    });
     console.error('[TelegramService] Failed to send Telegram notification:', err?.message || err);
   }
 };
@@ -1043,7 +1156,13 @@ export interface TelegramAdminAuditLogEntry {
   adminId: string | number;
   adminUsername?: string;
   orderId: string;
-  action: 'APPROVE_ORDER' | 'REJECT_ORDER' | 'UNAUTHORIZED_ATTEMPT' | 'INVALID_CALLBACK';
+  action:
+    | 'APPROVE_ORDER'
+    | 'REJECT_ORDER'
+    | 'APPROVE_RENEW'
+    | 'REJECT_RENEW'
+    | 'UNAUTHORIZED_ATTEMPT'
+    | 'INVALID_CALLBACK';
   outcome: string;
   timestamp: string;
 }
@@ -1306,6 +1425,160 @@ export const syncOrderTelegramInlineMessage = async (
   });
 };
 
+const buildUpdatedRenewTelegramText = (
+  originalText: string | undefined,
+  renewRow: any,
+  finalStatus: 'APPROVED' | 'REJECTED',
+  meta?: { adminLabel?: string; uuid?: string; newExpiry?: string; reason?: string; timestamp?: string }
+): string => {
+  const timestamp = meta?.timestamp || formatColomboTimestamp();
+  const adminLabel = meta?.adminLabel || 'Authorized Admin';
+  const statusSection =
+    finalStatus === 'APPROVED'
+      ? `Status:\n🟢 APPROVED\n✅ Processed By: ${adminLabel}${meta?.uuid ? `\n🔑 VPN UUID: ${meta.uuid}` : ''}${
+          meta?.newExpiry ? `\n📆 New Expiry: ${formatDateTime(meta.newExpiry)}` : ''
+        }\n🕒 Updated At: ${timestamp}`
+      : `Status:\n🔴 REJECTED\n❌ Processed By: ${adminLabel}${meta?.reason ? `\n📝 Reason: ${meta.reason}` : ''}\n🕒 Updated At: ${timestamp}`;
+
+  if (originalText && originalText.trim()) {
+    const statusIndex = originalText.lastIndexOf('Status:');
+    if (statusIndex !== -1) {
+      return `${originalText.substring(0, statusIndex).trimEnd()}\n\n${statusSection}`;
+    }
+    return `${originalText.trimEnd()}\n\n━━━━━━━━━━━━━━━━━━\n\n${statusSection}`;
+  }
+
+  const reqId = renewRow?.id || 'N/A';
+  const email = renewRow?.user_email || renewRow?.email || 'N/A';
+  const plan = renewRow?.plan_name || renewRow?.plan || 'VPN Plan';
+  const amount = Number(renewRow?.amount || 0).toLocaleString();
+
+  return `🔔 FIREVPNs
+
+Renewal Request
+
+🆔 Request ID:
+${reqId}
+
+👤 Customer:
+${email}
+
+📦 Plan:
+${plan}
+
+💰 Amount:
+LKR ${amount}
+
+${statusSection}`;
+};
+
+export const editTelegramRenewMessage = async (params: {
+  chatId: string | number;
+  messageId: number;
+  originalText?: string;
+  renewRow?: any;
+  finalStatus: 'APPROVED' | 'REJECTED';
+  adminLabel?: string;
+  uuid?: string;
+  newExpiry?: string;
+  reason?: string;
+}): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken || !params.chatId || !params.messageId) return;
+
+  const updatedText = buildUpdatedRenewTelegramText(
+    params.originalText,
+    params.renewRow,
+    params.finalStatus,
+    {
+      adminLabel: params.adminLabel,
+      uuid: params.uuid,
+      newExpiry: params.newExpiry,
+      reason: params.reason,
+      timestamp: formatColomboTimestamp(),
+    }
+  );
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/editMessageText`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({
+        chat_id: params.chatId,
+        message_id: params.messageId,
+        text: updatedText,
+        reply_markup: { inline_keyboard: [] },
+      }),
+    });
+
+    if (!response.ok) {
+      await removeTelegramMessageInlineKeyboard(params.chatId, params.messageId);
+    }
+  } catch (err: any) {
+    console.warn('[TelegramService] Failed to editTelegramRenewMessage:', err?.message || err);
+    await removeTelegramMessageInlineKeyboard(params.chatId, params.messageId);
+  }
+};
+
+export const syncRenewTelegramInlineMessage = async (
+  requestId: string,
+  finalStatus: 'APPROVED' | 'REJECTED',
+  meta?: { adminLabel?: string; uuid?: string; newExpiry?: string; reason?: string }
+): Promise<void> => {
+  if (!requestId) return;
+  const cleanId = String(requestId).trim();
+  let cached = renewTelegramMessageCache.get(cleanId);
+  let renewRow: any = null;
+
+  try {
+    const { data } = await supabaseAdmin
+      .from('renew_requests')
+      .select('*')
+      .eq('id', cleanId)
+      .maybeSingle();
+    renewRow = data;
+  } catch {
+    // Ignore DB lookup failure during sync
+  }
+
+  if (!cached) {
+    try {
+      const { data: dispatchRow } = await supabaseAdmin
+        .from('notification_dispatches')
+        .select('chat_id, message_id')
+        .eq('channel', 'telegram')
+        .eq('event_type', 'renew_created')
+        .eq('reference_id', cleanId)
+        .maybeSingle();
+      if (dispatchRow?.chat_id && dispatchRow?.message_id) {
+        cached = {
+          chatId: String(dispatchRow.chat_id),
+          messageId: Number(dispatchRow.message_id),
+          text: '',
+        };
+      }
+    } catch {
+      // Ignore if notification_dispatches table is not migrated yet
+    }
+  }
+
+  if (!cached || !cached.chatId || !cached.messageId) return;
+
+  await editTelegramRenewMessage({
+    chatId: cached.chatId,
+    messageId: cached.messageId,
+    originalText: cached.text || undefined,
+    renewRow,
+    finalStatus,
+    adminLabel: meta?.adminLabel,
+    uuid: meta?.uuid,
+    newExpiry: meta?.newExpiry,
+    reason: meta?.reason,
+  });
+};
+
 /**
  * Verifies whether a Telegram user ID is an authorized FIREVPNs administrator.
  * Checks TELEGRAM_ADMIN_IDS, TELEGRAM_ADMIN_ID, and TELEGRAM_CHAT_ID.
@@ -1432,8 +1705,10 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
   const rawCallbackData = String(callbackQuery.data || '').trim();
   const timestamp = new Date().toISOString();
 
-  // Parse callback_data: "approve_order:<orderId>" or "reject_order:<orderId>"
-  const match = rawCallbackData.match(/^(approve_order|reject_order|approve|reject):([A-Za-z0-9_-]{1,50})$/);
+  // Parse callback_data: "approve_order:<orderId>", "reject_order:<orderId>", "approve_renew:<requestId>", "reject_renew:<requestId>"
+  const match = rawCallbackData.match(
+    /^(approve_order|reject_order|approve_renew|reject_renew|approve|reject):([A-Za-z0-9_-]{1,50})$/
+  );
   if (!match) {
     logTelegramAdminAction({
       adminId: fromUserId || 'unknown',
@@ -1447,10 +1722,18 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
     return;
   }
 
-  const actionVerb = match[1].startsWith('approve') ? 'APPROVE_ORDER' : 'REJECT_ORDER';
+  const rawVerb = match[1];
+  const isRenewCallback = rawVerb === 'approve_renew' || rawVerb === 'reject_renew';
+  const actionVerb = isRenewCallback
+    ? rawVerb === 'approve_renew'
+      ? 'APPROVE_RENEW'
+      : 'REJECT_RENEW'
+    : rawVerb.startsWith('approve')
+      ? 'APPROVE_ORDER'
+      : 'REJECT_ORDER';
   const targetOrderId = match[2].trim();
 
-  // 1. Verify Admin Authorization FIRST before trusting orderId or performing any DB query
+  // 1. Verify Admin Authorization FIRST before trusting ID or performing any DB query
   const authCheck = await verifyTelegramAdminAuthorization(fromUserId, messageChatId);
   if (!authCheck.authorized) {
     logTelegramAdminAction({
@@ -1463,7 +1746,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
     });
     await answerTelegramCallbackQuery(
       callbackQueryId,
-      '⛔ Unauthorized: Only authorized FIREVPNs administrators can approve or reject orders.',
+      '⛔ Unauthorized: Only authorized FIREVPNs administrators can approve or reject orders and renewals.',
       true
     );
     return;
@@ -1473,7 +1756,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
   if (inFlightTelegramOrderActions.has(targetOrderId)) {
     await answerTelegramCallbackQuery(
       callbackQueryId,
-      '⏳ This order is currently being processed. Please wait...',
+      '⏳ This request is currently being processed. Please wait...',
       false
     );
     return;
@@ -1484,6 +1767,162 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
   let lockedCanonicalOrderId = '';
 
   try {
+    if (isRenewCallback) {
+      const { data: renewRow } = await supabaseAdmin
+        .from('renew_requests')
+        .select('*')
+        .eq('id', targetOrderId)
+        .maybeSingle();
+
+      if (!renewRow) {
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: targetOrderId,
+          action: actionVerb,
+          outcome: 'RENEW_REQUEST_NOT_FOUND',
+          timestamp,
+        });
+        await answerTelegramCallbackQuery(
+          callbackQueryId,
+          `⚠️ Renewal request "${targetOrderId}" no longer exists in the database.`,
+          true
+        );
+        if (messageChatId && messageId) {
+          await removeTelegramMessageInlineKeyboard(messageChatId, messageId);
+        }
+        return;
+      }
+
+      lockedDbId = String(renewRow.id || targetOrderId);
+      lockedCanonicalOrderId = lockedDbId;
+
+      const statusLower = String(renewRow.status || '').toLowerCase().trim();
+      if (statusLower === 'approved') {
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: lockedCanonicalOrderId,
+          action: actionVerb,
+          outcome: 'SKIPPED_ALREADY_APPROVED',
+          timestamp,
+        });
+        await answerTelegramCallbackQuery(
+          callbackQueryId,
+          `ℹ️ Renewal #${lockedCanonicalOrderId} has already been APPROVED.`,
+          true
+        );
+        if (messageChatId && messageId) {
+          await editTelegramRenewMessage({
+            chatId: messageChatId,
+            messageId,
+            originalText: originalMessageText,
+            renewRow,
+            finalStatus: 'APPROVED',
+            adminLabel: 'Already Approved',
+          });
+        }
+        return;
+      }
+
+      if (statusLower === 'rejected') {
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: lockedCanonicalOrderId,
+          action: actionVerb,
+          outcome: 'SKIPPED_ALREADY_REJECTED',
+          timestamp,
+        });
+        await answerTelegramCallbackQuery(
+          callbackQueryId,
+          `ℹ️ Renewal #${lockedCanonicalOrderId} has already been REJECTED.`,
+          true
+        );
+        if (messageChatId && messageId) {
+          await editTelegramRenewMessage({
+            chatId: messageChatId,
+            messageId,
+            originalText: originalMessageText,
+            renewRow,
+            finalStatus: 'REJECTED',
+            adminLabel: 'Already Rejected',
+          });
+        }
+        return;
+      }
+
+      const adminDisplayLabel = `${fromUsername} (ID: ${fromUserId})`;
+
+      if (actionVerb === 'APPROVE_RENEW') {
+        await answerTelegramCallbackQuery(
+          callbackQueryId,
+          `⏳ Approving renewal #${lockedCanonicalOrderId}...`,
+          false
+        );
+
+        const { executeRenewalApproval } = await import('../controllers/renewController.js');
+        const result = await executeRenewalApproval(renewRow.id, {
+          adminLabel: `Telegram Admin ${adminDisplayLabel}`,
+        });
+
+        if (messageChatId && messageId) {
+          await editTelegramRenewMessage({
+            chatId: messageChatId,
+            messageId,
+            originalText: originalMessageText,
+            renewRow,
+            finalStatus: 'APPROVED',
+            adminLabel: `Telegram Admin ${adminDisplayLabel}`,
+            uuid: result?.uuid,
+            newExpiry: result?.newExpiryIso,
+          });
+        }
+
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: lockedCanonicalOrderId,
+          action: 'APPROVE_RENEW',
+          outcome: `SUCCESS (uuid=${result?.uuid || 'N/A'})`,
+          timestamp,
+        });
+      } else {
+        await answerTelegramCallbackQuery(
+          callbackQueryId,
+          `⏳ Rejecting renewal #${lockedCanonicalOrderId}...`,
+          false
+        );
+
+        const { executeRenewalRejection } = await import('../controllers/renewController.js');
+        await executeRenewalRejection(renewRow.id, 'Rejected by Admin via Telegram', {
+          adminLabel: `Telegram Admin ${adminDisplayLabel}`,
+        });
+
+        if (messageChatId && messageId) {
+          await editTelegramRenewMessage({
+            chatId: messageChatId,
+            messageId,
+            originalText: originalMessageText,
+            renewRow,
+            finalStatus: 'REJECTED',
+            adminLabel: `Telegram Admin ${adminDisplayLabel}`,
+            reason: 'Rejected by Admin via Telegram',
+          });
+        }
+
+        logTelegramAdminAction({
+          adminId: fromUserId,
+          adminUsername: fromUsername,
+          orderId: lockedCanonicalOrderId,
+          action: 'REJECT_RENEW',
+          outcome: 'SUCCESS',
+          timestamp,
+        });
+      }
+      return;
+    }
+
     // 3. Verify that the order exists in Supabase
     const order = await fetchOrderFromSupabaseForTelegram(targetOrderId);
     if (!order) {

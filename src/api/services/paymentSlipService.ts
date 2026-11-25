@@ -1153,4 +1153,247 @@ export async function claimPaymentReceiptForAutoActivation(params: {
   }
 }
 
+/**
+ * Verifies whether a payment slip storage path belongs to the authenticated user
+ * for renewal submissions (allowing 'renewals', 'orders', and 'billing' folders).
+ */
+export function isRenewalPaymentSlipStoragePathOwnedByUser(
+  paramsOrSlipUrl:
+    | { slipUrl: string; uid?: string | null; email?: string | null }
+    | string
+    | null
+    | undefined,
+  userIdArg?: string | null,
+  userEmailArg?: string | null
+): {
+  valid: boolean;
+  owned: boolean;
+  reason?:
+    | 'PATH_TRAVERSAL_OR_INVALID'
+    | 'UNAUTHORIZED_BUCKET'
+    | 'MALFORMED_STORAGE_PATH'
+    | 'INVALID_FOLDER'
+    | 'OWNERSHIP_MISMATCH';
+} {
+  const isObj = typeof paramsOrSlipUrl === 'object' && paramsOrSlipUrl !== null;
+  const rawSlip = String(isObj ? paramsOrSlipUrl.slipUrl : paramsOrSlipUrl || '').trim();
+  const userId = isObj ? paramsOrSlipUrl.uid : userIdArg;
+  const userEmail = isObj ? paramsOrSlipUrl.email : userEmailArg;
+
+  let decodedOnce = rawSlip;
+  let decodedTwice = rawSlip;
+  try {
+    decodedOnce = decodeURIComponent(rawSlip);
+    decodedTwice = decodeURIComponent(decodedOnce);
+  } catch {
+    // Keep last decoded string
+  }
+
+  if (
+    !rawSlip ||
+    rawSlip.includes('..') ||
+    rawSlip.includes('\0') ||
+    rawSlip.includes('\\') ||
+    decodedOnce.includes('..') ||
+    decodedOnce.includes('\0') ||
+    decodedOnce.includes('\\') ||
+    decodedTwice.includes('..') ||
+    decodedTwice.includes('\0') ||
+    decodedTwice.includes('\\')
+  ) {
+    return { valid: false, owned: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const parsed = parsePaymentSlipReference(rawSlip);
+  if (parsed.kind === 'data') {
+    const ok = /^data:(image\/(?:jpeg|jpg|png|webp)|application\/pdf);base64,[A-Za-z0-9+/=\s]+$/i.test(rawSlip);
+    return ok
+      ? { valid: true, owned: true }
+      : { valid: false, owned: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+  if (parsed.kind === 'empty') {
+    return { valid: false, owned: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+  if (parsed.kind !== 'storage' || !parsed.objectPath) {
+    return { valid: false, owned: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+  if (!FALLBACK_BUCKETS.includes(parsed.bucket)) {
+    return { valid: false, owned: false, reason: 'UNAUTHORIZED_BUCKET' };
+  }
+
+  const objectPath = String(parsed.objectPath || '').trim();
+  let doubleDecodedPath = objectPath;
+  try {
+    doubleDecodedPath = decodeURIComponent(objectPath);
+  } catch {
+    // Keep objectPath as-is
+  }
+
+  if (
+    !objectPath ||
+    objectPath.includes('..') ||
+    objectPath.includes('\0') ||
+    objectPath.includes('\\') ||
+    doubleDecodedPath.includes('..') ||
+    doubleDecodedPath.includes('\0') ||
+    doubleDecodedPath.includes('\\')
+  ) {
+    return { valid: false, owned: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const segments = objectPath.split('/').filter(Boolean);
+  if (segments.length < 3) {
+    return { valid: false, owned: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+  if (segments.some((seg) => seg === '.' || seg === '..')) {
+    return { valid: false, owned: false, reason: 'PATH_TRAVERSAL_OR_INVALID' };
+  }
+
+  const folderSegment = segments[0].toLowerCase();
+  if (!['renewals', 'orders', 'billing'].includes(folderSegment)) {
+    return { valid: false, owned: false, reason: 'INVALID_FOLDER' };
+  }
+
+  const ownerSegment = segments[1].toLowerCase();
+  const fileSegment = segments.slice(2).join('/').trim();
+  if (!ownerSegment || !fileSegment) {
+    return { valid: false, owned: false, reason: 'MALFORMED_STORAGE_PATH' };
+  }
+
+  const cleanEmail = String(userEmail || '').trim().toLowerCase();
+  const cleanUid = String(userId || '').trim().toLowerCase();
+  const allowedOwners = new Set<string>();
+  if (cleanUid) {
+    allowedOwners.add(cleanUid);
+    allowedOwners.add(cleanUid.replace(/[^a-zA-Z0-9@._-]/g, '_'));
+    allowedOwners.add(cleanUid.replace(/[^a-zA-Z0-9_-]/g, '_'));
+  }
+  if (cleanEmail) {
+    allowedOwners.add(cleanEmail);
+    allowedOwners.add(cleanEmail.replace(/[^a-zA-Z0-9@._-]/g, '_'));
+    allowedOwners.add(cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_'));
+  }
+
+  if (allowedOwners.size === 0 || !allowedOwners.has(ownerSegment)) {
+    return { valid: false, owned: false, reason: 'OWNERSHIP_MISMATCH' };
+  }
+
+  return { valid: true, owned: true };
+}
+
+export interface PaymentReceiptRenewalClaimResult {
+  claimed: boolean;
+  existingOrderId?: string | null;
+  existingRenewRequestId?: string | null;
+  existingUserId?: string | null;
+  conflictReason?: string | null;
+  code?:
+    | 'CLAIMED'
+    | 'DUPLICATE_SLIP'
+    | 'CLAIM_UNAVAILABLE'
+    | 'SOURCE_OWNERSHIP_MISMATCH';
+  error?: string;
+}
+
+/**
+ * Atomically claims a payment receipt SHA-256 and canonical storage path for a renewal
+ * request via public.claim_renewal_payment_receipt().
+ * Preserves public.claim_payment_receipt() and claimPaymentReceiptForAutoActivation() 100%.
+ * Fails CLOSED if the RPC is unavailable or errors.
+ */
+export async function claimPaymentReceiptForRenewal(params: {
+  sha256: string;
+  canonicalSlipUrl: string;
+  renewRequestId: string;
+  userId: string;
+  userEmail: string;
+  byteSize: number;
+  contentType?: string;
+  dbClient?: any;
+}): Promise<PaymentReceiptRenewalClaimResult> {
+  const db = params.dbClient || supabaseAdmin;
+  if (!db || typeof db.rpc !== 'function') {
+    return {
+      claimed: false,
+      code: 'CLAIM_UNAVAILABLE',
+      error: 'Database RPC client unavailable for atomic renewal payment receipt claiming.',
+    };
+  }
+
+  try {
+    // Exact 7-argument signature matching public.claim_renewal_payment_receipt in supabase_migration_auto_renewals.sql
+    const { data, error } = await db.rpc('claim_renewal_payment_receipt', {
+      p_receipt_sha256: params.sha256,
+      p_canonical_slip_url: params.canonicalSlipUrl || null,
+      p_renew_request_id: String(params.renewRequestId),
+      p_user_id: params.userId,
+      p_user_email: params.userEmail || '',
+      p_byte_size: params.byteSize || 0,
+      p_content_type: params.contentType || null,
+    });
+
+    if (error) {
+      return {
+        claimed: false,
+        code: 'CLAIM_UNAVAILABLE',
+        error: error.message || 'Atomic renewal payment receipt claim RPC failed.',
+      };
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row.claimed !== 'boolean') {
+      return {
+        claimed: false,
+        code: 'CLAIM_UNAVAILABLE',
+        error: 'Unexpected response from claim_renewal_payment_receipt RPC.',
+      };
+    }
+
+    if (!row.claimed) {
+      const conflictReason = String(row.conflict_reason || 'duplicate_receipt_sha256');
+      const isOwnershipErr =
+        conflictReason === 'source_owner_mismatch' ||
+        conflictReason === 'claim_owner_mismatch' ||
+        conflictReason === 'source_renewal_not_found' ||
+        conflictReason === 'invalid_claim_owner' ||
+        conflictReason === 'invalid_claim_identity' ||
+        conflictReason === 'invalid_renewal_claim_identity';
+      const isInvalidHash = conflictReason === 'invalid_receipt_sha256';
+      return {
+        claimed: false,
+        code: isOwnershipErr
+          ? 'SOURCE_OWNERSHIP_MISMATCH'
+          : isInvalidHash
+          ? 'CLAIM_UNAVAILABLE'
+          : 'DUPLICATE_SLIP',
+        existingOrderId: row.existing_order_id || null,
+        existingRenewRequestId: row.existing_renew_request_id || null,
+        existingUserId: row.existing_user_id || null,
+        conflictReason,
+        error: isOwnershipErr
+          ? 'Renewal request ownership verification failed.'
+          : isInvalidHash
+          ? 'Invalid payment receipt SHA-256 format.'
+          : 'Duplicate payment receipt detected; automatic renewal blocked pending manual admin verification.',
+      };
+    }
+
+    return {
+      claimed: true,
+      code: 'CLAIMED',
+      existingOrderId: row.existing_order_id || null,
+      existingRenewRequestId: row.existing_renew_request_id || String(params.renewRequestId),
+      existingUserId: row.existing_user_id || params.userId,
+      conflictReason: null,
+    };
+  } catch (err: any) {
+    return {
+      claimed: false,
+      code: 'CLAIM_UNAVAILABLE',
+      error: err?.message || 'Atomic renewal payment receipt claim failed.',
+    };
+  }
+}
+
+
 

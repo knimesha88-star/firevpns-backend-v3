@@ -632,22 +632,45 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
     const rawStatus = String(orderRecord.status || '').toLowerCase();
     const rawProv = String(orderRecord.provisioning_status || '').toLowerCase();
     const rawPay = String(orderRecord.payment_status || '').toLowerCase();
-    const hasVpnCredentials = Boolean(
-      orderRecord.vless_url ||
-      orderRecord.client_uuid ||
-      vpnConfig?.vless_link ||
-      vpnConfig?.vless_url ||
-      vpnConfig?.uuid
+    const resolvedClientUuid = String(orderRecord.client_uuid || vpnConfig?.uuid || '').trim() || null;
+    const resolvedVlessUrl = String(orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || '').trim() || null;
+    const hasVpnCredentials = Boolean(resolvedVlessUrl || resolvedClientUuid);
+    const hasCompleteVpnCredentials = Boolean(resolvedVlessUrl && resolvedClientUuid);
+    const isRejectedOrRevoked = Boolean(
+      rawStatus === 'rejected' ||
+      rawStatus === 'cancelled' ||
+      rawStatus === 'canceled' ||
+      rawStatus === 'deleted' ||
+      rawStatus === 'revoked' ||
+      rawProv === 'revoked' ||
+      rawProv === 'revoke_failed' ||
+      rawPay === 'cancelled' ||
+      rawPay === 'rejected' ||
+      orderRecord.reject_reason
+    );
+    const isFailedState = rawProv === 'failed' || rawPay === 'failed';
+    const isConfirmedAutoActivated = Boolean(
+      !isRejectedOrRevoked &&
+      !isFailedState &&
+      hasCompleteVpnCredentials &&
+      (
+        rawProv === 'provisional' ||
+        rawProv === 'completed' ||
+        rawProv === 'active' ||
+        rawStatus === 'completed' ||
+        rawStatus === 'active'
+      )
     );
 
     let normalizedStage: 'Pending' | 'Verified' | 'Provisioning' | 'Active' | 'Rejected' | 'Failed' = 'Pending';
-    if (rawStatus === 'rejected' || rawPay === 'cancelled' || rawPay === 'rejected' || orderRecord.reject_reason) {
+    if (isRejectedOrRevoked) {
       normalizedStage = 'Rejected';
-    } else if (rawProv === 'failed' || rawPay === 'failed') {
+    } else if (isFailedState) {
       normalizedStage = 'Failed';
     } else if (
       rawStatus === 'completed' ||
       rawStatus === 'active' ||
+      rawProv === 'provisional' ||
       rawProv === 'completed' ||
       rawProv === 'active' ||
       hasVpnCredentials
@@ -673,12 +696,14 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
         duration: extra.duration || '1 Month',
         payment_status: orderRecord.payment_status || 'Pending Verification',
         provisioning_status: normalizedStage,
+        rawProvisioningStatus: orderRecord.provisioning_status || null,
+        autoActivated: isConfirmedAutoActivated,
         createdAt: orderRecord.created_at,
         activatedAt: orderRecord.activated_at || vpnConfig?.activated_at || null,
         expiryDate: orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null,
         inboundId: vpnConfig?.inbound_id || null,
-        clientUuid: orderRecord.client_uuid || vpnConfig?.uuid || null,
-        vlessUrl: orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || null,
+        clientUuid: resolvedClientUuid,
+        vlessUrl: resolvedVlessUrl,
         subscriptionUrl: orderRecord.subscription_url || vpnConfig?.subscription_url || null,
         dataLimit: vpnConfig?.data_limit || extra.dataLimit || null,
         reject_reason: orderRecord.reject_reason || null

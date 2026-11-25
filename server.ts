@@ -113,7 +113,12 @@ app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
 app.use('/api', (req, res, next) => {
+  const normalizedApiPath = (req.path || '').replace(/\/+$/, '');
+  const isCreateOrderPost = req.method === 'POST' && normalizedApiPath === '/renew/orders';
+  const isCreateRenewPost = req.method === 'POST' && normalizedApiPath === '/renew/request';
   const isLongRunning =
+    isCreateOrderPost ||
+    isCreateRenewPost ||
     req.path.includes('claim-trial') ||
     req.path.includes('approve') ||
     req.path.includes('telegram');

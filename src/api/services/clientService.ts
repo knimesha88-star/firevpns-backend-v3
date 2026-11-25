@@ -28,9 +28,23 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
 
   // Only include configurations that have a real UUID, configUrl, and are not pending/rejected/deleted/revoked
   const myConfigs = rawConfigs.filter((c: any) => {
-    if (!c || !c.uuid || !c.configUrl) return false;
+    if (!c || c.isRejected === true || !c.uuid || !c.configUrl) return false;
     const st = String(c.status || '').toLowerCase().trim();
-    if (st === 'pending' || st === 'rejected' || st === 'deleted' || st === 'cancelled' || st === 'revoked') return false;
+    const paySt = String(c.paymentStatus || '').toLowerCase().trim();
+    const provSt = String(c.provisioningStatus || '').toLowerCase().trim();
+    if (
+      st === 'pending' ||
+      st === 'rejected' ||
+      st === 'deleted' ||
+      st === 'cancelled' ||
+      st === 'revoked' ||
+      paySt === 'rejected' ||
+      provSt === 'revoked' ||
+      provSt === 'revoke_failed' ||
+      provSt === 'rejected'
+    ) {
+      return false;
+    }
     return true;
   });
 

@@ -2,7 +2,14 @@ import { Response } from 'express';
 import { AuthRequest } from '../../types/interfaces.js';
 import * as xuiService from '../services/xuiService.js';
 import { supabase, supabaseAdmin } from '../../lib/supabase.js';
-import { sendRenewNotification, sendRenewApprovedNotification, sendNewOrderNotification, sendOrderApprovedNotification, sendOrderRejectedNotification } from '../services/telegramService.js';
+import {
+  sendRenewNotification,
+  sendRenewApprovedNotification,
+  sendNewOrderNotification,
+  sendOrderApprovedNotification,
+  sendOrderRejectedNotification,
+  syncRenewTelegramInlineMessage,
+} from '../services/telegramService.js';
 import { createCustomerNotification } from '../services/notificationService.js';
 import {
   sendOrderReceivedEmail,
@@ -17,12 +24,16 @@ import { verifyRenewalCheckoutPrice, verifySpecialOfferCheckoutPrice } from '../
 import {
   computePaymentSlipSha256AndVerifyStorage,
   claimPaymentReceiptForAutoActivation,
+  claimPaymentReceiptForRenewal,
+  isRenewalPaymentSlipStoragePathOwnedByUser,
   parsePaymentSlipReference,
 } from '../services/paymentSlipService.js';
 
 /**
- * Feature flag helpers (Requirement 7 & 8):
- * Both flags default to false. Automatic renewals are strictly disabled in Phase 1.
+ * Feature flag helpers:
+ * Both flags default to false.
+ * Automatic renewals are controlled independently via AUTO_ACTIVATE_RENEWALS_ENABLED
+ * and require a separate, explicit, non-empty AUTO_ACTIVATE_RENEWALS_ALLOWLIST.
  */
 export const isAutoActivateNewOrdersEnabled = (): boolean =>
   String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || 'false').trim().toLowerCase() === 'true';
@@ -48,7 +59,28 @@ export const isUserAuthorizedForAutoActivateNewOrders = (uid?: string | null, em
   return Boolean((normUid && allowlist.includes(normUid)) || (normEmail && allowlist.includes(normEmail)));
 };
 
-export const isAutoActivateRenewalsEnabled = (): boolean => false;
+export const isAutoActivateRenewalsEnabled = (): boolean =>
+  String(process.env.AUTO_ACTIVATE_RENEWALS_ENABLED || 'false').trim().toLowerCase() === 'true';
+
+/**
+ * Mandatory safety requirement:
+ * Automatic renewals require a separate, explicit, non-empty AUTO_ACTIVATE_RENEWALS_ALLOWLIST
+ * during initial testing and must NEVER inherit AUTO_ACTIVATE_NEW_ORDERS_ALLOWLIST.
+ */
+export const getAutoActivateRenewalsAllowlist = (): string[] =>
+  String(process.env.AUTO_ACTIVATE_RENEWALS_ALLOWLIST || '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+
+export const isUserAuthorizedForAutoActivateRenewals = (uid?: string | null, email?: string | null): boolean => {
+  if (!isAutoActivateRenewalsEnabled()) return false;
+  const allowlist = getAutoActivateRenewalsAllowlist();
+  if (allowlist.length === 0) return false;
+  const normUid = String(uid || '').trim().toLowerCase();
+  const normEmail = String(email || '').trim().toLowerCase();
+  return Boolean((normUid && allowlist.includes(normUid)) || (normEmail && allowlist.includes(normEmail)));
+};
 
 const getSafeOrderSourceLabel = (
   rawSource: unknown
@@ -299,6 +331,124 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
     const data = req.body || {};
     const customerEmail = authEmail;
     const requestedDuration = Number(data.durationMonths || data.duration || 1);
+    const rawSlipUrl = String(data.slipUrl || data.slip_url || '').trim();
+
+    if (rawSlipUrl && (rawSlipUrl.includes('..') || rawSlipUrl.includes('\0'))) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid payment slip path.',
+      });
+      return;
+    }
+
+    const dbClient = (req as any).dbClient || supabaseAdmin || supabase;
+    const autoActivateRenewalsAuthorized = isUserAuthorizedForAutoActivateRenewals(uid, customerEmail);
+
+    // Upfront receipt storage path ownership verification when automatic renewal is authorized
+    if (autoActivateRenewalsAuthorized && rawSlipUrl) {
+      const ownershipCheck = isRenewalPaymentSlipStoragePathOwnedByUser({
+        slipUrl: rawSlipUrl,
+        uid,
+        email: customerEmail,
+      });
+      if (!ownershipCheck.valid) {
+        logAutoActivationDebug('renewal_upfront_ownership_rejected', {
+          endpoint: 'createRenewRequest',
+          authorizedForAutoRenewal: autoActivateRenewalsAuthorized,
+          reason: `UPFRONT_OWNERSHIP_REJECTED:${ownershipCheck.reason || 'INVALID_SLIP_PATH'}`,
+        });
+        res.status(ownershipCheck.reason === 'OWNERSHIP_MISMATCH' ? 403 : 400).json({
+          success: false,
+          error:
+            ownershipCheck.reason === 'OWNERSHIP_MISMATCH'
+              ? 'Payment slip ownership mismatch. Please upload your own payment receipt.'
+              : 'Invalid payment slip path. Please upload your payment receipt again.',
+        });
+        return;
+      }
+    }
+
+    // Verify customer ownership of the target VPN account if uuid or vpn_account_id is supplied
+    const requestedUuid = String(data.uuid || data.vpnAccountUuid || '').trim();
+    const requestedAccountId = String(data.vpn_account_id || data.vpnAccountId || '').trim();
+    let verifiedTargetVpnAccount: any = null;
+
+    if (requestedAccountId) {
+      const { data: vAcc } = await dbClient
+        .from('vpn_accounts')
+        .select('*')
+        .eq('id', requestedAccountId)
+        .maybeSingle();
+      if (vAcc) verifiedTargetVpnAccount = vAcc;
+    }
+    if (!verifiedTargetVpnAccount && requestedUuid) {
+      const { data: vAcc } = await dbClient
+        .from('vpn_accounts')
+        .select('*')
+        .eq('uuid', requestedUuid)
+        .maybeSingle();
+      if (vAcc) verifiedTargetVpnAccount = vAcc;
+    }
+
+    if (verifiedTargetVpnAccount) {
+      const accOwnerUid = String(verifiedTargetVpnAccount.user_id || '').trim();
+      const accOwnerEmail = String(verifiedTargetVpnAccount.email || '').trim().toLowerCase();
+      const uidMatches = Boolean(accOwnerUid && accOwnerUid === uid);
+      const emailMatches = Boolean(!accOwnerUid && accOwnerEmail && accOwnerEmail === customerEmail);
+      if (!uidMatches && !emailMatches && !(accOwnerEmail && accOwnerEmail === customerEmail)) {
+        res.status(403).json({
+          success: false,
+          error: 'Forbidden: You do not own the selected VPN account.',
+        });
+        return;
+      }
+    }
+
+    // Duplicate-submission protection: if an identical renewal request for this customer & slip was created within the last 2 minutes, return it
+    if (rawSlipUrl && !data.renewalId && !data.id) {
+      const twoMinutesAgoIso = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+      const { data: existingRecentRenew } = await dbClient
+        .from('renew_requests')
+        .select('*')
+        .eq('user_id', uid)
+        .eq('slip_url', rawSlipUrl)
+        .eq('status', 'pending')
+        .gte('created_at', twoMinutesAgoIso)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingRecentRenew) {
+        let existingNotes: any = {};
+        if (typeof existingRecentRenew.notes === 'string' && existingRecentRenew.notes.startsWith('{')) {
+          try {
+            existingNotes = JSON.parse(existingRecentRenew.notes);
+          } catch {
+            existingNotes = {};
+          }
+        }
+        const wasProvisional =
+          existingRecentRenew.provisioning_status === 'provisional' ||
+          Boolean(existingNotes?.provisional_renewal);
+        res.status(200).json({
+          success: true,
+          deduplicated: true,
+          renewalId: existingRecentRenew.id,
+          autoRenewed: wasProvisional,
+          provisional: wasProvisional,
+          provisioningStatus: existingRecentRenew.provisioning_status || (wasProvisional ? 'provisional' : 'pending'),
+          newExpiry: existingNotes?.new_expiry || null,
+          oldExpiry: existingNotes?.old_expiry || null,
+          dataAllowance: existingNotes?.data_allowance || null,
+          packageName: existingNotes?.package_name || existingRecentRenew.plan_name || null,
+          uuid: existingNotes?.uuid || requestedUuid || null,
+          message: wasProvisional
+            ? 'Renewal already processed and provisionally active.'
+            : 'Renewal request already submitted and pending payment verification.',
+        });
+        return;
+      }
+    }
 
     // Authoritatively validate renewal duration, package eligibility, and latest active offer price from Supabase
     const verified = await verifyRenewalCheckoutPrice({
@@ -313,8 +463,8 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       planName: data.planName || data.plan || null,
       category: data.category || null,
       packageType: data.packageType || data.package_type || null,
-      vpnAccountUuid: data.uuid || data.vpnAccountUuid || null,
-      vpnAccountId: data.vpn_account_id || data.vpnAccountId || null,
+      vpnAccountUuid: requestedUuid || null,
+      vpnAccountId: requestedAccountId || null,
     });
 
     const submittedAmount =
@@ -338,14 +488,13 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const dbClient = supabaseAdmin || supabase;
     let renewalRecordId = data.renewalId || data.id || null;
 
     const effectivePlanDisplay = verified.isSpecialOffer && verified.appliedOffer
       ? `${verified.packageName} (${verified.appliedOffer.name} - ${verified.durationLabel})`
       : data.planName || data.plan || `${verified.packageName} (${verified.planName})`;
 
-    const extraMetadata = {
+    const extraMetadata: Record<string, any> = {
       planId: data.planId || null,
       plan_name: effectivePlanDisplay,
       package_id: verified.packageId,
@@ -364,12 +513,13 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       paymentDate: String(data.paymentDate || '').trim(),
       receiptNumber: String(data.receiptNumber || '').trim(),
       message: String(data.message || '').trim().slice(0, 1000),
-      vpn_account_id: String(data.vpn_account_id || data.vpnAccountId || '').trim(),
-      uuid: String(data.uuid || data.vpnAccountUuid || '').trim(),
+      vpn_account_id: requestedAccountId || (verifiedTargetVpnAccount?.id ? String(verifiedTargetVpnAccount.id) : ''),
+      uuid: requestedUuid || (verifiedTargetVpnAccount?.uuid ? String(verifiedTargetVpnAccount.uuid) : ''),
+      order_id: verifiedTargetVpnAccount?.order_id ? String(verifiedTargetVpnAccount.order_id) : undefined,
       config_name: String(data.configName || data.config_name || effectivePlanDisplay).trim(),
       server_node: String(data.serverNode || data.server_node || 'Singapore Server').trim(),
       old_expiry: String(data.oldExpiry || data.old_expiry || '').trim(),
-      slip_url: String(data.slipUrl || data.slip_url || '').trim(),
+      slip_url: rawSlipUrl,
       user_name: String(data.customerName || data.userName || authEmail.split('@')[0] || 'Customer').trim().slice(0, 120),
     };
 
@@ -412,21 +562,35 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       }
     } else {
       // Authoritative server-side renewal insertion (always forced pending & verified price)
-      const { data: insertedRenew, error: insertRenewErr } = await dbClient
+      const insertPayload: Record<string, any> = {
+        user_id: uid,
+        user_email: customerEmail,
+        plan_name: effectivePlanDisplay,
+        amount: verified.finalPrice,
+        payment_method: String(data.receiptNumber || '').trim() || 'Bank Transfer',
+        slip_url: rawSlipUrl,
+        notes: JSON.stringify(extraMetadata),
+        status: 'pending',
+        provisioning_status: 'pending',
+        created_at: new Date().toISOString(),
+      };
+
+      let { data: insertedRenew, error: insertRenewErr } = await dbClient
         .from('renew_requests')
-        .insert({
-          user_id: uid,
-          user_email: customerEmail,
-          plan_name: effectivePlanDisplay,
-          amount: verified.finalPrice,
-          payment_method: String(data.receiptNumber || '').trim() || 'Bank Transfer',
-          slip_url: String(data.slipUrl || data.slip_url || '').trim(),
-          notes: JSON.stringify(extraMetadata),
-          status: 'pending',
-          created_at: new Date().toISOString(),
-        })
+        .insert(insertPayload)
         .select('id')
         .maybeSingle();
+
+      if (insertRenewErr && String(insertRenewErr.message || '').includes('provisioning_status')) {
+        const { provisioning_status: _omitted, ...fallbackPayload } = insertPayload;
+        const retryInsert = await dbClient
+          .from('renew_requests')
+          .insert(fallbackPayload)
+          .select('id')
+          .maybeSingle();
+        insertedRenew = retryInsert.data;
+        insertRenewErr = retryInsert.error;
+      }
 
       if (insertRenewErr) {
         console.error('[RenewController] Failed to create renew_requests row:', insertRenewErr.message);
@@ -436,7 +600,84 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       renewalRecordId = insertedRenew?.id || null;
     }
 
+    // Automatic Provisional Renewal Workflow (when AUTO_ACTIVATE_RENEWALS_ENABLED=true and user is in AUTO_ACTIVATE_RENEWALS_ALLOWLIST)
+    let autoRenewed = false;
+    let provisioningStatus: 'pending' | 'provisional' | 'uncertain' = 'pending';
+    let autoRenewalBlockedReason: string | null = null;
+    let provisionalResult: xuiService.ProvisionalRenewalProvisionResult | null = null;
+
+    if (autoActivateRenewalsAuthorized && renewalRecordId) {
+      if (!rawSlipUrl) {
+        autoRenewalBlockedReason = 'MISSING_PAYMENT_SLIP';
+      } else {
+        try {
+          const slipCheck = await computePaymentSlipSha256AndVerifyStorage({
+            slipUrl: rawSlipUrl,
+            userUid: uid,
+            userEmail: customerEmail,
+            allowedFolders: ['renewals', 'orders', 'billing'],
+            storageClient: dbClient.storage,
+          });
+
+          if (!slipCheck.valid) {
+            autoRenewalBlockedReason = slipCheck.code || 'SLIP_VERIFICATION_FAILED';
+            console.warn(
+              `[RenewController] Auto-renewal held for request ${renewalRecordId} (${autoRenewalBlockedReason}): ${slipCheck.error || 'Slip verification failed'}`
+            );
+          } else {
+            const claimRes = await claimPaymentReceiptForRenewal({
+              sha256: slipCheck.sha256,
+              canonicalSlipUrl: slipCheck.canonicalSlipUrl,
+              renewRequestId: String(renewalRecordId),
+              userId: uid,
+              userEmail: customerEmail,
+              byteSize: slipCheck.byteSize,
+              contentType: slipCheck.contentType,
+              dbClient,
+            });
+
+            if (!claimRes.claimed) {
+              autoRenewalBlockedReason = claimRes.conflictReason || claimRes.code || 'DUPLICATE_SLIP';
+              console.warn(
+                `[RenewController] Auto-renewal held for request ${renewalRecordId} (${autoRenewalBlockedReason}): ${claimRes.error || 'Receipt claim blocked'}`
+              );
+            } else {
+              console.log(
+                `[RenewController] AUTO_ACTIVATE_RENEWALS_ENABLED=true: Receipt claimed (${slipCheck.sha256.slice(0, 12)}...). Provisioning provisional renewal for request ${renewalRecordId}...`
+              );
+              provisionalResult = await xuiService.provisionProvisionalRenewal(String(renewalRecordId), {
+                dbClient,
+              });
+
+              if (
+                provisionalResult?.success &&
+                provisionalResult?.autoRenewed === true &&
+                provisionalResult?.provisioningStatus === 'provisional'
+              ) {
+                autoRenewed = true;
+                provisioningStatus = 'provisional';
+              } else {
+                autoRenewed = false;
+                provisioningStatus =
+                  provisionalResult?.provisioningStatus === 'uncertain' ? 'uncertain' : 'pending';
+                autoRenewalBlockedReason =
+                  provisionalResult?.blockedReason || 'PROVISIONING_HELD_FOR_MANUAL_REVIEW';
+              }
+            }
+          }
+        } catch (autoErr: any) {
+          autoRenewed = false;
+          autoRenewalBlockedReason = autoRenewalBlockedReason || 'PROVISIONING_ERROR';
+          console.error(
+            `[RenewController] Provisional automatic renewal failed for request ${renewalRecordId} (preserved in pending queue for manual admin review):`,
+            autoErr?.message || autoErr
+          );
+        }
+      }
+    }
+
     const notificationData = {
+      requestId: renewalRecordId ? String(renewalRecordId) : undefined,
       email: customerEmail,
       userEmail: customerEmail,
       planName: effectivePlanDisplay,
@@ -445,7 +686,14 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       receiptNumber: String(data.receiptNumber || '').trim(),
       message: String(data.message || '').trim(),
       paymentDate: String(data.paymentDate || '').trim(),
-      status: 'Pending'
+      slipUrl: rawSlipUrl,
+      status: 'Pending',
+      provisional: autoRenewed,
+      provisioningStatus,
+      newExpiry: provisionalResult?.newExpiryIso,
+      oldExpiry: provisionalResult?.oldExpiryIso,
+      autoRenewalBlockedReason: autoRenewalBlockedReason || undefined,
+      dbClient,
     };
 
     // Create customer notification
@@ -453,8 +701,10 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
       await createCustomerNotification({
         userId: uid,
         userEmail: customerEmail,
-        title: 'Payment Submitted',
-        message: `Your payment of LKR ${notificationData.amount} for "${notificationData.planName || 'VPN Package'}" (${verified.durationLabel}) has been submitted for verification.`,
+        title: autoRenewed ? 'VPN Renewed (Pending Payment Verification)' : 'Payment Submitted',
+        message: autoRenewed
+          ? `Your VPN package "${provisionalResult?.packageName || verified.packageName}" has been renewed immediately (${verified.durationLabel}). Your payment of LKR ${notificationData.amount} is pending admin verification.`
+          : `Your payment of LKR ${notificationData.amount} for "${notificationData.planName || 'VPN Package'}" (${verified.durationLabel}) has been submitted for verification.`,
         type: 'payment_submitted'
       });
     } catch (notifErr: any) {
@@ -485,7 +735,22 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
     res.json({
       success: true,
       renewalId: renewalRecordId,
-      message: 'Renewal request verified and submitted successfully.',
+      autoRenewed,
+      provisional: autoRenewed,
+      provisioningStatus,
+      autoRenewalBlockedReason,
+      newExpiry: autoRenewed ? provisionalResult?.newExpiryIso || null : null,
+      oldExpiry: autoRenewed ? provisionalResult?.oldExpiryIso || null : null,
+      dataAllowance: autoRenewed ? provisionalResult?.dataAllowanceLabel || null : null,
+      packageName: autoRenewed
+        ? provisionalResult?.packageName || verified.packageName || effectivePlanDisplay
+        : verified.packageName || effectivePlanDisplay,
+      uuid: provisionalResult?.uuid || extraMetadata.uuid || null,
+      paymentStatus: 'Pending Verification',
+      vpnStatus: autoRenewed ? 'Active' : undefined,
+      message: autoRenewed
+        ? 'VPN renewed and active immediately! Payment verification is pending admin review.'
+        : 'Renewal request verified and submitted successfully.',
       verifiedPrice: verified,
     });
   } catch (error: any) {
@@ -494,45 +759,100 @@ export const createRenewRequest = async (req: AuthRequest, res: Response): Promi
   }
 };
 
-export const approveRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
-  const { requestId } = req.params;
-  
+export interface ExecuteRenewalActionOptions {
+  adminId?: string | null;
+  adminLabel?: string;
+  dbClient?: any;
+  requestApiFn?: any;
+  getInboundsFn?: any;
+  getClientExpiryFn?: typeof xuiService.getClientExpiry;
+  updateClientExpiryFn?: typeof xuiService.updateClientExpiry;
+  nowMs?: number;
+  skipSideEffects?: boolean;
+}
+
+/**
+ * Authoritative renewal approval handler shared by Admin HTTP API and Telegram inline button callbacks.
+ * Works regardless of whether AUTO_ACTIVATE_RENEWALS_ENABLED is true or false.
+ * - If the renewal request has already been provisionally applied in 3X-UI, confirms payment and marks
+ *   the grant verified WITHOUT extending expiry or adding quota a second time.
+ * - If the renewal request is a standard manual pending renewal, acquires client & inbound locks and
+ *   extends expiry/quota in 3X-UI with read-back verification.
+ */
+export const executeRenewalApproval = async (
+  requestId: string,
+  options?: ExecuteRenewalActionOptions
+): Promise<{
+  success: boolean;
+  provisionalConfirmed: boolean;
+  uuid?: string;
+  newExpiryIso?: string;
+  data?: any;
+}> => {
+  const cleanRequestId = String(requestId || '').trim();
+  if (!cleanRequestId) {
+    throw new Error('Request ID is required');
+  }
+
+  const dbClient = options?.dbClient || supabaseAdmin || supabase;
+  const lockKey = `renew:${cleanRequestId}`;
+  const lockClaim = await xuiService.acquireDurableProvisioningOperationLock({
+    dbClient,
+    operationKey: lockKey,
+    operationType: 'approve_renew',
+    targetId: cleanRequestId,
+    leaseSeconds: 120,
+    requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
+    allowUncertainRecovery: true,
+    metadata: { action: 'approve_renew', adminLabel: options?.adminLabel || 'Admin' },
+  });
+
+  if (!lockClaim.acquired) {
+    const lockErr: any = new Error(
+      `Renewal request ${cleanRequestId} is currently locked by another operation (${lockClaim.previousStatus || 'in_progress'}). Please wait and retry.`
+    );
+    lockErr.statusCode = 409;
+    throw lockErr;
+  }
+
+  let finalLockStatus: 'completed' | 'failed' | 'uncertain' = 'failed';
+  let finalLockError: string | null = null;
+
   try {
-    if (!requestId) {
-      res.status(400).json({ error: 'Request ID is required' });
-      return;
-    }
-    
-    // Read the renew_requests record from Supabase using admin client
-    const dbClient = supabaseAdmin || supabase;
     const { data, error: fetchErr } = await dbClient
       .from('renew_requests')
       .select('*')
-      .eq('id', requestId)
+      .eq('id', cleanRequestId)
       .maybeSingle();
-    
+
     if (fetchErr || !data) {
-      res.status(404).json({ error: 'Renewal request not found' });
-      return;
+      const notFoundErr: any = new Error('Renewal request not found');
+      notFoundErr.statusCode = 404;
+      throw notFoundErr;
     }
-    
-    console.log("[RenewController] Loaded renew request for approval:", data);
-    
-    // Validate status must equal "pending"
+
     const currentStatus = String(data.status || '').toLowerCase();
     if (currentStatus !== 'pending') {
-      res.status(400).json({ error: `Cannot approve request with status '${data.status}'. Status must be 'pending'.` });
-      return;
+      const statusErr: any = new Error(
+        `Cannot approve request with status '${data.status}'. Status must be 'pending'.`
+      );
+      statusErr.statusCode = 400;
+      throw statusErr;
     }
-    
+
     const email = data.user_email || data.userEmail || data.email;
     if (!email) {
-      res.status(400).json({ error: 'Client email is missing in the renewal request.' });
-      return;
+      const emailErr: any = new Error('Client email is missing in the renewal request.');
+      emailErr.statusCode = 400;
+      throw emailErr;
     }
-    
+
     let durationMonths = Number(data.durationMonths || data.duration_months || data.duration || 1);
-    const parsedNotes = data.notes ? (typeof data.notes === 'string' && data.notes.startsWith('{') ? JSON.parse(data.notes) : data.notes) : null;
+    const parsedNotes = data.notes
+      ? typeof data.notes === 'string' && data.notes.startsWith('{')
+        ? JSON.parse(data.notes)
+        : data.notes
+      : null;
     if (parsedNotes && typeof parsedNotes === 'object') {
       if (parsedNotes.durationMonths) {
         durationMonths = Number(parsedNotes.durationMonths);
@@ -545,7 +865,81 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       durationMonths = 1;
     }
 
-    // Resolve corresponding vpn_accounts row by order_id / vpn_account_id / uuid / user
+    // 1. Check if this renewal request was already provisionally provisioned
+    const provisionalConfirm = await xuiService.confirmProvisionalRenewal(cleanRequestId, {
+      dbClient,
+      adminLabel: options?.adminLabel || (options?.adminId ? `Admin (${options.adminId})` : 'Admin Panel'),
+      getInboundsFn: options?.getInboundsFn,
+      heldRenewLockOwnerId: lockClaim.lockOwnerId,
+    });
+
+    if (provisionalConfirm.handledAsProvisional) {
+      const nowIso = new Date().toISOString();
+      const confirmedExpiryIso =
+        provisionalConfirm.newExpiryIso ||
+        parsedNotes?.new_expiry ||
+        new Date().toISOString();
+      const confirmedUuid = provisionalConfirm.uuid || parsedNotes?.uuid || data.uuid;
+      const { data: refreshedApprovedRow } = await dbClient
+        .from('renew_requests')
+        .select('*')
+        .eq('id', cleanRequestId)
+        .maybeSingle();
+
+      if (!options?.skipSideEffects) {
+        try {
+          await createCustomerNotification({
+            userId: data.user_id || data.userId || null,
+            userEmail: email,
+            title: 'Renewal Payment Approved',
+            message: `Your payment for VPN renewal "${data.plan_name || data.planName || 'Plan'}" has been verified and approved. Your renewed VPN remains active until ${new Date(confirmedExpiryIso).toLocaleDateString()}.`,
+            type: 'vpn_renewed',
+          });
+        } catch (nErr: any) {
+          console.error('[RenewController] Customer notification creation error:', nErr?.message || nErr);
+        }
+
+        sendRenewApprovedNotification({
+          email,
+          userEmail: email,
+          planName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
+          durationMonths,
+          new_expiry: confirmedExpiryIso,
+          approved_at: new Date(nowIso),
+        }).catch((telegramErr) => {
+          console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
+        });
+
+        syncRenewTelegramInlineMessage(cleanRequestId, 'APPROVED', {
+          adminLabel: options?.adminLabel || 'Admin Panel',
+          uuid: confirmedUuid,
+          newExpiry: confirmedExpiryIso,
+        }).catch(() => {});
+
+        if (email) {
+          sendRenewalApprovedEmail({
+            userEmail: email,
+            customerName: data.user_name || parsedNotes?.user_name || undefined,
+            renewalId: cleanRequestId,
+            packageName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
+            expiryDate: confirmedExpiryIso,
+            vlessUrl: '',
+            userId: data.user_id || data.userId,
+          }).catch((e) => console.warn('[RenewController] Renewal approved email warning:', e));
+        }
+      }
+
+      finalLockStatus = 'completed';
+      return {
+        success: true,
+        provisionalConfirmed: true,
+        uuid: confirmedUuid,
+        newExpiryIso: confirmedExpiryIso,
+        data: refreshedApprovedRow || data,
+      };
+    }
+
+    // 2. Standard Manual Renewal Approval Flow (not provisionally applied yet)
     const orderId = data.order_id || data.orderId || parsedNotes?.order_id || parsedNotes?.orderId;
     const specAccountId = data.vpn_account_id || parsedNotes?.vpn_account_id;
     const specUuid = data.uuid || parsedNotes?.uuid;
@@ -553,7 +947,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     let targetVpnAcc: any = null;
 
     if (orderId) {
-      const { data: vAcc } = await supabase
+      const { data: vAcc } = await dbClient
         .from('vpn_accounts')
         .select('*')
         .eq('order_id', orderId)
@@ -562,7 +956,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }
 
     if (!targetVpnAcc && specAccountId) {
-      const { data: vAcc } = await supabase
+      const { data: vAcc } = await dbClient
         .from('vpn_accounts')
         .select('*')
         .eq('id', specAccountId)
@@ -571,7 +965,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }
 
     if (!targetVpnAcc && specUuid) {
-      const { data: vAcc } = await supabase
+      const { data: vAcc } = await dbClient
         .from('vpn_accounts')
         .select('*')
         .eq('uuid', specUuid)
@@ -580,7 +974,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }
 
     if (!targetVpnAcc && data.user_id) {
-      const { data: vAcc } = await supabase
+      const { data: vAcc } = await dbClient
         .from('vpn_accounts')
         .select('*')
         .eq('user_id', data.user_id)
@@ -591,7 +985,7 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     }
 
     if (!targetVpnAcc && email) {
-      const { data: vAcc } = await supabase
+      const { data: vAcc } = await dbClient
         .from('vpn_accounts')
         .select('*')
         .ilike('email', email)
@@ -604,60 +998,88 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     const targetUuid = targetVpnAcc?.uuid || specUuid;
 
     if (!targetUuid) {
-      res.status(400).json({ error: 'Could not resolve target VPN account UUID for renewal request.' });
-      return;
+      const uuidErr: any = new Error('Could not resolve target VPN account UUID for renewal request.');
+      uuidErr.statusCode = 400;
+      throw uuidErr;
     }
 
-    // 1. Fetch old expiry date
-    let oldExpiryMs: number | null = null;
-    if (data.old_expiry) {
-      oldExpiryMs = new Date(data.old_expiry).getTime();
-    } else if (parsedNotes?.old_expiry) {
-      oldExpiryMs = new Date(parsedNotes.old_expiry).getTime();
-    }
+    const manualUpdateResult = await xuiService.withClientMutationLock(
+      {
+        dbClient,
+        clientUuid: targetUuid,
+        operationType: 'client_lock',
+        targetId: `approve_renew:${cleanRequestId}`,
+        requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
+        allowUncertainRecovery: true,
+        metadata: { renewRequestId: cleanRequestId, action: 'manual_approve_renew' },
+      },
+      async () => {
+        await xuiService.assertNoUnresolvedClientRenewalGrant({
+          dbClient,
+          clientUuid: targetUuid,
+          excludeRenewRequestId: cleanRequestId,
+          operationDescription: 'manual renewal approval',
+        });
 
-    if (!oldExpiryMs || isNaN(oldExpiryMs)) {
-      try {
-        oldExpiryMs = await xuiService.getClientExpiry(targetUuid);
-      } catch (e) {
-        console.warn('[RenewController] Could not fetch live expiry from 3X-UI:', e);
+        let oldExpiryMs: number | null = null;
+        if (data.old_expiry) {
+          oldExpiryMs = new Date(data.old_expiry).getTime();
+        } else if (parsedNotes?.old_expiry) {
+          oldExpiryMs = new Date(parsedNotes.old_expiry).getTime();
+        }
+
+        const getClientExpiryCall = options?.getClientExpiryFn || xuiService.getClientExpiry;
+        const updateClientExpiryCall = options?.updateClientExpiryFn || xuiService.updateClientExpiry;
+
+        if (!oldExpiryMs || isNaN(oldExpiryMs)) {
+          try {
+            oldExpiryMs = await getClientExpiryCall(targetUuid);
+          } catch (e) {
+            console.warn('[RenewController] Could not fetch live expiry from 3X-UI:', e);
+          }
+        }
+
+        if (!oldExpiryMs || isNaN(oldExpiryMs)) {
+          if (targetVpnAcc?.expiry_time) {
+            oldExpiryMs = Number(targetVpnAcc.expiry_time);
+          } else if (targetVpnAcc?.expiry_date) {
+            oldExpiryMs = new Date(targetVpnAcc.expiry_date).getTime();
+          }
+        }
+
+        const oldExpiryIso =
+          oldExpiryMs && !isNaN(oldExpiryMs)
+            ? new Date(oldExpiryMs).toISOString()
+            : new Date().toISOString();
+
+        const planName =
+          data.plan_name ||
+          data.planName ||
+          data.plan ||
+          parsedNotes?.plan_name ||
+          parsedNotes?.planName ||
+          '';
+
+        const { new_expiryMs, newTotalBytes, verifiedEnable, inboundId } =
+          await updateClientExpiryCall(targetUuid, durationMonths, planName, oldExpiryMs);
+
+        if (!verifiedEnable || !new_expiryMs || new_expiryMs <= Date.now()) {
+          throw new Error(
+            `3X-UI client reactivation verification failed for UUID ${targetUuid}: client remains disabled or expiry was not extended in the future.`
+          );
+        }
+
+        return {
+          oldExpiryIso,
+          new_expiryMs,
+          new_expiryIso: new Date(new_expiryMs).toISOString(),
+          newTotalBytes,
+          inboundId,
+        };
       }
-    }
-
-    if (!oldExpiryMs || isNaN(oldExpiryMs)) {
-      if (targetVpnAcc?.expiry_time) {
-        oldExpiryMs = Number(targetVpnAcc.expiry_time);
-      } else if (targetVpnAcc?.expiry_date) {
-        oldExpiryMs = new Date(targetVpnAcc.expiry_date).getTime();
-      }
-    }
-
-    const oldExpiryIso = oldExpiryMs && !isNaN(oldExpiryMs) ? new Date(oldExpiryMs).toISOString() : new Date().toISOString();
-
-    console.log(`[RenewController] Approving renewal request ${requestId} for ${email} (UUID: ${targetUuid}, ${durationMonths} month(s)). Old Expiry: ${oldExpiryIso}`);
-    
-    const planName = data.plan_name || data.planName || data.plan || parsedNotes?.plan_name || parsedNotes?.planName || '';
-
-    // 2. Extend client expiry and reactivate (enable: true) in 3X-UI using UUID (preserving existing UUID & credentials and extending by durationMonths calendar months)
-    const { new_expiryMs, newTotalBytes, verifiedEnable, inboundId } = await xuiService.updateClientExpiry(
-      targetUuid,
-      durationMonths,
-      planName,
-      oldExpiryMs
     );
 
-    if (!verifiedEnable || !new_expiryMs || new_expiryMs <= Date.now()) {
-      throw new Error(
-        `3X-UI client reactivation verification failed for UUID ${targetUuid}: client remains disabled or expiry was not extended in the future.`
-      );
-    }
-
-    const new_expiryIso = new Date(new_expiryMs).toISOString();
-
-    console.log(
-      `[RenewController] 3X-UI update & reactivation verified on inbound ${inboundId} (enable=true). New expiry time: ${new_expiryIso}. New total bytes: ${newTotalBytes}. Executing atomic database updates...`
-    );
-    
+    const { oldExpiryIso, new_expiryMs, new_expiryIso, newTotalBytes } = manualUpdateResult;
     const nowIso = new Date().toISOString();
 
     const updatedNotesObj =
@@ -670,28 +1092,40 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
           }
         : undefined;
 
-    // 3. Update renew_requests table (retaining original agreed amount and duration)
-    const { data: updatedRow, error: updateErr } = await supabase
+    const updatePayload: Record<string, any> = {
+      status: 'approved',
+      provisioning_status: 'completed',
+      updated_at: nowIso,
+      ...(updatedNotesObj ? { notes: JSON.stringify(updatedNotesObj) } : {}),
+    };
+
+    let { data: updatedRow, error: updateErr } = await dbClient
       .from('renew_requests')
-      .update({
-        status: 'approved',
-        updated_at: nowIso,
-        ...(updatedNotesObj ? { notes: JSON.stringify(updatedNotesObj) } : {}),
-      })
-      .eq('id', requestId)
+      .update(updatePayload)
+      .eq('id', cleanRequestId)
       .select()
       .maybeSingle();
+
+    if (updateErr && String(updateErr.message || '').includes('provisioning_status')) {
+      const { provisioning_status: _omitted, ...fallbackPayload } = updatePayload;
+      const retry = await dbClient
+        .from('renew_requests')
+        .update(fallbackPayload)
+        .eq('id', cleanRequestId)
+        .select()
+        .maybeSingle();
+      updatedRow = retry.data;
+      updateErr = retry.error;
+    }
 
     if (updateErr) {
       console.error('[RenewController] Error updating renew_requests table:', updateErr);
       throw updateErr;
     }
-    
-    const dataLimitStr = newTotalBytes > 0 
-      ? `${newTotalBytes / (1024 * 1024 * 1024)}GB` 
-      : 'Unlimited';
 
-    // 4. Update vpn_accounts
+    const dataLimitStr =
+      newTotalBytes > 0 ? `${newTotalBytes / (1024 * 1024 * 1024)}GB` : 'Unlimited';
+
     try {
       let updatedSpecific = false;
       const accUpdatePayload = {
@@ -699,39 +1133,25 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
         expiry_time: new_expiryMs,
         data_limit: dataLimitStr,
         status: 'active',
-        updated_at: nowIso
+        updated_at: nowIso,
       };
 
       if (targetVpnAcc?.id) {
-        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
-        const { error: vErr } = await supabase
+        const { error: vErr } = await dbClient
           .from('vpn_accounts')
           .update(accUpdatePayload)
           .eq('id', targetVpnAcc.id);
-        if (!vErr) {
-          updatedSpecific = true;
-          console.log(`[RenewController] Successfully renewed vpn_account by ID: ${targetVpnAcc.id} with data limit: ${dataLimitStr}`);
-        } else {
-          console.warn(`[RenewController] Failed to renew vpn_account by ID: ${targetVpnAcc.id}`, vErr);
-        }
+        if (!vErr) updatedSpecific = true;
       } else if (targetUuid) {
-        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
-        const { error: vErr } = await supabase
+        const { error: vErr } = await dbClient
           .from('vpn_accounts')
           .update(accUpdatePayload)
           .eq('uuid', targetUuid);
-        if (!vErr) {
-          updatedSpecific = true;
-          console.log(`[RenewController] Successfully renewed vpn_account by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
-        } else {
-          console.warn(`[RenewController] Failed to renew vpn_account by UUID: ${targetUuid}`, vErr);
-        }
+        if (!vErr) updatedSpecific = true;
       }
 
       if (!updatedSpecific && targetUuid) {
-        console.log(`[RenewController] Fallback: Renewing vpn_accounts by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
-        console.log('[vpn_accounts.update payload]:', JSON.stringify(accUpdatePayload, null, 2));
-        await supabase
+        await dbClient
           .from('vpn_accounts')
           .update(accUpdatePayload)
           .eq('uuid', targetUuid);
@@ -740,10 +1160,9 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       console.warn('[RenewController] vpn_accounts update warning:', vErr);
     }
 
-    // 5. Update vpn_configs (and orders if previously expired)
     try {
       if (targetUuid) {
-        const { error: cErr } = await supabase
+        await dbClient
           .from('vpn_configs')
           .update({
             expiry_date: new_expiryIso,
@@ -752,13 +1171,8 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
             status: 'active',
           })
           .eq('uuid', targetUuid);
-        if (!cErr) {
-          console.log(`[RenewController] Successfully renewed and re-enabled vpn_configs by UUID: ${targetUuid} with data limit: ${dataLimitStr}`);
-        } else {
-          console.warn(`[RenewController] Failed to renew vpn_configs by UUID: ${targetUuid}`, cErr);
-        }
 
-        await supabase
+        await dbClient
           .from('orders')
           .update({
             expiry_date: new_expiryIso,
@@ -771,67 +1185,79 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
     } catch (cErr) {
       console.warn('[RenewController] vpn_configs/orders update warning:', cErr);
     }
-    
-    // 6. Create customer notification informing them that their VPN has been renewed and reactivated
-    try {
-      console.log('[RenewController] Creating VPN Renewed & Reactivated notification');
-      await createCustomerNotification({
-        userId: data.user_id || data.userId || null,
+
+    if (!options?.skipSideEffects) {
+      try {
+        await createCustomerNotification({
+          userId: data.user_id || data.userId || null,
+          userEmail: email,
+          title: 'VPN Renewed & Reactivated',
+          message: `Your VPN renewal request for "${data.plan_name || data.planName || 'Plan'}" was approved and your VPN connection has been reactivated. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
+          type: 'vpn_renewed',
+        });
+      } catch (nErr: any) {
+        console.error('[RenewController] CRITICAL: Customer notification creation error:', nErr.message || nErr);
+      }
+
+      sendRenewApprovedNotification({
+        email,
         userEmail: email,
-        title: 'VPN Renewed & Reactivated',
-        message: `Your VPN renewal request for "${data.plan_name || data.planName || 'Plan'}" was approved and your VPN connection has been reactivated. Expiry extended to ${new Date(new_expiryMs).toLocaleDateString()}.`,
-        type: 'vpn_renewed'
+        planName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
+        durationMonths,
+        new_expiry: new_expiryIso,
+        approved_at: new Date(nowIso),
+      }).catch((telegramErr) => {
+        console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
       });
-    } catch (nErr: any) {
-      console.error('[RenewController] CRITICAL: Customer notification creation error:', nErr.message || nErr);
+
+      syncRenewTelegramInlineMessage(cleanRequestId, 'APPROVED', {
+        adminLabel: options?.adminLabel || 'Admin Panel',
+        uuid: targetUuid,
+        newExpiry: new_expiryIso,
+      }).catch(() => {});
+
+      if (email) {
+        sendRenewalApprovedEmail({
+          userEmail: email,
+          customerName: data.user_name || parsedNotes?.user_name || undefined,
+          renewalId: cleanRequestId,
+          packageName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
+          expiryDate: new_expiryIso,
+          vlessUrl: targetVpnAcc?.vless_url || '',
+          userId: data.user_id || data.userId,
+        }).catch((e) => console.warn('[RenewController] Renewal approved email warning:', e));
+      }
+
+      xuiService.triggerBackgroundSyncIfNeeded('VPN Renewed', true);
     }
 
-    // 7. Trigger Telegram approved notification
-    sendRenewApprovedNotification({
-      email: email,
-      userEmail: email,
-      planName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
-      durationMonths: durationMonths,
-      new_expiry: new_expiryIso,
-      approved_at: new Date(nowIso),
-    }).catch((telegramErr) => {
-      console.error('[RenewController] Telegram approved notification error:', telegramErr?.message || telegramErr);
-    });
-
-    // Send Renewal Approved Email (non-blocking)
-    if (email) {
-      sendRenewalApprovedEmail({
-        userEmail: email,
-        customerName: data.user_name || parsedNotes?.user_name || undefined,
-        renewalId: requestId,
-        packageName: data.planName || data.plan_name || data.plan || 'FIREVPN Package',
-        expiryDate: new_expiryIso,
-        vlessUrl: targetVpnAcc?.vless_url || '',
-        userId: data.user_id || data.userId
-      }).catch(e => console.warn('[RenewController] Renewal approved email warning:', e));
-    }
-    
-    // Trigger background synchronization asynchronously and non-blockingly
-    xuiService.triggerBackgroundSyncIfNeeded('VPN Renewed', true);
-
-    res.json({
+    finalLockStatus = 'completed';
+    return {
       success: true,
-      message: 'Renewal request approved, client subscription extended and VPN reactivated successfully.',
-      data: updatedRow
-    });
-  } catch (error: any) {
-    console.error(`[RenewController] Error approving renewal request ${requestId}:`, error?.message || error);
-    res.status(500).json({
-      error:
-        error?.message ||
-        'Failed to approve renewal and reactivate 3X-UI client. The request remains pending and can be retried safely.'
-    });
+      provisionalConfirmed: false,
+      uuid: targetUuid,
+      newExpiryIso: new_expiryIso,
+      data: updatedRow,
+    };
+  } catch (err: any) {
+    finalLockStatus = err?.markLockUncertain ? 'uncertain' : 'failed';
+    finalLockError = err?.message || String(err);
+    throw err;
+  } finally {
+    if (lockClaim.tableAvailable) {
+      await xuiService.finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: lockKey,
+        lockOwnerId: lockClaim.lockOwnerId,
+        status: finalLockStatus,
+        errorMessage: finalLockError,
+      });
+    }
   }
 };
 
-export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
+export const approveRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   const { requestId } = req.params;
-  const reason = req.body?.reason || req.body?.reject_reason || req.body?.rejection_reason || 'Rejected by Admin';
 
   try {
     if (!requestId) {
@@ -839,76 +1265,224 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const dbClient = supabaseAdmin || supabase;
+    const result = await executeRenewalApproval(requestId, {
+      adminId: req.user?.uid || null,
+      adminLabel: req.user?.email ? `Admin (${req.user.email})` : 'Admin Panel',
+      dbClient: (req as any).dbClient || supabaseAdmin || supabase,
+    });
+
+    res.json({
+      success: true,
+      provisionalConfirmed: result.provisionalConfirmed,
+      message: result.provisionalConfirmed
+        ? 'Provisional renewal payment confirmed and verified without duplicate extension.'
+        : 'Renewal request approved, client subscription extended and VPN reactivated successfully.',
+      data: result.data,
+    });
+  } catch (error: any) {
+    const statusCode = Number(error?.statusCode) || 500;
+    console.error(`[RenewController] Error approving renewal request ${requestId}:`, error?.message || error);
+    res.status(statusCode).json({
+      error:
+        error?.message ||
+        'Failed to approve renewal and reactivate 3X-UI client. The request remains pending and can be retried safely.',
+    });
+  }
+};
+
+/**
+ * Authoritative renewal rejection handler shared by Admin HTTP API and Telegram inline button callbacks.
+ * Works regardless of whether AUTO_ACTIVATE_RENEWALS_ENABLED is true or false.
+ * - If the renewal request was provisionally applied, rolls back 3X-UI expiry, quota, and enable state
+ *   (preserving live traffic counters) and restores Supabase records from pre_renewal_db_snapshot
+ *   while preserving valid paid VPN access.
+ * - If the renewal request was a manual pending request, marks it rejected.
+ */
+export const executeRenewalRejection = async (
+  requestId: string,
+  reason = 'Rejected by Admin',
+  options?: ExecuteRenewalActionOptions
+): Promise<{
+  success: boolean;
+  provisionalRevoked: boolean;
+  uuid?: string;
+  data?: any;
+}> => {
+  const cleanRequestId = String(requestId || '').trim();
+  if (!cleanRequestId) {
+    throw new Error('Request ID is required');
+  }
+
+  const dbClient = options?.dbClient || supabaseAdmin || supabase;
+  const lockKey = `renew:${cleanRequestId}`;
+  const lockClaim = await xuiService.acquireDurableProvisioningOperationLock({
+    dbClient,
+    operationKey: lockKey,
+    operationType: 'reject_renew',
+    targetId: cleanRequestId,
+    leaseSeconds: 120,
+    requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
+    allowUncertainRecovery: true,
+    metadata: { action: 'reject_renew', reason, adminLabel: options?.adminLabel || 'Admin' },
+  });
+
+  if (!lockClaim.acquired) {
+    const lockErr: any = new Error(
+      `Renewal request ${cleanRequestId} is currently locked by another operation (${lockClaim.previousStatus || 'in_progress'}). Please wait and retry.`
+    );
+    lockErr.statusCode = 409;
+    throw lockErr;
+  }
+
+  let finalLockStatus: 'completed' | 'failed' | 'uncertain' = 'failed';
+  let finalLockError: string | null = null;
+
+  try {
     const { data, error: fetchErr } = await dbClient
       .from('renew_requests')
       .select('*')
-      .eq('id', requestId)
+      .eq('id', cleanRequestId)
       .maybeSingle();
 
     if (fetchErr || !data) {
-      res.status(404).json({ error: 'Renewal request not found' });
-      return;
+      const notFoundErr: any = new Error('Renewal request not found');
+      notFoundErr.statusCode = 404;
+      throw notFoundErr;
     }
 
     const currentStatus = String(data.status || '').toLowerCase();
     if (currentStatus !== 'pending') {
-      res.status(400).json({ error: `Cannot reject request with status '${data.status}'. Status must be 'pending'.` });
-      return;
+      const statusErr: any = new Error(
+        `Cannot reject request with status '${data.status}'. Status must be 'pending'.`
+      );
+      statusErr.statusCode = 400;
+      throw statusErr;
     }
 
     const email = data.user_email || data.userEmail || data.email;
     const nowIso = new Date().toISOString();
 
-    const { data: updatedRow, error: updateErr } = await supabase
-      .from('renew_requests')
-      .update({
-        status: 'rejected',
-        updated_at: nowIso
-      })
-      .eq('id', requestId)
-      .select()
-      .maybeSingle();
+    const revokeRes = await xuiService.revokeProvisionalRenewal(cleanRequestId, reason, {
+      dbClient,
+      adminLabel: options?.adminLabel || (options?.adminId ? `Admin (${options.adminId})` : 'Admin Panel'),
+      requestApiFn: options?.requestApiFn,
+      getInboundsFn: options?.getInboundsFn,
+      nowMs: options?.nowMs,
+    });
 
-    if (updateErr) {
-      console.error('[RenewController] Error updating renew_requests on rejection:', updateErr);
-      throw updateErr;
+    let updatedRow: any = data;
+
+    if (!revokeRes.handledAsProvisional) {
+      const { data: manualRejectedRow, error: updateErr } = await dbClient
+        .from('renew_requests')
+        .update({
+          status: 'rejected',
+          updated_at: nowIso,
+        })
+        .eq('id', cleanRequestId)
+        .select()
+        .maybeSingle();
+
+      if (updateErr) {
+        console.error('[RenewController] Error updating renew_requests on rejection:', updateErr);
+        throw updateErr;
+      }
+      updatedRow = manualRejectedRow;
+    } else {
+      const { data: refreshedRow } = await dbClient
+        .from('renew_requests')
+        .select('*')
+        .eq('id', cleanRequestId)
+        .maybeSingle();
+      if (refreshedRow) updatedRow = refreshedRow;
     }
 
-    // Create customer notification
-    try {
-      console.log('[RenewController] Creating Payment Rejected notification for renewal rejection');
-      await createCustomerNotification({
-        userId: data.user_id || data.userId || null,
-        userEmail: email,
-        title: 'Payment Rejected',
-        message: `Your VPN renewal payment/request for "${data.plan_name || data.planName || 'Plan'}" was rejected: ${reason}`,
-        type: 'payment_rejected'
+    if (!options?.skipSideEffects) {
+      try {
+        await createCustomerNotification({
+          userId: data.user_id || data.userId || null,
+          userEmail: email,
+          title: 'Payment Rejected',
+          message: revokeRes.handledAsProvisional
+            ? `Your VPN renewal payment for "${data.plan_name || data.planName || 'Plan'}" was rejected (${reason}) and the provisional renewal extension has been rolled back.`
+            : `Your VPN renewal payment/request for "${data.plan_name || data.planName || 'Plan'}" was rejected: ${reason}`,
+          type: 'payment_rejected',
+        });
+      } catch (nErr: any) {
+        console.error('[RenewController] CRITICAL: Customer notification creation error on reject:', nErr.message || nErr);
+      }
+
+      syncRenewTelegramInlineMessage(cleanRequestId, 'REJECTED', {
+        adminLabel: options?.adminLabel || 'Admin Panel',
+        uuid: revokeRes.uuid,
+        reason,
+      }).catch(() => {});
+
+      if (email) {
+        sendRenewalRejectedEmail({
+          userEmail: email,
+          customerName: data.user_name || undefined,
+          renewalId: cleanRequestId,
+          packageName: data.plan_name || data.planName || 'VPN Plan',
+          reason,
+          userId: data.user_id || data.userId,
+        }).catch((e) => console.warn('[RenewController] Renewal rejected email warning:', e));
+      }
+    }
+
+    finalLockStatus = 'completed';
+    return {
+      success: true,
+      provisionalRevoked: revokeRes.handledAsProvisional,
+      uuid: revokeRes.uuid,
+      data: updatedRow,
+    };
+  } catch (err: any) {
+    finalLockStatus = err?.markLockUncertain ? 'uncertain' : 'failed';
+    finalLockError = err?.message || String(err);
+    throw err;
+  } finally {
+    if (lockClaim.tableAvailable) {
+      await xuiService.finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: lockKey,
+        lockOwnerId: lockClaim.lockOwnerId,
+        status: finalLockStatus,
+        errorMessage: finalLockError,
       });
-    } catch (nErr: any) {
-      console.error('[RenewController] CRITICAL: Customer notification creation error on reject:', nErr.message || nErr);
+    }
+  }
+};
+
+export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { requestId } = req.params;
+  const reason =
+    req.body?.reason || req.body?.reject_reason || req.body?.rejection_reason || 'Rejected by Admin';
+
+  try {
+    if (!requestId) {
+      res.status(400).json({ error: 'Request ID is required' });
+      return;
     }
 
-    // Send Renewal Rejected Email (non-blocking)
-    if (email) {
-      sendRenewalRejectedEmail({
-        userEmail: email,
-        customerName: data.user_name || undefined,
-        renewalId: requestId,
-        packageName: data.plan_name || data.planName || 'VPN Plan',
-        reason: reason,
-        userId: data.user_id || data.userId
-      }).catch(e => console.warn('[RenewController] Renewal rejected email warning:', e));
-    }
+    const result = await executeRenewalRejection(requestId, reason, {
+      adminId: req.user?.uid || null,
+      adminLabel: req.user?.email ? `Admin (${req.user.email})` : 'Admin Panel',
+      dbClient: (req as any).dbClient || supabaseAdmin || supabase,
+    });
 
     res.json({
       success: true,
-      message: 'Renewal request rejected successfully.',
-      data: updatedRow
+      provisionalRevoked: result.provisionalRevoked,
+      message: result.provisionalRevoked
+        ? 'Renewal request rejected and provisional VPN extension rolled back safely.'
+        : 'Renewal request rejected successfully.',
+      data: result.data,
     });
   } catch (error: any) {
-    console.error(`[RenewController] Error rejecting renewal request ${requestId}:`, error.message);
-    res.status(500).json({ error: error.message || 'Failed to reject renewal request' });
+    const statusCode = Number(error?.statusCode) || 500;
+    console.error(`[RenewController] Error rejecting renewal request ${requestId}:`, error?.message || error);
+    res.status(statusCode).json({ error: error?.message || 'Failed to reject renewal request' });
   }
 };
 
@@ -1074,7 +1648,18 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const verifiedAmount = verifiedPrice.finalPrice;
-    const generatedOrderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+    const rawClientOrderId = String(data.clientOrderId || data.orderId || '').trim();
+    let generatedOrderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+    if (/^ORD-\d{6}-\d{3,4}$/.test(rawClientOrderId)) {
+      const { data: existingOrderById } = await dbClient
+        .from('orders')
+        .select('id')
+        .eq('order_id', rawClientOrderId)
+        .maybeSingle();
+      if (!existingOrderById) {
+        generatedOrderId = rawClientOrderId;
+      }
+    }
     const packageName = String(data.plan || data.packageName || 'VPN Package').trim().slice(0, 180);
 
     const paymentMetadata: Record<string, any> = {

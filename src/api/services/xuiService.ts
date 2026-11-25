@@ -1381,6 +1381,9 @@ const INBOUND_LOCK_LEASE_SECONDS = 45;
 export const isAutoActivateNewOrdersFlagEnabled = (): boolean =>
   String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || 'false').trim().toLowerCase() === 'true';
 
+export const isAutoActivateRenewalsFlagEnabled = (): boolean =>
+  String(process.env.AUTO_ACTIVATE_RENEWALS_ENABLED || 'false').trim().toLowerCase() === 'true';
+
 const isMissingSchemaOrRpcError = (err: any): boolean => {
   const code = String(err?.code || '');
   const msg = String(err?.message || '').toLowerCase();
@@ -1414,7 +1417,9 @@ export type DurableOperationType =
   | 'verify_payment'
   | 'approve_renew'
   | 'reject_renew'
-  | 'inbound_write';
+  | 'inbound_write'
+  | 'client_lock'
+  | 'traffic_reset';
 
 export interface DurableLockAcquireResult {
   acquired: boolean;
@@ -1431,8 +1436,9 @@ export interface DurableLockAcquireResult {
 
 /**
  * Atomically acquires a durable, lease-based PostgreSQL lock via public.acquire_provisioning_lock().
- * Fails CLOSED whenever requireDurableLock is true (always true for auto_order, reject_order,
- * verify_payment, inbound_write, or whenever AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true).
+ * Fails CLOSED whenever requireDurableLock is true (always true for auto_order, auto_renew,
+ * reject_order, reject_renew, verify_payment, inbound_write, client_lock, traffic_reset,
+ * or whenever AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true or AUTO_ACTIVATE_RENEWALS_ENABLED=true).
  */
 export async function acquireDurableProvisioningOperationLock(params: {
   dbClient: any;
@@ -1458,22 +1464,29 @@ export async function acquireDurableProvisioningOperationLock(params: {
   const lockOwnerId = params.lockOwnerId || crypto.randomUUID();
   const leaseSeconds = params.leaseSeconds || DEFAULT_LOCK_LEASE_SECONDS;
   const staleGraceSeconds = params.staleGraceSeconds ?? 35;
-  // Never blindly take over uncertain operations during automated auto_order;
-  // only explicit admin reconciliation (approve_order / reject_order) or post-grace inbound_write may recover.
+  // Never blindly take over uncertain operations during automated auto_order or auto_renew;
+  // only explicit admin reconciliation (approve_order / reject_order / approve_renew / reject_renew) or post-grace inbound_write may recover.
   const allowUncertainRecovery =
     params.allowUncertainRecovery !== undefined
       ? params.allowUncertainRecovery
       : operationType === 'approve_order' ||
         operationType === 'reject_order' ||
+        operationType === 'approve_renew' ||
+        operationType === 'reject_renew' ||
         operationType === 'inbound_write';
   const mustFailClosed =
     params.requireDurableLock !== undefined
       ? params.requireDurableLock
       : isAutoActivateNewOrdersFlagEnabled() ||
+        isAutoActivateRenewalsFlagEnabled() ||
         operationType === 'auto_order' ||
+        operationType === 'auto_renew' ||
         operationType === 'reject_order' ||
+        operationType === 'reject_renew' ||
         operationType === 'verify_payment' ||
-        operationType === 'inbound_write';
+        operationType === 'inbound_write' ||
+        operationType === 'client_lock' ||
+        operationType === 'traffic_reset';
 
   if (!dbClient || typeof dbClient.rpc !== 'function') {
     if (!mustFailClosed) {
@@ -4272,13 +4285,161 @@ export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): P
 };
 
 /**
+ * Verifies that no unresolved ('provisioning', 'provisional', 'uncertain', 'revoke_failed')
+ * renewal grant exists in public.vpn_entitlement_grants for the specified client UUID.
+ * Throws a 409 Conflict error if an unresolved renewal grant is active on that client.
+ */
+export async function assertNoUnresolvedClientRenewalGrant(params: {
+  dbClient: any;
+  clientUuid: string;
+  excludeRenewRequestId?: string | null;
+  operationDescription?: string;
+}): Promise<void> {
+  const { dbClient, clientUuid, excludeRenewRequestId, operationDescription } = params;
+  const cleanUuid = String(clientUuid || '').trim();
+  if (!cleanUuid || !dbClient || typeof dbClient.from !== 'function') return;
+
+  try {
+    const { data: grants, error } = await dbClient
+      .from('vpn_entitlement_grants')
+      .select('id, grant_type, source_id, status, provisional')
+      .eq('client_uuid', cleanUuid)
+      .eq('grant_type', 'renewal')
+      .in('status', ['provisioning', 'provisional', 'uncertain', 'revoke_failed']);
+
+    if (error) {
+      if (isMissingSchemaOrRpcError(error) && !isAutoActivateRenewalsFlagEnabled()) {
+        return;
+      }
+      throw new Error(`Failed to check unresolved renewal entitlement grants for client ${cleanUuid}: ${error.message}`);
+    }
+
+    const conflicting = (grants || []).find((g: any) => {
+      if (excludeRenewRequestId && String(g.source_id || '').trim() === String(excludeRenewRequestId).trim()) {
+        return false;
+      }
+      return true;
+    });
+
+    if (conflicting) {
+      const conflictErr: any = new Error(
+        `Cannot proceed with ${operationDescription || 'client modification'}: VPN client '${cleanUuid}' currently has an unresolved renewal entitlement grant (request=${conflicting.source_id}, status=${conflicting.status}). Please complete or reconcile payment verification first.`
+      );
+      conflictErr.statusCode = 409;
+      conflictErr.code = 'UNRESOLVED_CLIENT_RENEWAL_GRANT';
+      conflictErr.conflictingGrant = conflicting;
+      throw conflictErr;
+    }
+  } catch (err: any) {
+    if (err?.statusCode === 409) throw err;
+    if (isMissingSchemaOrRpcError(err) && !isAutoActivateRenewalsFlagEnabled()) {
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Serializes mutations targeting a specific VPN client UUID (`client:<uuid>`) using a durable
+ * PostgreSQL provisioning lock with lease verification.
+ */
+export async function withClientMutationLock<T>(
+  params: {
+    dbClient: any;
+    clientUuid: string;
+    operationType?: 'client_lock' | 'traffic_reset';
+    targetId: string;
+    requireDurableLock?: boolean;
+    allowUncertainRecovery?: boolean;
+    metadata?: Record<string, any>;
+  },
+  fn: (assertClientLockStillHeld: () => Promise<void>) => Promise<T>
+): Promise<T> {
+  const cleanUuid = String(params.clientUuid || '').trim().toLowerCase();
+  if (!cleanUuid) {
+    throw new Error('Client UUID is required to acquire client mutation lock.');
+  }
+
+  const operationKey = `client:${cleanUuid}`;
+  const operationType = params.operationType || 'client_lock';
+  const requireDurable =
+    params.requireDurableLock !== undefined
+      ? params.requireDurableLock
+      : isAutoActivateRenewalsFlagEnabled() || isAutoActivateNewOrdersFlagEnabled();
+
+  const lockRes = await acquireDurableProvisioningOperationLock({
+    dbClient: params.dbClient,
+    operationKey,
+    operationType,
+    targetId: params.targetId,
+    clientUuid: cleanUuid,
+    leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+    metadata: params.metadata || { targetId: params.targetId, clientUuid: cleanUuid },
+    requireDurableLock: requireDurable,
+    allowUncertainRecovery: params.allowUncertainRecovery ?? false,
+  });
+
+  if (!lockRes.acquired) {
+    const conflictErr: any = new Error(
+      lockRes.previousStatus === 'uncertain'
+        ? `VPN client '${cleanUuid}' has an uncertain prior external provisioning state; automatic modification is blocked until admin reconciliation.`
+        : lockRes.error || `Another operation (${lockRes.previousOperationType || 'active'}) is currently modifying VPN client '${cleanUuid}'.`
+    );
+    conflictErr.statusCode = 409;
+    conflictErr.code = lockRes.previousStatus === 'uncertain' ? 'CLIENT_LOCK_UNCERTAIN' : 'CLIENT_LOCK_BUSY';
+    throw conflictErr;
+  }
+
+  const assertClientLockStillHeld = async (): Promise<void> => {
+    if (!lockRes.tableAvailable) return;
+    const renewed = await renewDurableProvisioningOperationLock({
+      dbClient: params.dbClient,
+      operationKey,
+      lockOwnerId: lockRes.lockOwnerId,
+      leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+    });
+    if (!renewed) {
+      const fenceErr: any = new Error(
+        `Lost durable client mutation lock '${operationKey}' before 3X-UI mutation; aborting to prevent concurrent client corruption.`
+      );
+      fenceErr.statusCode = 409;
+      throw fenceErr;
+    }
+  };
+
+  let outcome: 'completed' | 'failed' | 'uncertain' = 'completed';
+  let errMsg: string | null = null;
+  try {
+    return await fn(assertClientLockStillHeld);
+  } catch (err: any) {
+    outcome = err?.xuiUncertain === true ? 'uncertain' : 'failed';
+    errMsg = err?.message || String(err);
+    throw err;
+  } finally {
+    if (lockRes.tableAvailable) {
+      await finalizeDurableProvisioningOperationLock({
+        dbClient: params.dbClient,
+        operationKey,
+        lockOwnerId: lockRes.lockOwnerId,
+        status: outcome,
+        clientUuid: cleanUuid,
+        errorMessage: errMsg,
+      });
+    }
+  }
+}
+
+/**
  * Reset client traffic in 3X-UI for an active client
  * Tries the primary 3X-UI client reset endpoint and inbounds reset endpoint.
+ * Coordinated under `client:<uuid>` durable lock and blocked if an unresolved
+ * provisional/uncertain renewal grant exists for the client.
  */
 export const resetClientTraffic = async (
   email: string,
   inboundId?: number,
-  clientUuid?: string
+  clientUuid?: string,
+  options?: { dbClient?: any }
 ): Promise<{ success: boolean; message: string }> => {
   console.log(`[xuiService] Resetting traffic in 3X-UI for client - Email: '${email}', Inbound: ${inboundId}, UUID: '${clientUuid}'`);
 
@@ -4286,26 +4447,11 @@ export const resetClientTraffic = async (
     throw new Error('Client email or UUID is required to reset 3X-UI traffic');
   }
 
-  const endpointsToTry: string[] = [];
-  if (email) {
-    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(email)}`);
-    if (inboundId && inboundId > 0) {
-      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/resetClientTraffic/${encodeURIComponent(email)}`);
-      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${inboundId}/${encodeURIComponent(email)}`);
-    }
-    endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${encodeURIComponent(email)}`);
-  }
-
-  if (clientUuid) {
-    if (inboundId && inboundId > 0) {
-      endpointsToTry.push(`/panel/api/inbounds/${inboundId}/resetClientTraffic/${encodeURIComponent(clientUuid)}`);
-      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${inboundId}/${encodeURIComponent(clientUuid)}`);
-    }
-    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(clientUuid)}`);
-  }
-
+  const dbClient = options?.dbClient || supabaseAdmin;
   let resolvedInboundId = inboundId && Number(inboundId) > 0 ? Number(inboundId) : null;
-  if (!resolvedInboundId && (clientUuid || email)) {
+  let resolvedUuid = String(clientUuid || '').trim();
+
+  if ((!resolvedInboundId || !resolvedUuid) && (clientUuid || email)) {
     try {
       const inbounds = await getCachedInbounds();
       for (const ib of inbounds) {
@@ -4316,14 +4462,37 @@ export const resetClientTraffic = async (
             (clientUuid && String(c.id || '').trim().toLowerCase() === clientUuid.trim().toLowerCase()) ||
             (email && String(c.email || '').trim().toLowerCase() === email.trim().toLowerCase())
         );
-        if (match && Number(ib.id) > 0) {
-          resolvedInboundId = Number(ib.id);
+        if (match) {
+          if (!resolvedInboundId && Number(ib.id) > 0) {
+            resolvedInboundId = Number(ib.id);
+          }
+          if (!resolvedUuid && match.id) {
+            resolvedUuid = String(match.id).trim();
+          }
           break;
         }
       }
     } catch {
       // Non-blocking resolution
     }
+  }
+
+  const endpointsToTry: string[] = [];
+  if (email) {
+    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(email)}`);
+    if (resolvedInboundId && resolvedInboundId > 0) {
+      endpointsToTry.push(`/panel/api/inbounds/${resolvedInboundId}/resetClientTraffic/${encodeURIComponent(email)}`);
+      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${resolvedInboundId}/${encodeURIComponent(email)}`);
+    }
+    endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${encodeURIComponent(email)}`);
+  }
+
+  if (resolvedUuid) {
+    if (resolvedInboundId && resolvedInboundId > 0) {
+      endpointsToTry.push(`/panel/api/inbounds/${resolvedInboundId}/resetClientTraffic/${encodeURIComponent(resolvedUuid)}`);
+      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${resolvedInboundId}/${encodeURIComponent(resolvedUuid)}`);
+    }
+    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(resolvedUuid)}`);
   }
 
   const executeReset = async (): Promise<{ success: boolean; message: string }> => {
@@ -4349,7 +4518,6 @@ export const resetClientTraffic = async (
       throw new Error(`Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`);
     }
 
-    // Invalidate inbounds cache so that subsequent queries immediately retrieve updated 0 byte traffic stats
     invalidateInboundCache(resolvedInboundId || inboundId || null);
     try {
       await getInbounds(true);
@@ -4360,24 +4528,2112 @@ export const resetClientTraffic = async (
     return { success: true, message: responseMsg || 'Traffic counter successfully reset in 3X-UI' };
   };
 
-  if (resolvedInboundId && resolvedInboundId > 0) {
-    return await withInboundWriteLock(
+  const runUnderInboundLock = async (): Promise<{ success: boolean; message: string }> => {
+    if (resolvedUuid) {
+      await assertNoUnresolvedClientRenewalGrant({
+        dbClient,
+        clientUuid: resolvedUuid,
+        operationDescription: 'resetting client traffic',
+      });
+    }
+    if (resolvedInboundId && resolvedInboundId > 0) {
+      return await withInboundWriteLock(
+        {
+          dbClient,
+          inboundId: resolvedInboundId,
+          targetId: `reset_traffic:${resolvedUuid || email}`,
+          clientUuid: resolvedUuid || null,
+          requireDurableLock: isAutoActivateNewOrdersFlagEnabled() || isAutoActivateRenewalsFlagEnabled(),
+        },
+        async (assertInboundLockStillHeld) => {
+          await assertInboundLockStillHeld();
+          return executeReset();
+        }
+      );
+    }
+    return executeReset();
+  };
+
+  if (resolvedUuid) {
+    return await withClientMutationLock(
       {
-        dbClient: supabaseAdmin,
-        inboundId: resolvedInboundId,
-        targetId: `reset_traffic:${clientUuid || email}`,
-        clientUuid: clientUuid || null,
-        requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+        dbClient,
+        clientUuid: resolvedUuid,
+        operationType: 'traffic_reset',
+        targetId: `reset_traffic:${resolvedUuid}`,
+        requireDurableLock: isAutoActivateRenewalsFlagEnabled(),
       },
-      async (assertInboundLockStillHeld) => {
-        await assertInboundLockStillHeld();
-        return executeReset();
+      async (assertClientLockStillHeld) => {
+        await assertClientLockStillHeld();
+        return runUnderInboundLock();
       }
     );
   }
 
-  return executeReset();
+  return runUnderInboundLock();
 };
+
+// ============================================================================
+// PHASE 2: AUTOMATIC PROVISIONAL RENEWALS, APPROVAL CONFIRMATION & ROLLBACK
+// ============================================================================
+
+export type RenewalCalculationMode =
+  | 'active_finite'
+  | 'expired_finite_option_4b'
+  | 'exhausted_finite'
+  | 'unlimited_to_unlimited';
+
+export interface RenewalEntitlementCalculationResult {
+  eligible: boolean;
+  mode?: RenewalCalculationMode;
+  code?:
+    | 'ACCOUNT_DISABLED_OR_REVOKED'
+    | 'INTENTIONALLY_DISABLED'
+    | 'CLIENT_DISABLED_OR_AMBIGUOUS'
+    | 'INBOUND_DISABLED_OR_AMBIGUOUS'
+    | 'PACKAGE_MODE_CHANGE_MANUAL_REQUIRED'
+    | 'INVALID_PARAMETERS';
+  reason?: string;
+  previousExpiryMs: number;
+  previousTotalBytes: number;
+  previousWasUnlimited: boolean;
+  liveUpBytes: number;
+  liveDownBytes: number;
+  liveUsedBytes: number;
+  addedDurationMonths: number;
+  addedQuotaBytes: number;
+  grantedExpiryMs: number;
+  grantedTotalBytes: number;
+  grantedUnlimited: boolean;
+  grantedDataLimitStr: string;
+}
+
+/**
+ * Pure, deterministic renewal entitlement calculator implementing all approved Phase 2 rules:
+ * - Active finite: grantedTotalBytes = prevTotalBytes + addedQuotaBytes; grantedExpiryMs = addCalendarMonths(prevExpiryMs, durationMonths)
+ * - Expired finite (Option 4B): grantedTotalBytes = (liveUp + liveDown) + addedQuotaBytes; grantedExpiryMs = addCalendarMonths(nowMs, durationMonths)
+ * - Exhausted finite (unexpired): grantedTotalBytes = Math.max(prevTotalBytes, liveUp + liveDown) + addedQuotaBytes; grantedExpiryMs = addCalendarMonths(Math.max(prevExpiryMs, nowMs), durationMonths)
+ * - Unlimited to Unlimited: grantedTotalBytes = 0; grantedExpiryMs = addCalendarMonths(Math.max(prevExpiryMs, nowMs), durationMonths)
+ * - Package mode changes (Finite <-> Unlimited): not eligible for auto-renewal (falls back to manual queue)
+ * - Mandatory re-enable safety guard: strictly requires verified client.enable === true AND inbound.enable === true.
+ *   Even if expired or quota-exhausted, a client or inbound with enable=false or ambiguous enable state MUST fall back
+ *   to manual admin approval and must NEVER be auto-re-enabled.
+ * - Never resets live traffic counters (up / down).
+ */
+export function calculateApprovedRenewalEntitlement(params: {
+  previousExpiryMs: number;
+  previousTotalBytes: number;
+  liveUpBytes: number;
+  liveDownBytes: number;
+  liveEnable: unknown;
+  inboundEnable: unknown;
+  dbAccountStatus?: string | null;
+  addedDurationMonths: number;
+  addedQuotaBytes: number;
+  nowMs?: number;
+}): RenewalEntitlementCalculationResult {
+  const nowMs = params.nowMs ?? Date.now();
+  const prevExpiryMs = Math.max(0, Math.trunc(Number(params.previousExpiryMs) || 0));
+  const prevTotalBytes = Math.max(0, Math.trunc(Number(params.previousTotalBytes) || 0));
+  const liveUpBytes = Math.max(0, Math.trunc(Number(params.liveUpBytes) || 0));
+  const liveDownBytes = Math.max(0, Math.trunc(Number(params.liveDownBytes) || 0));
+  const liveUsedBytes = liveUpBytes + liveDownBytes;
+  const addedDurationMonths = Math.max(1, Math.trunc(Number(params.addedDurationMonths) || 1));
+  const addedQuotaBytes = Math.max(0, Math.trunc(Number(params.addedQuotaBytes) || 0));
+  const prevWasUnlimited = prevTotalBytes === 0;
+  const renewalIsUnlimited = addedQuotaBytes === 0;
+
+  const dbStatusLower = String(params.dbAccountStatus || 'active').trim().toLowerCase();
+  if (
+    dbStatusLower === 'disabled' ||
+    dbStatusLower === 'rejected' ||
+    dbStatusLower === 'revoked' ||
+    dbStatusLower === 'cancelled' ||
+    dbStatusLower === 'deleted'
+  ) {
+    return {
+      eligible: false,
+      code: 'ACCOUNT_DISABLED_OR_REVOKED',
+      reason: `VPN account status '${dbStatusLower}' is not eligible for automatic renewal.`,
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: prevTotalBytes,
+      previousWasUnlimited: prevWasUnlimited,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: prevTotalBytes,
+      grantedUnlimited: prevWasUnlimited,
+      grantedDataLimitStr: prevTotalBytes > 0 ? `${Math.round(prevTotalBytes / (1024 * 1024 * 1024))}GB` : 'Unlimited',
+    };
+  }
+
+  // Strictly require verified inbound.enable === true before automatic renewal
+  if (params.inboundEnable !== true) {
+    return {
+      eligible: false,
+      code: 'INBOUND_DISABLED_OR_AMBIGUOUS',
+      reason: '3X-UI inbound is disabled or its enable state is ambiguous. Manual admin approval is required.',
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: prevTotalBytes,
+      previousWasUnlimited: prevWasUnlimited,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: prevTotalBytes,
+      grantedUnlimited: prevWasUnlimited,
+      grantedDataLimitStr: prevTotalBytes > 0 ? `${Math.round(prevTotalBytes / (1024 * 1024 * 1024))}GB` : 'Unlimited',
+    };
+  }
+
+  // Strictly require verified client.enable === true before automatic renewal.
+  // Never auto-re-enable a disabled/ambiguous client even if expired or quota-exhausted,
+  // so intentional administrator disable actions are never overridden.
+  if (params.liveEnable !== true) {
+    return {
+      eligible: false,
+      code: 'CLIENT_DISABLED_OR_AMBIGUOUS',
+      reason: 'VPN client is disabled or its enable state is ambiguous on 3X-UI. Automatic re-enabling is prohibited; manual admin approval is required.',
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: prevTotalBytes,
+      previousWasUnlimited: prevWasUnlimited,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: prevTotalBytes,
+      grantedUnlimited: prevWasUnlimited,
+      grantedDataLimitStr: prevTotalBytes > 0 ? `${Math.round(prevTotalBytes / (1024 * 1024 * 1024))}GB` : 'Unlimited',
+    };
+  }
+
+  const isExpiredByTime = prevExpiryMs > 0 && prevExpiryMs <= nowMs;
+  const isExhaustedByQuota = !prevWasUnlimited && liveUsedBytes >= prevTotalBytes;
+
+  // Package mode changes (Finite <-> Unlimited) must fall back to manual admin approval
+  if (prevWasUnlimited !== renewalIsUnlimited) {
+    return {
+      eligible: false,
+      code: 'PACKAGE_MODE_CHANGE_MANUAL_REQUIRED',
+      reason: 'Switching between Finite (100GB) and Unlimited package modes requires manual admin approval.',
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: prevTotalBytes,
+      previousWasUnlimited: prevWasUnlimited,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: prevTotalBytes,
+      grantedUnlimited: renewalIsUnlimited,
+      grantedDataLimitStr: renewalIsUnlimited ? 'Unlimited' : `${Math.round(addedQuotaBytes / (1024 * 1024 * 1024))}GB`,
+    };
+  }
+
+  let grantedExpiryMs = 0;
+  let grantedTotalBytes = 0;
+  let mode: RenewalCalculationMode = 'unlimited_to_unlimited';
+
+  if (prevWasUnlimited && renewalIsUnlimited) {
+    mode = 'unlimited_to_unlimited';
+    grantedTotalBytes = 0;
+    const baseExpiryMs = prevExpiryMs > nowMs ? prevExpiryMs : nowMs;
+    grantedExpiryMs = addCalendarMonths(baseExpiryMs, addedDurationMonths);
+  } else if (isExpiredByTime) {
+    // Option 4B: Expired finite-to-finite renewal without resetting 3X-UI traffic counters
+    mode = 'expired_finite_option_4b';
+    grantedTotalBytes = liveUsedBytes + addedQuotaBytes;
+    grantedExpiryMs = addCalendarMonths(nowMs, addedDurationMonths);
+  } else if (isExhaustedByQuota) {
+    // Exhausted finite-to-finite renewal (unexpired)
+    mode = 'exhausted_finite';
+    grantedTotalBytes = Math.max(prevTotalBytes, liveUsedBytes) + addedQuotaBytes;
+    const baseExpiryMs = prevExpiryMs > nowMs ? prevExpiryMs : nowMs;
+    grantedExpiryMs = addCalendarMonths(baseExpiryMs, addedDurationMonths);
+  } else {
+    // Active finite-to-finite renewal
+    mode = 'active_finite';
+    grantedTotalBytes = prevTotalBytes + addedQuotaBytes;
+    grantedExpiryMs = addCalendarMonths(prevExpiryMs, addedDurationMonths);
+  }
+
+  // Post-condition safety assertion for finite renewals: remaining usable quota must be >= addedQuotaBytes
+  if (!renewalIsUnlimited && grantedTotalBytes - liveUsedBytes < addedQuotaBytes) {
+    grantedTotalBytes = liveUsedBytes + addedQuotaBytes;
+  }
+
+  const grantedDataLimitStr =
+    grantedTotalBytes === 0
+      ? 'Unlimited'
+      : `${Math.max(1, Math.round(addedQuotaBytes / (1024 * 1024 * 1024)))}GB`;
+
+  return {
+    eligible: true,
+    mode,
+    previousExpiryMs: prevExpiryMs,
+    previousTotalBytes: prevTotalBytes,
+    previousWasUnlimited: prevWasUnlimited,
+    liveUpBytes,
+    liveDownBytes,
+    liveUsedBytes,
+    addedDurationMonths,
+    addedQuotaBytes,
+    grantedExpiryMs,
+    grantedTotalBytes,
+    grantedUnlimited: grantedTotalBytes === 0,
+    grantedDataLimitStr,
+  };
+}
+
+/**
+ * Builds a complete `pre_renewal_db_snapshot` JSONB object conforming strictly to
+ * `public.is_valid_pre_renewal_db_snapshot` in PostgreSQL (with exact millisecond
+ * timestamp consistency and integer byte counters).
+ */
+export function buildVerifiedPreRenewalDbSnapshot(params: {
+  capturedAtMs?: number;
+  clientUuid: string;
+  inboundId: number;
+  previousExpiryMs: number;
+  previousTotalBytes: number;
+  previousUpBytes: number;
+  previousDownBytes: number;
+  previousEnable: boolean;
+  grantedExpiryMs: number;
+  grantedTotalBytes: number;
+  grantedDataLimit: string;
+  vpnAccount: any;
+  parentOrder: any;
+  vpnConfig?: any | null;
+  liveClient: any;
+}): Record<string, any> {
+  const capturedAtMs = Math.trunc(params.capturedAtMs ?? Date.now());
+  const prevExpiryMs = Math.trunc(Number(params.previousExpiryMs));
+  const prevTotalBytes = Math.trunc(Number(params.previousTotalBytes));
+  const prevUpBytes = Math.trunc(Number(params.previousUpBytes));
+  const prevDownBytes = Math.trunc(Number(params.previousDownBytes));
+  const prevEnable = Boolean(params.previousEnable);
+  const grantedExpiryMs = Math.trunc(Number(params.grantedExpiryMs));
+  const grantedTotalBytes = Math.trunc(Number(params.grantedTotalBytes));
+  const inboundId = Math.trunc(Number(params.inboundId));
+  const clientUuid = String(params.clientUuid).trim();
+
+  // Exact ISO representation of prevExpiryMs and grantedExpiryMs so PostgreSQL
+  // (extract(epoch from ts) * 1000)::bigint matches p_prev_expiry_ms and p_granted_expiry_ms to the exact ms.
+  const exactPrevExpiryIso = new Date(prevExpiryMs).toISOString();
+  const exactGrantedExpiryIso = new Date(grantedExpiryMs).toISOString();
+  const prevStatus = String(params.vpnAccount?.status || 'active').trim() || 'active';
+  const prevDataLimit =
+    String(
+      params.vpnAccount?.data_limit ||
+        params.vpnConfig?.data_limit ||
+        (prevTotalBytes > 0 ? `${Math.max(1, Math.round(prevTotalBytes / (1024 * 1024 * 1024)))}GB` : 'Unlimited')
+    ).trim() || 'Unlimited';
+
+  const vlessUrl = String(
+    params.parentOrder?.vless_url ||
+      params.vpnAccount?.vless_url ||
+      params.vpnConfig?.vless_url ||
+      `vless://${clientUuid}@127.0.0.1:443`
+  ).trim();
+
+  const hasVpnConfig = Boolean(params.vpnConfig && params.vpnConfig.id && String(params.vpnConfig.id).trim().length > 0);
+  const rawTrafficLimit =
+    hasVpnConfig && params.vpnConfig?.traffic_limit !== undefined && params.vpnConfig?.traffic_limit !== null
+      ? String(params.vpnConfig.traffic_limit).trim()
+      : '';
+
+  // Exact JSONB structure validated by public.is_valid_pre_renewal_db_snapshot() and chk_vpn_entitlement_grants_renewal_snapshot
+  return {
+    schema_version: 1,
+    captured_at: new Date(capturedAtMs).toISOString(),
+    vpn_account: {
+      id: String(params.vpnAccount.id).trim(),
+      uuid: clientUuid,
+      order_id: String(params.parentOrder.id).trim(),
+      enable: prevEnable,
+      status: prevStatus,
+      expiry_time: prevExpiryMs,
+      expiry_date: exactPrevExpiryIso,
+      total_bytes: prevTotalBytes,
+      data_limit: prevDataLimit,
+      up_bytes: prevUpBytes,
+      down_bytes: prevDownBytes,
+      original_db_expiry_time:
+        params.vpnAccount?.expiry_time !== undefined && params.vpnAccount?.expiry_time !== null
+          ? Number(params.vpnAccount.expiry_time)
+          : null,
+      original_db_expiry_date: params.vpnAccount?.expiry_date ? String(params.vpnAccount.expiry_date) : null,
+    },
+    parent_order: {
+      id: String(params.parentOrder.id).trim(),
+      client_uuid: clientUuid,
+      status: String(params.parentOrder.status || 'completed').trim() || 'completed',
+      payment_status: String(params.parentOrder.payment_status || 'Paid').trim() || 'Paid',
+      provisioning_status: String(params.parentOrder.provisioning_status || 'completed').trim() || 'completed',
+      expiry_date: params.parentOrder?.expiry_date ? exactPrevExpiryIso : null,
+      original_db_expiry_date: params.parentOrder?.expiry_date ? String(params.parentOrder.expiry_date) : null,
+      vless_url: vlessUrl,
+    },
+    vpn_config: hasVpnConfig
+      ? {
+          exists: true,
+          id: String(params.vpnConfig.id).trim(),
+          uuid: clientUuid,
+          inbound_id: inboundId,
+          enabled: typeof params.vpnConfig.enabled === 'boolean' ? params.vpnConfig.enabled : prevEnable,
+          status: String(params.vpnConfig.status || prevStatus).trim() || prevStatus,
+          expiry_date: exactPrevExpiryIso,
+          original_db_expiry_date: params.vpnConfig?.expiry_date ? String(params.vpnConfig.expiry_date) : null,
+          data_limit: String(params.vpnConfig.data_limit || prevDataLimit).trim() || prevDataLimit,
+          traffic_limit: rawTrafficLimit.length > 0 ? rawTrafficLimit : null,
+        }
+      : {
+          exists: false,
+        },
+    xui_client: {
+      inbound_id: inboundId,
+      client_uuid: clientUuid,
+      enable: prevEnable,
+      expiry_time_ms: prevExpiryMs,
+      total_bytes: prevTotalBytes,
+      up_bytes_at_renewal: prevUpBytes,
+      down_bytes_at_renewal: prevDownBytes,
+      email: String(params.liveClient?.email || params.vpnAccount?.remark || params.vpnAccount?.email || clientUuid).trim(),
+      sub_id: params.liveClient?.subId ? String(params.liveClient.subId) : null,
+    },
+    granted_db_state: {
+      granted_expiry_ms: grantedExpiryMs,
+      granted_expiry_date: exactGrantedExpiryIso,
+      granted_total_bytes: grantedTotalBytes,
+      granted_data_limit: String(params.grantedDataLimit || 'Unlimited').trim() || 'Unlimited',
+      granted_enable: true,
+      granted_status: 'active',
+    },
+  };
+}
+
+export interface ProvisionProvisionalRenewalOptions {
+  dbClient?: any;
+  requestApiFn?: typeof requestApi;
+  getInboundsFn?: typeof getInbounds;
+  nowMs?: number;
+  skipSideEffects?: boolean;
+}
+
+export interface ProvisionProvisionalRenewalResult {
+  success: boolean;
+  autoRenewed: boolean;
+  provisional: boolean;
+  provisioningStatus: 'provisional' | 'pending' | 'uncertain' | 'failed';
+  fallbackToManual?: boolean;
+  blockedReason?: string;
+  mode?: RenewalCalculationMode;
+  uuid?: string;
+  inboundId?: number;
+  oldExpiryIso?: string;
+  newExpiryIso?: string;
+  grantedExpiryMs?: number;
+  grantedTotalBytes?: number;
+  addedQuotaBytes?: number;
+  dataAllowanceLabel?: string;
+  packageName?: string;
+  message?: string;
+}
+
+export type ProvisionalRenewalProvisionResult = ProvisionProvisionalRenewalResult;
+
+/**
+ * Executes automatic provisional renewal for an existing paid VPN client:
+ * 1. Acquires durable locks in deterministic order: `renew:<requestId>` -> `client:<uuid>` -> `inbound:<inboundId>`.
+ * 2. Verifies target VPN account & parent order eligibility (must be paid/completed, not trial, not disabled/rejected,
+ *    no unresolved renewal grant on this client, DB vs live 3X-UI expiry discrepancy <= 5 minutes).
+ * 3. Reads live 3X-UI client state and live traffic counters (`up`, `down`), calculates new entitlement (including Option 4B).
+ * 4. Pre-persists `vpn_entitlement_grants` (`grant_type='renewal'`, `status='provisioning'`, complete `pre_renewal_db_snapshot`)
+ *    BEFORE calling 3X-UI.
+ * 5. Updates only `expiryTime`, `totalGB`, and `enable: true` on the existing 3X-UI client (preserving UUID, password,
+ *    Hysteria auth, subId, flow, inbound, VLESS URL, and cumulative traffic counters) and performs mandatory read-back verification.
+ * 6. Updates `vpn_accounts`, `vpn_configs`, `orders.expiry_date` (keeping `orders.payment_status='Paid'`),
+ *    `vpn_entitlement_grants.status='provisional'`, and `renew_requests.provisioning_status='provisional'` (keeping `renew_requests.status='pending'`).
+ */
+export async function provisionProvisionalRenewal(
+  renewRequestId: string,
+  options?: ProvisionProvisionalRenewalOptions
+): Promise<ProvisionProvisionalRenewalResult> {
+  const dbClient = options?.dbClient || supabaseAdmin;
+  const requestApiCall = options?.requestApiFn || requestApi;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
+  const nowMs = options?.nowMs ?? Date.now();
+  const cleanRequestId = String(renewRequestId || '').trim();
+
+  if (!cleanRequestId) {
+    throw new Error('Renewal request ID is required for provisional renewal.');
+  }
+
+  const renewLockKey = `renew:${cleanRequestId}`;
+  const renewLockRes = await acquireDurableProvisioningOperationLock({
+    dbClient,
+    operationKey: renewLockKey,
+    operationType: 'auto_renew',
+    targetId: cleanRequestId,
+    leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+    metadata: { renewRequestId: cleanRequestId },
+    requireDurableLock: true,
+    allowUncertainRecovery: false,
+  });
+
+  if (!renewLockRes.acquired) {
+    return {
+      success: false,
+      autoRenewed: false,
+      provisional: false,
+      provisioningStatus: renewLockRes.previousStatus === 'uncertain' ? 'uncertain' : 'pending',
+      fallbackToManual: true,
+      blockedReason:
+        renewLockRes.previousStatus === 'uncertain'
+          ? 'prior_renewal_uncertain'
+          : 'renewal_lock_busy',
+      message:
+        renewLockRes.error ||
+        'Another renewal operation is already in progress for this request. Held for manual admin verification.',
+    };
+  }
+
+  let renewLockOutcome: 'completed' | 'failed' | 'uncertain' = 'completed';
+  let renewLockError: string | null = null;
+  let targetClientUuid: string | null = null;
+
+  try {
+    const { data: renewReq, error: reqErr } = await dbClient
+      .from('renew_requests')
+      .select('*')
+      .eq('id', cleanRequestId)
+      .maybeSingle();
+
+    if (reqErr || !renewReq) {
+      renewLockOutcome = 'failed';
+      renewLockError = reqErr?.message || 'Renewal request not found';
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'renew_request_not_found',
+        message: 'Renewal request not found.',
+      };
+    }
+
+    let extra: any = {};
+    if (renewReq.notes && typeof renewReq.notes === 'string' && renewReq.notes.startsWith('{')) {
+      try {
+        extra = JSON.parse(renewReq.notes);
+      } catch {
+        extra = {};
+      }
+    }
+
+    // Check if already provisionally applied (idempotent retry)
+    const { data: existingGrant } = await dbClient
+      .from('vpn_entitlement_grants')
+      .select('*')
+      .eq('grant_type', 'renewal')
+      .eq('source_id', cleanRequestId)
+      .maybeSingle();
+
+    if (existingGrant && (existingGrant.status === 'provisional' || existingGrant.status === 'verified')) {
+      targetClientUuid = existingGrant.client_uuid;
+      return {
+        success: true,
+        autoRenewed: true,
+        provisional: existingGrant.status === 'provisional',
+        provisioningStatus: 'provisional',
+        uuid: existingGrant.client_uuid,
+        inboundId: existingGrant.inbound_id,
+        oldExpiryIso: new Date(Number(existingGrant.previous_expiry_ms)).toISOString(),
+        newExpiryIso: new Date(Number(existingGrant.granted_expiry_ms)).toISOString(),
+        grantedExpiryMs: Number(existingGrant.granted_expiry_ms),
+        grantedTotalBytes: Number(existingGrant.granted_total_bytes),
+        addedQuotaBytes: Number(existingGrant.added_quota_bytes),
+        dataAllowanceLabel:
+          Number(existingGrant.added_quota_bytes) > 0
+            ? `${Math.round(Number(existingGrant.added_quota_bytes) / (1024 * 1024 * 1024))} GB`
+            : 'Unlimited',
+        packageName: existingGrant.package_name || renewReq.plan_name,
+        message: 'Renewal is already provisionally active.',
+      };
+    }
+
+    if (existingGrant && existingGrant.status === 'uncertain') {
+      renewLockOutcome = 'uncertain';
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'uncertain',
+        fallbackToManual: true,
+        blockedReason: 'prior_renewal_uncertain',
+        message: 'Previous renewal attempt ended in an uncertain state. Held for manual admin reconciliation.',
+      };
+    }
+
+    const requestUserId = String(renewReq.user_id || '').trim();
+    const requestEmail = String(renewReq.user_email || renewReq.email || '').trim().toLowerCase();
+    const targetAccountId = String(extra.vpn_account_id || '').trim();
+    const targetUuidFromReq = String(extra.uuid || '').trim();
+
+    // Locate target vpn_accounts row
+    let vpnAccount: any = null;
+    if (targetAccountId) {
+      const { data } = await dbClient.from('vpn_accounts').select('*').eq('id', targetAccountId).maybeSingle();
+      if (data) vpnAccount = data;
+    }
+    if (!vpnAccount && targetUuidFromReq) {
+      const { data } = await dbClient.from('vpn_accounts').select('*').eq('uuid', targetUuidFromReq).maybeSingle();
+      if (data) vpnAccount = data;
+    }
+
+    if (!vpnAccount || !vpnAccount.uuid) {
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'vpn_account_not_found',
+        message: 'Target VPN account not found for automatic renewal. Held for manual admin review.',
+      };
+    }
+
+    // Verify customer ownership of the VPN account
+    const accOwnerId = String(vpnAccount.user_id || '').trim();
+    const accOwnerEmail = String(vpnAccount.email || '').trim().toLowerCase();
+    const ownsAccount =
+      (requestUserId && accOwnerId && requestUserId === accOwnerId) ||
+      (!accOwnerId && requestEmail && accOwnerEmail === requestEmail);
+
+    if (!ownsAccount) {
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'account_ownership_mismatch',
+        message: 'VPN account ownership could not be verified. Held for manual admin review.',
+      };
+    }
+
+    // Verify not a free trial
+    const isTrialAccount = Boolean(
+      vpnAccount.is_trial ||
+        String(vpnAccount.order_id || '').startsWith('TRIAL-') ||
+        String(vpnAccount.data_limit || '').toLowerCase().trim() === '1gb'
+    );
+    if (isTrialAccount) {
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'trial_not_renewable',
+        message: 'Free trial accounts cannot be automatically renewed.',
+      };
+    }
+
+    const clientUuid = String(vpnAccount.uuid).trim();
+    targetClientUuid = clientUuid;
+
+    // Locate parent order and verify it is an approved/paid order (never allow auto-renew on an unpaid provisional or rejected order!)
+    let parentOrder: any = null;
+    if (vpnAccount.order_id) {
+      const { data } = await dbClient.from('orders').select('*').eq('id', vpnAccount.order_id).maybeSingle();
+      if (data) parentOrder = data;
+    }
+    if (!parentOrder) {
+      const { data } = await dbClient
+        .from('orders')
+        .select('*')
+        .eq('client_uuid', clientUuid)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (data) parentOrder = data;
+    }
+
+    if (!parentOrder || !parentOrder.id) {
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'parent_order_not_found',
+        message: 'Parent order record not found for target VPN account. Held for manual admin review.',
+      };
+    }
+
+    const parentOrderStatus = String(parentOrder.status || '').trim().toLowerCase();
+    const parentPayStatus = String(parentOrder.payment_status || '').trim().toLowerCase();
+    const parentProvStatus = String(parentOrder.provisioning_status || '').trim().toLowerCase();
+
+    const isParentPaidAndCompleted =
+      (parentOrderStatus === 'completed' || parentOrderStatus === 'active' || parentOrderStatus === 'approved') &&
+      (parentPayStatus === 'paid' || parentPayStatus === 'approved' || parentPayStatus === 'verified') &&
+      parentProvStatus !== 'provisional' &&
+      parentProvStatus !== 'revoked' &&
+      parentProvStatus !== 'revoke_failed';
+
+    if (!isParentPaidAndCompleted) {
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: 'parent_order_not_paid_verified',
+        message: 'Parent VPN order is not yet payment-verified. Automatic renewal held for manual admin review.',
+      };
+    }
+
+    // Acquire durable client-level lock `client:<uuid>` (Lock #2 in deterministic hierarchy)
+    return await withClientMutationLock(
+      {
+        dbClient,
+        clientUuid,
+        operationType: 'client_lock',
+        targetId: cleanRequestId,
+        requireDurableLock: true,
+        allowUncertainRecovery: false,
+        metadata: { renewRequestId: cleanRequestId, parentOrderId: parentOrder.id },
+      },
+      async (assertClientLockStillHeld) => {
+        // Check for any other unresolved renewal grant on this client UUID
+        await assertNoUnresolvedClientRenewalGrant({
+          dbClient,
+          clientUuid,
+          excludeRenewRequestId: cleanRequestId,
+          operationDescription: 'automatic renewal provisioning',
+        });
+
+        // Re-read fresh vpn_accounts, vpn_configs, and parent order INSIDE client:<uuid> lock
+        const { data: freshAcc } = await dbClient.from('vpn_accounts').select('*').eq('id', vpnAccount.id).maybeSingle();
+        if (freshAcc) vpnAccount = freshAcc;
+
+        const { data: freshParent } = await dbClient.from('orders').select('*').eq('id', parentOrder.id).maybeSingle();
+        if (freshParent) parentOrder = freshParent;
+
+        let { data: vpnConfig } = await dbClient.from('vpn_configs').select('*').eq('uuid', clientUuid).maybeSingle();
+        if (!vpnConfig && parentOrder.id) {
+          const { data: byOrdCfg } = await dbClient.from('vpn_configs').select('*').eq('order_id', parentOrder.id).maybeSingle();
+          if (byOrdCfg) vpnConfig = byOrdCfg;
+        }
+
+        // Resolve live 3X-UI inbound and client
+        const allInbounds = await getInboundsCall(true);
+        let matchedInbound: any = null;
+        let matchedClient: any = null;
+
+        for (const ib of allInbounds) {
+          let sObj: any = {};
+          try {
+            sObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings || {};
+          } catch {
+            continue;
+          }
+          const cList: any[] = Array.isArray(sObj.clients) ? sObj.clients : [];
+          const found = cList.find(
+            (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+          );
+          if (found) {
+            matchedInbound = ib;
+            matchedClient = found;
+            break;
+          }
+        }
+
+        if (!matchedInbound || !matchedClient || !matchedInbound.id) {
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'pending',
+            fallbackToManual: true,
+            blockedReason: 'xui_client_not_found',
+            message: 'Target VPN client was not found on live 3X-UI panel. Held for manual admin review.',
+          };
+        }
+
+        const inboundId = Number(matchedInbound.id);
+
+        // Extract live 3X-UI expiry, totalGB, and live traffic counters (up, down)
+        const liveExpiryRaw = Number(matchedClient.expiryTime || 0);
+        const liveExpiryMs =
+          liveExpiryRaw > 0 && liveExpiryRaw < 10_000_000_000 ? liveExpiryRaw * 1000 : Math.max(0, Math.trunc(liveExpiryRaw));
+
+        let dbExpiryMs = 0;
+        if (vpnAccount.expiry_time && Number(vpnAccount.expiry_time) > 0) {
+          const rawAccExp = Number(vpnAccount.expiry_time);
+          dbExpiryMs = rawAccExp < 10_000_000_000 ? rawAccExp * 1000 : Math.trunc(rawAccExp);
+        } else if (vpnAccount.expiry_date) {
+          const parsed = new Date(vpnAccount.expiry_date).getTime();
+          if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
+        } else if (parentOrder.expiry_date) {
+          const parsed = new Date(parentOrder.expiry_date).getTime();
+          if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
+        }
+
+        // Check DB vs live 3X-UI expiry discrepancy (> 5 minutes falls back to manual verification).
+        // Within <= 5 minutes (legitimate minor sync drift), live 3X-UI expiry is authoritative.
+        const MAX_EXPIRY_DISCREPANCY_MS = 5 * 60 * 1000;
+        const dbExpiryCandidates: Array<{ label: string; ms: number }> = [];
+        if (dbExpiryMs > 0) dbExpiryCandidates.push({ label: 'vpn_accounts', ms: dbExpiryMs });
+        if (vpnConfig?.expiry_date) {
+          const cfgMs = new Date(vpnConfig.expiry_date).getTime();
+          if (!Number.isNaN(cfgMs) && cfgMs > 0) dbExpiryCandidates.push({ label: 'vpn_configs', ms: cfgMs });
+        }
+        if (parentOrder?.expiry_date) {
+          const ordMs = new Date(parentOrder.expiry_date).getTime();
+          if (!Number.isNaN(ordMs) && ordMs > 0) dbExpiryCandidates.push({ label: 'orders', ms: ordMs });
+        }
+
+        if (liveExpiryMs > 0) {
+          const excessiveDrift = dbExpiryCandidates.find(
+            (cand) => Math.abs(liveExpiryMs - cand.ms) > MAX_EXPIRY_DISCREPANCY_MS
+          );
+          if (excessiveDrift) {
+            console.warn(
+              `[AutoRenew] Expiry discrepancy > 5m for client ${clientUuid} (${excessiveDrift.label}): live=${liveExpiryMs}, db=${excessiveDrift.ms}. Falling back to manual review.`
+            );
+            return {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: 'pending',
+              fallbackToManual: true,
+              blockedReason: 'expiry_discrepancy_exceeds_threshold',
+              message: 'Database and 3X-UI expiry timestamps differ by more than 5 minutes. Held for manual admin verification.',
+            };
+          }
+        }
+
+        const authoritativePrevExpiryMs = liveExpiryMs > 0 ? liveExpiryMs : dbExpiryMs;
+        if (authoritativePrevExpiryMs <= 0) {
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'pending',
+            fallbackToManual: true,
+            blockedReason: 'missing_previous_expiry',
+            message: 'Previous VPN expiry timestamp could not be determined. Held for manual admin review.',
+          };
+        }
+
+        const authoritativePrevTotalBytes = Math.max(0, Math.trunc(Number(matchedClient.totalGB ?? vpnAccount.total_bytes ?? 0) || 0));
+        const clientStats: any[] = Array.isArray(matchedInbound.clientStats) ? matchedInbound.clientStats : [];
+        const statRow =
+          clientStats.find((s: any) => String(s.id || '').trim().toLowerCase() === clientUuid.toLowerCase()) ||
+          clientStats.find(
+            (s: any) =>
+              matchedClient.email &&
+              String(s.email || '').trim().toLowerCase() === String(matchedClient.email).trim().toLowerCase()
+          );
+
+        const liveUpBytes = Math.max(
+          0,
+          Math.trunc(Number(statRow?.up ?? matchedClient.up ?? vpnAccount.up_bytes ?? 0) || 0)
+        );
+        const liveDownBytes = Math.max(
+          0,
+          Math.trunc(Number(statRow?.down ?? matchedClient.down ?? vpnAccount.down_bytes ?? 0) || 0)
+        );
+
+        // STRICT enable verification: pass raw values without coercing undefined/null to true!
+        const rawLiveClientEnable: unknown = matchedClient.enable;
+        const rawLiveInboundEnable: unknown = matchedInbound.enable;
+
+        // Determine requested renewal duration and quota from verified renew_requests record
+        const durationMonths = Math.max(
+          1,
+          Math.trunc(Number(extra.durationMonths || renewReq.duration_months || 1) || 1)
+        );
+        const combinedPlanStr = `${renewReq.plan_id || ''} ${renewReq.plan_name || ''} ${extra.package_type || ''} ${extra.data_limit || ''}`.toLowerCase();
+        const isFinite100GbPackage =
+          combinedPlanStr.includes('100gb') ||
+          combinedPlanStr.includes('100 gb') ||
+          combinedPlanStr.includes('sim_100') ||
+          String(extra.data_limit || '').toLowerCase().includes('100');
+        const ONE_HUNDRED_GB_BYTES = 100 * 1024 * 1024 * 1024;
+        const addedQuotaBytes = isFinite100GbPackage ? ONE_HUNDRED_GB_BYTES * durationMonths : 0;
+
+        const calc = calculateApprovedRenewalEntitlement({
+          previousExpiryMs: authoritativePrevExpiryMs,
+          previousTotalBytes: authoritativePrevTotalBytes,
+          liveUpBytes,
+          liveDownBytes,
+          liveEnable: rawLiveClientEnable,
+          inboundEnable: rawLiveInboundEnable,
+          dbAccountStatus: vpnAccount.status,
+          addedDurationMonths: durationMonths,
+          addedQuotaBytes,
+          nowMs,
+        });
+
+        if (!calc.eligible) {
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'pending',
+            fallbackToManual: true,
+            blockedReason: calc.code || 'ineligible_for_auto_renewal',
+            message: calc.reason || 'Account is not eligible for automatic renewal. Held for manual admin review.',
+          };
+        }
+
+        if (calc.grantedExpiryMs <= calc.previousExpiryMs) {
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'pending',
+            fallbackToManual: true,
+            blockedReason: 'non_increasing_granted_expiry',
+            message: 'Calculated renewal expiry is not strictly greater than previous expiry. Held for manual admin review.',
+          };
+        }
+
+        // Verified boolean enable (guaranteed === true by calculateApprovedRenewalEntitlement)
+        const verifiedPrevEnable = rawLiveClientEnable === true;
+        const normalizedPrevStatus = String(vpnAccount.status || 'active').trim() || 'active';
+
+        // Build complete pre-renewal snapshot conforming to public.is_valid_pre_renewal_db_snapshot
+        const preRenewalSnapshot = buildVerifiedPreRenewalDbSnapshot({
+          capturedAtMs: nowMs,
+          clientUuid,
+          inboundId,
+          previousExpiryMs: calc.previousExpiryMs,
+          previousTotalBytes: calc.previousTotalBytes,
+          previousUpBytes: calc.liveUpBytes,
+          previousDownBytes: calc.liveDownBytes,
+          previousEnable: verifiedPrevEnable,
+          grantedExpiryMs: calc.grantedExpiryMs,
+          grantedTotalBytes: calc.grantedTotalBytes,
+          grantedDataLimit: calc.grantedDataLimitStr,
+          vpnAccount: { ...vpnAccount, status: normalizedPrevStatus },
+          parentOrder,
+          vpnConfig,
+          liveClient: matchedClient,
+        });
+
+        const prePersistIso = new Date(nowMs).toISOString();
+        const packageName = String(
+          extra.package_name || renewReq.plan_name || vpnConfig?.package_name || parentOrder.package_name || 'FIREVPN Package'
+        ).trim();
+
+        const preGrantPayload = {
+          grant_type: 'renewal',
+          source_id: cleanRequestId,
+          renew_request_id: cleanRequestId,
+          order_id: parentOrder.id,
+          user_id: requestUserId || vpnAccount.user_id || parentOrder.customer_id,
+          user_email: requestEmail || vpnAccount.email || parentOrder.email || '',
+          vpn_account_id: vpnAccount.id,
+          client_uuid: clientUuid,
+          sub_id: matchedClient.subId ? String(matchedClient.subId) : null,
+          inbound_id: inboundId,
+          remark: matchedClient.email || vpnAccount.remark || '',
+          package_name: packageName,
+          duration_months: durationMonths,
+          previous_expiry_ms: calc.previousExpiryMs,
+          previous_total_bytes: calc.previousTotalBytes,
+          previous_was_unlimited: calc.previousWasUnlimited,
+          previous_enable: verifiedPrevEnable,
+          previous_status: normalizedPrevStatus,
+          previous_up_bytes: calc.liveUpBytes,
+          previous_down_bytes: calc.liveDownBytes,
+          pre_renewal_db_snapshot: preRenewalSnapshot,
+          added_duration_months: durationMonths,
+          granted_expiry_ms: calc.grantedExpiryMs,
+          added_quota_bytes: calc.addedQuotaBytes,
+          granted_total_bytes: calc.grantedTotalBytes,
+          granted_unlimited: calc.grantedUnlimited,
+          provisional: true,
+          status: 'provisioning',
+          updated_at: prePersistIso,
+        };
+
+        // Pre-persist entitlement grant row BEFORE modifying 3X-UI (fail closed if DB rejects snapshot)
+        let grantRowId = existingGrant?.id || null;
+        if (grantRowId) {
+          const { error: updGrantErr } = await dbClient
+            .from('vpn_entitlement_grants')
+            .update(preGrantPayload)
+            .eq('id', grantRowId);
+          if (updGrantErr) {
+            throw new Error(`Failed to pre-persist renewal entitlement grant before 3X-UI update: ${updGrantErr.message}`);
+          }
+        } else {
+          const { data: insGrant, error: insGrantErr } = await dbClient
+            .from('vpn_entitlement_grants')
+            .insert({ ...preGrantPayload, created_at: prePersistIso })
+            .select('id')
+            .maybeSingle();
+          if (insGrantErr || !insGrant?.id) {
+            throw new Error(
+              `Failed to pre-persist renewal entitlement grant before 3X-UI update: ${insGrantErr?.message || 'No grant ID returned'}`
+            );
+          }
+          grantRowId = insGrant.id;
+        }
+
+        const preExtraNotes = {
+          ...extra,
+          old_expiry: new Date(calc.previousExpiryMs).toISOString(),
+          new_expiry: new Date(calc.grantedExpiryMs).toISOString(),
+        };
+
+        const { error: preReqErr } = await dbClient
+          .from('renew_requests')
+          .update({
+            provisioning_status: 'provisioning',
+            notes: JSON.stringify(preExtraNotes),
+            updated_at: prePersistIso,
+          })
+          .eq('id', cleanRequestId);
+
+        if (preReqErr) {
+          throw new Error(`Failed to update renew_requests status to provisioning before 3X-UI write: ${preReqErr.message}`);
+        }
+
+        let xuiWriteAttempted = false;
+        let xuiWriteConfirmed = false;
+
+        try {
+          // Acquire inbound write lock `inbound:<inboundId>` (Lock #3 in deterministic hierarchy)
+          await withInboundWriteLock(
+            {
+              dbClient,
+              inboundId,
+              targetId: `renew:${cleanRequestId}`,
+              clientUuid,
+              requireDurableLock: true,
+            },
+            async (assertInboundLockStillHeld) => {
+              const fetchFreshInbound = async (): Promise<any | null> => {
+                try {
+                  const res = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+                  const obj = res?.obj || res;
+                  if (obj && typeof obj === 'object' && obj.id !== undefined) return obj;
+                } catch (_e) {}
+                const list = await getInboundsCall(true);
+                return list.find((ib: any) => Number(ib.id) === Number(inboundId)) || null;
+              };
+
+              const liveInboundObj = await fetchFreshInbound();
+              if (!liveInboundObj) {
+                throw new Error(`Unable to fetch live inbound ${inboundId} from 3X-UI panel for renewal.`);
+              }
+
+              // Re-verify inbound.enable === true inside the inbound write lock before any 3X-UI mutation
+              if (liveInboundObj.enable !== true) {
+                const disabledIbErr: any = new Error(
+                  `Inbound ${inboundId} is disabled or ambiguous (enable=${String(liveInboundObj.enable)}) inside write lock. Aborting automatic renewal.`
+                );
+                disabledIbErr.blockedReason = 'INBOUND_DISABLED_OR_AMBIGUOUS';
+                throw disabledIbErr;
+              }
+
+              let settingsObj: any = {};
+              if (typeof liveInboundObj.settings === 'string') {
+                try {
+                  settingsObj = JSON.parse(liveInboundObj.settings);
+                } catch {
+                  settingsObj = { clients: [] };
+                }
+              } else if (liveInboundObj.settings && typeof liveInboundObj.settings === 'object') {
+                settingsObj = { ...liveInboundObj.settings };
+              }
+
+              const clientsList: any[] = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+              const cIdx = clientsList.findIndex(
+                (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+              );
+              if (cIdx < 0) {
+                throw new Error(`Client ${clientUuid} no longer found on inbound ${inboundId} inside write lock.`);
+              }
+
+              // Re-verify client.enable === true inside the inbound write lock before any 3X-UI mutation
+              if (clientsList[cIdx].enable !== true) {
+                const disabledClientErr: any = new Error(
+                  `Client ${clientUuid} is disabled or ambiguous (enable=${String(clientsList[cIdx].enable)}) inside write lock. Refusing unauthorized re-enable.`
+                );
+                disabledClientErr.blockedReason = 'CLIENT_DISABLED_OR_AMBIGUOUS';
+                throw disabledClientErr;
+              }
+
+              // Update ONLY expiryTime, totalGB, and enable: true while preserving all credentials (id, email, password, auth, subId, flow, etc.)
+              clientsList[cIdx] = {
+                ...clientsList[cIdx],
+                id: clientUuid,
+                expiryTime: calc.grantedExpiryMs,
+                totalGB: calc.grantedTotalBytes,
+                enable: true,
+              };
+              settingsObj.clients = clientsList;
+
+              const updatePayload: any = {
+                ...liveInboundObj,
+                id: inboundId,
+                settings: JSON.stringify(settingsObj),
+              };
+              delete updatePayload.up;
+              delete updatePayload.down;
+              delete updatePayload.clientStats;
+              delete updatePayload.trafficReset;
+              delete updatePayload.lastTrafficResetTime;
+
+              // Verify all 3 locks are still held right before dispatching external 3X-UI mutation
+              await assertInboundLockStillHeld();
+              await assertClientLockStillHeld();
+              const renewStillHeld = await renewDurableProvisioningOperationLock({
+                dbClient,
+                operationKey: renewLockKey,
+                lockOwnerId: renewLockRes.lockOwnerId,
+              });
+              if (!renewStillHeld) {
+                const fenceErr: any = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
+                fenceErr.statusCode = 409;
+                throw fenceErr;
+              }
+
+              xuiWriteAttempted = true;
+              const updateRes = await requestApiCall<any>(
+                `/panel/api/inbounds/update/${inboundId}`,
+                'POST',
+                updatePayload
+              );
+              if (updateRes && updateRes.success === false) {
+                throw new Error(updateRes.msg || updateRes.message || '3X-UI panel rejected renewal inbound update.');
+              }
+
+              // MANDATORY READ-BACK VERIFICATION from live 3X-UI panel
+              const afterInbound = await fetchFreshInbound();
+              if (!afterInbound) {
+                throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal write.`);
+              }
+              if (afterInbound.enable !== true) {
+                throw new Error(
+                  `Read-back verification failed: inbound ${inboundId} is not enabled (enable=${String(afterInbound.enable)}) after renewal write.`
+                );
+              }
+              let afterSettings: any = {};
+              try {
+                afterSettings =
+                  typeof afterInbound.settings === 'string'
+                    ? JSON.parse(afterInbound.settings)
+                    : afterInbound.settings || {};
+              } catch {
+                afterSettings = {};
+              }
+              const verifiedClient = (Array.isArray(afterSettings.clients) ? afterSettings.clients : []).find(
+                (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+              );
+
+              if (
+                !verifiedClient ||
+                verifiedClient.enable !== true ||
+                Number(verifiedClient.expiryTime) !== calc.grantedExpiryMs ||
+                Number(verifiedClient.totalGB) !== calc.grantedTotalBytes
+              ) {
+                throw new Error(
+                  `Read-back verification failed for renewed client ${clientUuid} on inbound ${inboundId}: expected enable=true, expiryTime=${calc.grantedExpiryMs}, totalGB=${calc.grantedTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+                );
+              }
+
+              xuiWriteConfirmed = true;
+              invalidateInboundCache(inboundId);
+            }
+          );
+        } catch (xuiErr: any) {
+          const errText = xuiErr?.message || String(xuiErr);
+          const isUncertain = xuiWriteAttempted && !xuiWriteConfirmed;
+          renewLockOutcome = isUncertain ? 'uncertain' : 'failed';
+          renewLockError = errText;
+
+          try {
+            if (isUncertain) {
+              await dbClient
+                .from('vpn_entitlement_grants')
+                .update({
+                  status: 'uncertain',
+                  last_error: errText,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', grantRowId);
+            } else if (grantRowId) {
+              // 3X-UI write was never dispatched; delete the temporary 'provisioning' row
+              // so vpn_entitlement_grants_status_check is satisfied and manual admin approval remains unblocked.
+              await dbClient
+                .from('vpn_entitlement_grants')
+                .delete()
+                .eq('id', grantRowId);
+            }
+          } catch (_e) {}
+
+          try {
+            await dbClient
+              .from('renew_requests')
+              .update({
+                provisioning_status: isUncertain ? 'uncertain' : 'pending',
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', cleanRequestId);
+          } catch (_e) {}
+
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: isUncertain ? 'uncertain' : 'pending',
+            fallbackToManual: true,
+            blockedReason: xuiErr?.blockedReason || (isUncertain ? 'xui_write_uncertain' : 'xui_update_failed'),
+            uuid: clientUuid,
+            inboundId,
+            message: errText,
+          };
+        }
+
+        // Step 6: Update Supabase records after confirmed 3X-UI read-back verification.
+        // CRITICAL SAFETY: If ANY database write fails AFTER 3X-UI has been mutated, we MUST NOT
+        // release the lock as 'completed' and MUST NOT return autoRenewed=true; we mark the durable
+        // lock, grant, and renewal request as 'uncertain' so duplicate retries are blocked until reconciliation.
+        const finalNowIso = new Date().toISOString();
+        const grantedExpiryIso = new Date(calc.grantedExpiryMs).toISOString();
+        const dataAllowanceLabel =
+          calc.addedQuotaBytes > 0
+            ? `${Math.round(calc.addedQuotaBytes / (1024 * 1024 * 1024))} GB`
+            : 'Unlimited';
+
+        try {
+          const { error: accUpdErr } = await dbClient
+            .from('vpn_accounts')
+            .update({
+              expiry_time: calc.grantedExpiryMs,
+              expiry_date: grantedExpiryIso,
+              total_bytes: calc.grantedTotalBytes,
+              data_limit: calc.grantedDataLimitStr,
+              status: 'active',
+              enable: true,
+              updated_at: finalNowIso,
+            })
+            .eq('id', vpnAccount.id);
+
+          if (accUpdErr) {
+            throw new Error(`Failed to update vpn_accounts after 3X-UI renewal: ${accUpdErr.message}`);
+          }
+
+          if (vpnConfig?.id) {
+            const { error: cfgUpdErr } = await dbClient
+              .from('vpn_configs')
+              .update({
+                expiry_date: grantedExpiryIso,
+                data_limit: calc.grantedDataLimitStr,
+                enabled: true,
+                status: 'active',
+              })
+              .eq('id', vpnConfig.id);
+
+            if (cfgUpdErr) {
+              throw new Error(`Failed to update vpn_configs after 3X-UI renewal: ${cfgUpdErr.message}`);
+            }
+          }
+
+          // Update orders.expiry_date while keeping orders.payment_status='Paid' and orders.status='completed'
+          const { error: ordUpdErr } = await dbClient
+            .from('orders')
+            .update({
+              expiry_date: grantedExpiryIso,
+              updated_at: finalNowIso,
+            })
+            .eq('id', parentOrder.id);
+
+          if (ordUpdErr) {
+            throw new Error(`Failed to update orders.expiry_date after 3X-UI renewal: ${ordUpdErr.message}`);
+          }
+
+          // Promote vpn_entitlement_grants to 'provisional'
+          const { error: grantPromErr } = await dbClient
+            .from('vpn_entitlement_grants')
+            .update({
+              status: 'provisional',
+              provisional: true,
+              last_error: null,
+              updated_at: finalNowIso,
+            })
+            .eq('id', grantRowId);
+
+          if (grantPromErr) {
+            throw new Error(`Failed to promote renewal vpn_entitlement_grants to provisional: ${grantPromErr.message}`);
+          }
+
+          // Keep renew_requests.status = 'pending' and set renew_requests.provisioning_status = 'provisional'
+          const updatedExtra = {
+            ...extra,
+            old_expiry: new Date(calc.previousExpiryMs).toISOString(),
+            new_expiry: grantedExpiryIso,
+            data_allowance: dataAllowanceLabel,
+            provisional_renewal: true,
+            calculation_mode: calc.mode,
+          };
+
+          const { error: reqUpdErr } = await dbClient
+            .from('renew_requests')
+            .update({
+              status: 'pending',
+              provisioning_status: 'provisional',
+              notes: JSON.stringify(updatedExtra),
+              updated_at: finalNowIso,
+            })
+            .eq('id', cleanRequestId);
+
+          if (reqUpdErr) {
+            throw new Error(`Failed to update renew_requests provisioning_status to provisional: ${reqUpdErr.message}`);
+          }
+        } catch (postXuiDbErr: any) {
+          const dbErrText = postXuiDbErr?.message || String(postXuiDbErr);
+          console.error(
+            `[AutoRenew] CRITICAL: Database sync failed AFTER confirmed 3X-UI renewal write for request ${cleanRequestId} (client ${clientUuid}):`,
+            dbErrText
+          );
+          renewLockOutcome = 'uncertain';
+          renewLockError = dbErrText;
+
+          try {
+            await dbClient
+              .from('vpn_entitlement_grants')
+              .update({
+                status: 'uncertain',
+                last_error: dbErrText,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', grantRowId);
+          } catch (_e) {}
+
+          try {
+            await dbClient
+              .from('renew_requests')
+              .update({
+                provisioning_status: 'uncertain',
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', cleanRequestId);
+          } catch (_e) {}
+
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'uncertain',
+            fallbackToManual: true,
+            blockedReason: 'post_xui_db_sync_failed',
+            uuid: clientUuid,
+            inboundId,
+            message: `3X-UI renewal succeeded but database sync failed (${dbErrText}). Marked 'uncertain' for safe admin reconciliation.`,
+          };
+        }
+
+        if (!options?.skipSideEffects) {
+          try {
+            await createCustomerNotification({
+              userId: requestUserId || vpnAccount.user_id || null,
+              userEmail: requestEmail || vpnAccount.email,
+              title: 'VPN Renewed (Payment Pending Verification)',
+              message: `Your VPN subscription "${packageName}" has been renewed until ${new Date(calc.grantedExpiryMs).toLocaleDateString()}! Payment verification is pending admin review.`,
+              type: 'renewal_approved',
+              vpnName: packageName,
+            });
+          } catch (notifErr: any) {
+            console.warn('[AutoRenew] Customer notification warning:', notifErr?.message || notifErr);
+          }
+          triggerBackgroundSyncIfNeeded('VPN Provisionally Renewed', true);
+        }
+
+        return {
+          success: true,
+          autoRenewed: true,
+          provisional: true,
+          provisioningStatus: 'provisional',
+          mode: calc.mode,
+          uuid: clientUuid,
+          inboundId,
+          oldExpiryIso: new Date(calc.previousExpiryMs).toISOString(),
+          newExpiryIso: grantedExpiryIso,
+          grantedExpiryMs: calc.grantedExpiryMs,
+          grantedTotalBytes: calc.grantedTotalBytes,
+          addedQuotaBytes: calc.addedQuotaBytes,
+          dataAllowanceLabel,
+          packageName,
+          message: 'VPN subscription renewed and provisionally activated pending payment verification.',
+        };
+      }
+    );
+  } finally {
+    if (renewLockRes.tableAvailable) {
+      await finalizeDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: renewLockKey,
+        lockOwnerId: renewLockRes.lockOwnerId,
+        status: renewLockOutcome,
+        clientUuid: targetClientUuid,
+        errorMessage: renewLockError,
+      });
+    }
+  }
+}
+
+export interface ConfirmProvisionalRenewalOptions {
+  adminLabel?: string;
+  dbClient?: any;
+  getInboundsFn?: typeof getInbounds;
+  heldRenewLockOwnerId?: string;
+}
+
+/**
+ * Confirms an already provisionally applied renewal upon Admin or Telegram approval
+ * WITHOUT extending expiry or adding quota a second time.
+ * Works regardless of whether AUTO_ACTIVATE_RENEWALS_ENABLED is currently true or false.
+ */
+export async function confirmProvisionalRenewal(
+  renewRequestId: string,
+  options?: ConfirmProvisionalRenewalOptions
+): Promise<{
+  handledAsProvisional: boolean;
+  confirmed?: boolean;
+  uuid?: string;
+  newExpiryIso?: string;
+  oldExpiryIso?: string;
+  durationMonths?: number;
+  packageName?: string;
+}> {
+  const dbClient = options?.dbClient || supabaseAdmin;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
+  const cleanRequestId = String(renewRequestId || '').trim();
+
+  const { data: grantRow, error: grantErr } = await dbClient
+    .from('vpn_entitlement_grants')
+    .select('*')
+    .eq('grant_type', 'renewal')
+    .eq('source_id', cleanRequestId)
+    .maybeSingle();
+
+  if (grantErr) {
+    if (isMissingSchemaOrRpcError(grantErr) && !isAutoActivateRenewalsFlagEnabled()) {
+      return { handledAsProvisional: false };
+    }
+    throw new Error(`Failed to lookup renewal entitlement grant: ${grantErr.message}`);
+  }
+
+  if (!grantRow) {
+    return { handledAsProvisional: false };
+  }
+
+  if (grantRow.status === 'revoked' || grantRow.status === 'revoke_failed') {
+    const conflictErr: any = new Error(
+      `Renewal request '${cleanRequestId}' has already been rejected/revoked (grant status=${grantRow.status}) and cannot be approved.`
+    );
+    conflictErr.statusCode = 409;
+    throw conflictErr;
+  }
+
+  if (grantRow.status === 'provisioning') {
+    const conflictErr: any = new Error(
+      `Renewal request '${cleanRequestId}' currently has an in-flight provisioning grant (status=provisioning). Please wait or verify live 3X-UI client state before approving.`
+    );
+    conflictErr.statusCode = 409;
+    throw conflictErr;
+  }
+
+  const isUncertainReconciliation = grantRow.status === 'uncertain';
+  const clientUuid = String(grantRow.client_uuid || '').trim();
+  const grantedExpiryMs = Number(grantRow.granted_expiry_ms || 0);
+  const grantedTotalBytes = Number(grantRow.granted_total_bytes || 0);
+  const previousExpiryMs = Number(grantRow.previous_expiry_ms || 0);
+  const snapshot =
+    grantRow.pre_renewal_db_snapshot && typeof grantRow.pre_renewal_db_snapshot === 'object'
+      ? grantRow.pre_renewal_db_snapshot
+      : null;
+
+  return await withClientMutationLock(
+    {
+      dbClient,
+      clientUuid,
+      operationType: 'client_lock',
+      targetId: `approve_renew:${cleanRequestId}`,
+      requireDurableLock: true,
+      allowUncertainRecovery: true,
+      metadata: { renewRequestId: cleanRequestId, action: 'confirm_provisional_renewal' },
+    },
+    async () => {
+      // Verify live 3X-UI inbound and client reflect the provisionally granted entitlement
+      const liveInbounds = await getInboundsCall(true);
+      let liveInbound: any = null;
+      let liveClient: any = null;
+      for (const ib of liveInbounds) {
+        let sObj: any = {};
+        try {
+          sObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings || {};
+        } catch {
+          continue;
+        }
+        const found = (Array.isArray(sObj.clients) ? sObj.clients : []).find(
+          (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+        );
+        if (found) {
+          liveInbound = ib;
+          liveClient = found;
+          break;
+        }
+      }
+
+      if (isUncertainReconciliation) {
+        // Durable uncertain-state reconciliation:
+        // Only confirm & sync DB without modifying 3X-UI if live 3X-UI EXACTLY matches the granted entitlement.
+        const exactMatch =
+          Boolean(liveInbound && liveInbound.enable === true) &&
+          Boolean(liveClient && liveClient.enable === true) &&
+          Number(liveClient?.expiryTime || 0) === grantedExpiryMs &&
+          Number(liveClient?.totalGB ?? -1) === grantedTotalBytes;
+
+        if (!exactMatch) {
+          const conflictErr: any = new Error(
+            `Uncertain renewal '${cleanRequestId}' cannot be confirmed automatically because live 3X-UI state (inboundEnable=${String(liveInbound?.enable)}, clientEnable=${String(liveClient?.enable)}, expiryTime=${String(liveClient?.expiryTime)}, totalGB=${String(liveClient?.totalGB)}) does not exactly match granted entitlement (expiryTime=${grantedExpiryMs}, totalGB=${grantedTotalBytes}).`
+          );
+          conflictErr.statusCode = 409;
+          conflictErr.markLockUncertain = true;
+          throw conflictErr;
+        }
+      } else {
+        if (
+          !liveInbound ||
+          liveInbound.enable !== true ||
+          !liveClient ||
+          liveClient.enable !== true ||
+          Number(liveClient.expiryTime || 0) < grantedExpiryMs
+        ) {
+          const conflictErr: any = new Error(
+            `Live 3X-UI client '${clientUuid}' does not match the provisional renewal grant (inboundEnable=${String(liveInbound?.enable)}, liveEnable=${String(liveClient?.enable)}, live expiryTime=${String(liveClient?.expiryTime)}, expected expiryTime>=${grantedExpiryMs}). Refusing to mark verified without reconciliation.`
+          );
+          conflictErr.statusCode = 409;
+          throw conflictErr;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const newExpiryIso = new Date(grantedExpiryMs).toISOString();
+      const oldExpiryIso = previousExpiryMs > 0 ? new Date(previousExpiryMs).toISOString() : undefined;
+
+      // If reconciling an 'uncertain' grant (e.g., after post-3X-UI DB sync failure or timeout),
+      // synchronize Supabase records to the verified live 3X-UI entitlement WITHOUT touching 3X-UI again.
+      if (isUncertainReconciliation) {
+        const grantedDataLimit =
+          String(
+            snapshot?.granted_db_state?.granted_data_limit ||
+              (grantedTotalBytes === 0
+                ? 'Unlimited'
+                : `${Math.max(1, Math.round(Number(grantRow.added_quota_bytes || grantedTotalBytes) / (1024 * 1024 * 1024)))}GB`)
+          ).trim() || 'Unlimited';
+
+        if (grantRow.vpn_account_id) {
+          const { error: accSyncErr } = await dbClient
+            .from('vpn_accounts')
+            .update({
+              expiry_time: grantedExpiryMs,
+              expiry_date: newExpiryIso,
+              total_bytes: grantedTotalBytes,
+              data_limit: grantedDataLimit,
+              status: 'active',
+              enable: true,
+              updated_at: nowIso,
+            })
+            .eq('id', grantRow.vpn_account_id);
+          if (accSyncErr) {
+            throw new Error(`Failed to reconcile vpn_accounts for uncertain grant: ${accSyncErr.message}`);
+          }
+        }
+
+        const snapCfg = snapshot?.vpn_config;
+        if (snapCfg && snapCfg.exists === true && snapCfg.id) {
+          const { error: cfgSyncErr } = await dbClient
+            .from('vpn_configs')
+            .update({
+              expiry_date: newExpiryIso,
+              data_limit: grantedDataLimit,
+              enabled: true,
+              status: 'active',
+            })
+            .eq('id', snapCfg.id);
+          if (cfgSyncErr) {
+            throw new Error(`Failed to reconcile vpn_configs for uncertain grant: ${cfgSyncErr.message}`);
+          }
+        }
+
+        if (grantRow.order_id) {
+          const { error: ordSyncErr } = await dbClient
+            .from('orders')
+            .update({
+              expiry_date: newExpiryIso,
+              updated_at: nowIso,
+            })
+            .eq('id', grantRow.order_id);
+          if (ordSyncErr) {
+            throw new Error(`Failed to reconcile orders.expiry_date for uncertain grant: ${ordSyncErr.message}`);
+          }
+        }
+      }
+
+      // 1. Mark vpn_entitlement_grants as 'verified'
+      const { error: verifyErr } = await dbClient
+        .from('vpn_entitlement_grants')
+        .update({
+          status: 'verified',
+          verified_at: nowIso,
+          verified_by: options?.adminLabel || 'Admin',
+          last_error: null,
+          updated_at: nowIso,
+        })
+        .eq('id', grantRow.id);
+
+      if (verifyErr) {
+        throw new Error(`Failed to mark renewal entitlement grant verified: ${verifyErr.message}`);
+      }
+
+      // 2. Merge audit fields into renew_requests.notes and mark status='approved', provisioning_status='completed'
+      const { data: currentReqRow } = await dbClient
+        .from('renew_requests')
+        .select('notes')
+        .eq('id', cleanRequestId)
+        .maybeSingle();
+
+      let mergedNotes: Record<string, any> = {};
+      if (currentReqRow?.notes && typeof currentReqRow.notes === 'string' && currentReqRow.notes.startsWith('{')) {
+        try {
+          mergedNotes = JSON.parse(currentReqRow.notes);
+        } catch {
+          mergedNotes = {};
+        }
+      }
+      mergedNotes = {
+        ...mergedNotes,
+        ...(oldExpiryIso ? { old_expiry: oldExpiryIso } : {}),
+        new_expiry: newExpiryIso,
+        approved_at: nowIso,
+        approved_by: options?.adminLabel || 'Admin',
+        provisional_confirmed: true,
+        ...(isUncertainReconciliation ? { reconciled_from_uncertain: true } : {}),
+      };
+
+      const { error: reqUpdErr } = await dbClient
+        .from('renew_requests')
+        .update({
+          status: 'approved',
+          provisioning_status: 'completed',
+          notes: JSON.stringify(mergedNotes),
+          updated_at: nowIso,
+        })
+        .eq('id', cleanRequestId);
+
+      if (reqUpdErr) {
+        throw new Error(`Failed to mark provisionally renewed request approved: ${reqUpdErr.message}`);
+      }
+
+      return {
+        handledAsProvisional: true,
+        confirmed: true,
+        uuid: clientUuid,
+        newExpiryIso,
+        oldExpiryIso,
+        durationMonths: Number(grantRow.added_duration_months || grantRow.duration_months || 1),
+        packageName: grantRow.package_name || 'VPN Subscription',
+      };
+    }
+  );
+}
+
+export interface RevokeProvisionalRenewalOptions {
+  adminLabel?: string;
+  dbClient?: any;
+  requestApiFn?: typeof requestApi;
+  getInboundsFn?: typeof getInbounds;
+  nowMs?: number;
+}
+
+/**
+ * Safely rolls back an unpaid provisional renewal upon Admin or Telegram rejection:
+ * - Works even when AUTO_ACTIVATE_RENEWALS_ENABLED=false.
+ * - Acquires `client:<uuid>` and `inbound:<inboundId>` locks.
+ * - Verifies no newer renewal or unrelated admin change occurred on the client (`liveExpiryMs === grant.granted_expiry_ms`
+ *   and `liveTotalBytes === grant.granted_total_bytes`; if mismatched, marks 'uncertain' and refuses blind overwrite).
+ * - Restores `expiryTime = grant.previous_expiry_ms` and `totalGB = grant.previous_total_bytes` on 3X-UI
+ *   WITHOUT restoring stale `up`/`down` traffic counters.
+ * - Sets `enable = Boolean(grant.previous_enable) && !restoredIsExpired && !restoredIsExhausted` so that:
+ *   - If the customer's pre-renewal entitlement is still unexpired and unexhausted, their valid paid VPN access remains active!
+ *   - If the customer's pre-renewal entitlement was already expired or exhausted, the client is disabled and read-back verified
+ *     so unpaid VPN access is no longer possible!
+ * - Restores `vpn_accounts`, `vpn_configs`, and `orders.expiry_date` from `pre_renewal_db_snapshot` while preserving `orders.payment_status = 'Paid'`.
+ * - Marks `vpn_entitlement_grants.status = 'revoked'` and `renew_requests.provisioning_status = 'revoked'`.
+ */
+export async function revokeProvisionalRenewal(
+  renewRequestId: string,
+  reason: string,
+  options?: RevokeProvisionalRenewalOptions
+): Promise<{
+  handledAsProvisional: boolean;
+  revoked: boolean;
+  uuid?: string;
+  inboundId?: number | null;
+  restoredExpiryMs?: number;
+  restoredTotalBytes?: number;
+  restoredEnable?: boolean;
+  restoredStatus?: 'active' | 'expired' | 'disabled';
+  reason?: string;
+}> {
+  const dbClient = options?.dbClient || supabaseAdmin;
+  const requestApiCall = options?.requestApiFn || requestApi;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
+  const nowMs = options?.nowMs ?? Date.now();
+  const cleanRequestId = String(renewRequestId || '').trim();
+
+  const { data: grantRow, error: grantErr } = await dbClient
+    .from('vpn_entitlement_grants')
+    .select('*')
+    .eq('grant_type', 'renewal')
+    .eq('source_id', cleanRequestId)
+    .maybeSingle();
+
+  if (grantErr) {
+    if (isMissingSchemaOrRpcError(grantErr) && !isAutoActivateRenewalsFlagEnabled()) {
+      return { handledAsProvisional: false, revoked: false };
+    }
+    throw new Error(`Failed to lookup renewal entitlement grant for rejection: ${grantErr.message}`);
+  }
+
+  // If no renewal grant exists, this is a standard manual pending renewal request (no 3X-UI rollback needed)
+  if (!grantRow) {
+    return { handledAsProvisional: false, revoked: false };
+  }
+
+  if (grantRow.status === 'revoked') {
+    return {
+      handledAsProvisional: true,
+      revoked: true,
+      uuid: grantRow.client_uuid,
+      inboundId: grantRow.inbound_id,
+      restoredExpiryMs: Number(grantRow.previous_expiry_ms || 0),
+      restoredTotalBytes: Number(grantRow.previous_total_bytes || 0),
+      reason: 'Provisional renewal grant was already revoked.',
+    };
+  }
+
+  if (grantRow.status === 'verified') {
+    const conflictErr: any = new Error(
+      `Renewal request '${cleanRequestId}' has already been payment-verified and approved; refusing to revoke confirmed paid renewal.`
+    );
+    conflictErr.statusCode = 409;
+    throw conflictErr;
+  }
+
+  const clientUuid = String(grantRow.client_uuid || '').trim();
+  const inboundId = Number(grantRow.inbound_id || 0);
+  const prevExpiryMs = Math.max(0, Math.trunc(Number(grantRow.previous_expiry_ms || 0)));
+  const prevTotalBytes = Math.max(0, Math.trunc(Number(grantRow.previous_total_bytes || 0)));
+  const prevEnable = grantRow.previous_enable !== false;
+  const grantedExpiryMs = Math.max(0, Math.trunc(Number(grantRow.granted_expiry_ms || 0)));
+  const grantedTotalBytes = Math.max(0, Math.trunc(Number(grantRow.granted_total_bytes || 0)));
+  const snapshot = (grantRow.pre_renewal_db_snapshot && typeof grantRow.pre_renewal_db_snapshot === 'object')
+    ? grantRow.pre_renewal_db_snapshot
+    : null;
+
+  if (!clientUuid || !inboundId || !snapshot) {
+    const conflictErr: any = new Error(
+      `Renewal grant '${grantRow.id}' is missing required pre-renewal snapshot or inbound metadata; manual reconciliation required.`
+    );
+    conflictErr.statusCode = 409;
+    throw conflictErr;
+  }
+
+  return await withClientMutationLock(
+    {
+      dbClient,
+      clientUuid,
+      operationType: 'client_lock',
+      targetId: `reject_renew:${cleanRequestId}`,
+      requireDurableLock: true,
+      allowUncertainRecovery: true,
+      metadata: { renewRequestId: cleanRequestId, action: 'revoke_provisional_renewal', reason },
+    },
+    async (assertClientLockStillHeld) => {
+      // Check if any OTHER newer renewal grant was created for this client after this grant
+      const { data: otherClientGrants } = await dbClient
+        .from('vpn_entitlement_grants')
+        .select('id, source_id, status, created_at')
+        .eq('client_uuid', clientUuid)
+        .eq('grant_type', 'renewal')
+        .neq('id', grantRow.id);
+
+      const hasNewerActiveGrant = (otherClientGrants || []).some((g: any) => {
+        const st = String(g.status || '').toLowerCase();
+        if (st === 'revoked' || st === 'failed') return false;
+        const gCreated = g.created_at ? new Date(g.created_at).getTime() : 0;
+        const curCreated = grantRow.created_at ? new Date(grantRow.created_at).getTime() : 0;
+        return gCreated >= curCreated;
+      });
+
+      if (hasNewerActiveGrant) {
+        const nowIso = new Date().toISOString();
+        await dbClient
+          .from('vpn_entitlement_grants')
+          .update({
+            status: 'uncertain',
+            last_error: 'Newer renewal grant exists on client; automatic rollback blocked to prevent overwriting newer state.',
+            updated_at: nowIso,
+          })
+          .eq('id', grantRow.id);
+        await dbClient
+          .from('renew_requests')
+          .update({
+            provisioning_status: 'uncertain',
+            updated_at: nowIso,
+          })
+          .eq('id', cleanRequestId);
+
+        const conflictErr: any = new Error(
+          `Cannot automatically roll back renewal '${cleanRequestId}' because another active/newer renewal grant exists for client '${clientUuid}'. Marked 'uncertain' for manual reconciliation.`
+        );
+        conflictErr.statusCode = 409;
+        conflictErr.markLockUncertain = true;
+        throw conflictErr;
+      }
+
+      let restoredEnable = false;
+      let restoredStatus = 'active' as 'active' | 'expired' | 'disabled';
+
+      try {
+        await withInboundWriteLock(
+          {
+            dbClient,
+            inboundId,
+            targetId: `reject_renew:${cleanRequestId}`,
+            clientUuid,
+            requireDurableLock: true,
+          },
+          async (assertInboundLockStillHeld) => {
+            const fetchFreshInbound = async (): Promise<any | null> => {
+              try {
+                const res = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+                const obj = res?.obj || res;
+                if (obj && typeof obj === 'object' && obj.id !== undefined) return obj;
+              } catch (_e) {}
+              const list = await getInboundsCall(true);
+              return list.find((ib: any) => Number(ib.id) === Number(inboundId)) || null;
+            };
+
+            const liveInbound = await fetchFreshInbound();
+            if (!liveInbound) {
+              throw new Error(`Unable to fetch live inbound ${inboundId} from 3X-UI for renewal rollback.`);
+            }
+
+            let settingsObj: any = {};
+            if (typeof liveInbound.settings === 'string') {
+              try {
+                settingsObj = JSON.parse(liveInbound.settings);
+              } catch {
+                settingsObj = { clients: [] };
+              }
+            } else if (liveInbound.settings && typeof liveInbound.settings === 'object') {
+              settingsObj = { ...liveInbound.settings };
+            }
+
+            const clientsList: any[] = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+            const cIdx = clientsList.findIndex(
+              (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+            );
+
+            if (cIdx < 0) {
+              throw new Error(`Client '${clientUuid}' not found on inbound ${inboundId} during renewal rollback.`);
+            }
+
+            const liveClient = clientsList[cIdx];
+            const liveClientExpiryMs = Math.max(0, Math.trunc(Number(liveClient.expiryTime || 0)));
+            const liveClientTotalBytes = Math.max(0, Math.trunc(Number(liveClient.totalGB || 0)));
+
+            // Verify no unrelated admin modification occurred on 3X-UI since the provisional renewal was applied.
+            // (Allow idempotent retry if 3X-UI already matches prevExpiryMs & prevTotalBytes from an interrupted rollback.)
+            const matchesGrantedState =
+              liveClientExpiryMs === grantedExpiryMs && liveClientTotalBytes === grantedTotalBytes;
+            const matchesAlreadyRestoredState =
+              liveClientExpiryMs === prevExpiryMs && liveClientTotalBytes === prevTotalBytes;
+
+            if (!matchesGrantedState && !matchesAlreadyRestoredState) {
+              const nowIso = new Date().toISOString();
+              await dbClient
+                .from('vpn_entitlement_grants')
+                .update({
+                  status: 'uncertain',
+                  last_error: `Live 3X-UI state (expiryTime=${liveClientExpiryMs}, totalGB=${liveClientTotalBytes}) differs from expected provisional grant (expiryTime=${grantedExpiryMs}, totalGB=${grantedTotalBytes}).`,
+                  updated_at: nowIso,
+                })
+                .eq('id', grantRow.id);
+              await dbClient
+                .from('renew_requests')
+                .update({
+                  provisioning_status: 'uncertain',
+                  updated_at: nowIso,
+                })
+                .eq('id', cleanRequestId);
+
+              const conflictErr: any = new Error(
+                `Live 3X-UI client '${clientUuid}' was modified after provisional renewal (live expiryTime=${liveClientExpiryMs}, totalGB=${liveClientTotalBytes}; expected expiryTime=${grantedExpiryMs}, totalGB=${grantedTotalBytes}). Refusing blind overwrite; marked 'uncertain' for reconciliation.`
+              );
+              conflictErr.statusCode = 409;
+              conflictErr.markLockUncertain = true;
+              throw conflictErr;
+            }
+
+            // Read live cumulative traffic counters (NEVER restore stale up/down counters!)
+            const clientStats: any[] = Array.isArray(liveInbound.clientStats) ? liveInbound.clientStats : [];
+            const statRow =
+              clientStats.find((s: any) => String(s.id || '').trim().toLowerCase() === clientUuid.toLowerCase()) ||
+              clientStats.find(
+                (s: any) =>
+                  liveClient.email &&
+                  String(s.email || '').trim().toLowerCase() === String(liveClient.email).trim().toLowerCase()
+              );
+            const currentLiveUpBytes = Math.max(0, Math.trunc(Number(statRow?.up ?? liveClient.up ?? 0) || 0));
+            const currentLiveDownBytes = Math.max(0, Math.trunc(Number(statRow?.down ?? liveClient.down ?? 0) || 0));
+            const currentLiveUsedBytes = currentLiveUpBytes + currentLiveDownBytes;
+
+            const restoredIsExpired = prevExpiryMs > 0 && prevExpiryMs <= nowMs;
+            const restoredIsExhausted = prevTotalBytes > 0 && currentLiveUsedBytes >= prevTotalBytes;
+            restoredEnable = Boolean(prevEnable) && !restoredIsExpired && !restoredIsExhausted;
+            restoredStatus = restoredEnable
+              ? 'active'
+              : restoredIsExpired || restoredIsExhausted
+              ? 'expired'
+              : 'disabled';
+
+            clientsList[cIdx] = {
+              ...liveClient,
+              id: clientUuid,
+              expiryTime: prevExpiryMs,
+              totalGB: prevTotalBytes,
+              enable: restoredEnable,
+            };
+            settingsObj.clients = clientsList;
+
+            const updatePayload: any = {
+              ...liveInbound,
+              id: inboundId,
+              settings: JSON.stringify(settingsObj),
+            };
+            delete updatePayload.up;
+            delete updatePayload.down;
+            delete updatePayload.clientStats;
+            delete updatePayload.trafficReset;
+            delete updatePayload.lastTrafficResetTime;
+
+            await assertInboundLockStillHeld();
+            await assertClientLockStillHeld();
+
+            const updateRes = await requestApiCall<any>(
+              `/panel/api/inbounds/update/${inboundId}`,
+              'POST',
+              updatePayload
+            );
+            if (updateRes && updateRes.success === false) {
+              throw new Error(updateRes.msg || updateRes.message || '3X-UI rejected renewal rollback update.');
+            }
+
+            // MANDATORY READ-BACK VERIFICATION from live 3X-UI
+            const verifiedInbound = await fetchFreshInbound();
+            if (!verifiedInbound) {
+              throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal rollback.`);
+            }
+            let verifiedSettings: any = {};
+            try {
+              verifiedSettings =
+                typeof verifiedInbound.settings === 'string'
+                  ? JSON.parse(verifiedInbound.settings)
+                  : verifiedInbound.settings || {};
+            } catch {
+              verifiedSettings = {};
+            }
+            const verifiedClient = (Array.isArray(verifiedSettings.clients) ? verifiedSettings.clients : []).find(
+              (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+            );
+
+            if (
+              !verifiedClient ||
+              Boolean(verifiedClient.enable) !== restoredEnable ||
+              Number(verifiedClient.expiryTime) !== prevExpiryMs ||
+              Number(verifiedClient.totalGB) !== prevTotalBytes
+            ) {
+              throw new Error(
+                `Read-back verification failed after renewal rollback for client ${clientUuid}: expected enable=${restoredEnable}, expiryTime=${prevExpiryMs}, totalGB=${prevTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+              );
+            }
+
+            invalidateInboundCache(inboundId);
+          }
+        );
+      } catch (err: any) {
+        if (err?.statusCode === 409) {
+          throw err;
+        }
+        const nowIso = new Date().toISOString();
+        const errText = err?.message || String(err);
+        await dbClient
+          .from('vpn_entitlement_grants')
+          .update({
+            status: 'revoke_failed',
+            last_error: errText,
+            updated_at: nowIso,
+          })
+          .eq('id', grantRow.id);
+        await dbClient
+          .from('renew_requests')
+          .update({
+            provisioning_status: 'revoke_failed',
+            updated_at: nowIso,
+          })
+          .eq('id', cleanRequestId);
+
+        throw new Error(
+          `Failed to roll back provisional renewal on 3X-UI (retained in recoverable 'revoke_failed' state): ${errText}`
+        );
+      }
+
+      // Restore vpn_accounts, vpn_configs, and parent orders.expiry_date from pre_renewal_db_snapshot
+      const nowIso = new Date().toISOString();
+      const restoredExpiryIso = new Date(prevExpiryMs).toISOString();
+      const snapAcc = snapshot.vpn_account || {};
+      const snapOrd = snapshot.parent_order || {};
+      const snapCfg = snapshot.vpn_config || {};
+      const restoredDataLimit =
+        String(
+          snapAcc.data_limit ||
+            (prevTotalBytes > 0 ? `${Math.max(1, Math.round(prevTotalBytes / (1024 * 1024 * 1024)))}GB` : 'Unlimited')
+        ).trim() || 'Unlimited';
+
+      if (snapAcc.id || grantRow.vpn_account_id) {
+        const { error: accRestoreErr } = await dbClient
+          .from('vpn_accounts')
+          .update({
+            expiry_time: prevExpiryMs,
+            expiry_date: restoredExpiryIso,
+            total_bytes: prevTotalBytes,
+            data_limit: restoredDataLimit,
+            status: restoredStatus,
+            enable: restoredEnable,
+            updated_at: nowIso,
+          })
+          .eq('id', snapAcc.id || grantRow.vpn_account_id);
+        if (accRestoreErr) {
+          throw new Error(`Failed to restore vpn_accounts from pre_renewal_db_snapshot: ${accRestoreErr.message}`);
+        }
+      }
+
+      if (snapCfg.exists === true && snapCfg.id) {
+        await dbClient
+          .from('vpn_configs')
+          .update({
+            expiry_date: restoredExpiryIso,
+            data_limit: String(snapCfg.data_limit || restoredDataLimit),
+            enabled: restoredEnable,
+            status: restoredStatus,
+          })
+          .eq('id', snapCfg.id);
+      } else if (snapCfg.exists !== false) {
+        await dbClient
+          .from('vpn_configs')
+          .update({
+            expiry_date: restoredExpiryIso,
+            data_limit: restoredDataLimit,
+            enabled: restoredEnable,
+            status: restoredStatus,
+          })
+          .eq('uuid', clientUuid);
+      }
+
+      // Restore parent order expiry_date while strictly preserving its paid/completed status!
+      if (snapOrd.id || grantRow.order_id) {
+        await dbClient
+          .from('orders')
+          .update({
+            expiry_date: snapOrd.expiry_date === null ? null : restoredExpiryIso,
+            status: restoredStatus === 'expired' ? 'expired' : (snapOrd.status || 'completed'),
+            payment_status: snapOrd.payment_status || 'Paid',
+            provisioning_status: snapOrd.provisioning_status || 'completed',
+            updated_at: nowIso,
+          })
+          .eq('id', snapOrd.id || grantRow.order_id);
+      }
+
+      // Mark renewal grant as 'revoked'
+      const { error: grantRevokeErr } = await dbClient
+        .from('vpn_entitlement_grants')
+        .update({
+          status: 'revoked',
+          revoked_at: nowIso,
+          revoked_by: options?.adminLabel || 'Admin',
+          revoke_reason: reason,
+          last_error: null,
+          updated_at: nowIso,
+        })
+        .eq('id', grantRow.id);
+
+      if (grantRevokeErr) {
+        throw new Error(`Failed to mark renewal grant revoked: ${grantRevokeErr.message}`);
+      }
+
+      // Mark renew_requests as 'rejected' and provisioning_status = 'revoked'
+      const { error: reqRevokeErr } = await dbClient
+        .from('renew_requests')
+        .update({
+          status: 'rejected',
+          provisioning_status: 'revoked',
+          updated_at: nowIso,
+        })
+        .eq('id', cleanRequestId);
+
+      if (reqRevokeErr) {
+        throw new Error(`Failed to mark provisionally renewed request rejected/revoked: ${reqRevokeErr.message}`);
+      }
+
+      return {
+        handledAsProvisional: true,
+        revoked: true,
+        uuid: clientUuid,
+        inboundId,
+        restoredExpiryMs: prevExpiryMs,
+        restoredTotalBytes: prevTotalBytes,
+        restoredEnable,
+        restoredStatus,
+      };
+    }
+  );
+}
+
 
 
 

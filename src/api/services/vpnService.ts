@@ -112,6 +112,132 @@ export const evaluateVpnClientStatus = (
   };
 };
 
+export const REJECTED_VPN_CUSTOMER_MESSAGE =
+  'Your VPN has been disabled because your payment was rejected. Please contact support for assistance.';
+
+export const sanitizeRejectionReasonForCustomer = (raw?: any): string | null => {
+  if (raw === null || raw === undefined) return null;
+  let cleaned = String(raw)
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return null;
+
+  // Suppress internal technical/stack/credential leakage from customer-facing rejection text
+  const unsafePattern =
+    /(vless:\/\/|vmess:\/\/|trojan:\/\/|ss:\/\/|hysteria|https?:\/\/|bearer\s+[a-z0-9._-]+|select\s+.+\s+from|insert\s+into|update\s+.+\s+set|delete\s+from|postgres|supabase|3x-?ui|econnrefused|etimedout|stack\s*trace|error:\s*at\s|password\s*[:=]|secret\s*[:=]|token\s*[:=]|api_?key\s*[:=]|service_role|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+  if (unsafePattern.test(cleaned)) {
+    return null;
+  }
+
+  if (cleaned.length > 240) {
+    cleaned = `${cleaned.slice(0, 237).trimEnd()}...`;
+  }
+  return cleaned;
+};
+
+export const isOrderRejectedOrRevoked = (ord: any, grantStatus?: string | null): boolean => {
+  if (!ord || typeof ord !== 'object') return false;
+  const rawStatus = String(ord.status || '').toLowerCase().trim();
+  const rawPayStatus = String(ord.payment_status || '').toLowerCase().trim();
+  const provStatus = String(ord.provisioning_status || '').toLowerCase().trim();
+  const gStatus = String(grantStatus || '').toLowerCase().trim();
+
+  return (
+    rawStatus === 'rejected' ||
+    rawPayStatus === 'rejected' ||
+    provStatus === 'revoked' ||
+    provStatus === 'revoke_failed' ||
+    provStatus === 'rejected' ||
+    gStatus === 'revoked' ||
+    gStatus === 'revoke_failed' ||
+    gStatus === 'rejected'
+  );
+};
+
+/**
+ * Builds a strictly redacted display-only VPN configuration card for a rejected/revoked order.
+ * Never exposes usable VPN credentials (UUID, VLESS URI, subscription URL, host/port, passwords, or Hysteria auth)
+ * and always enforces Disabled status regardless of 3X-UI state.
+ */
+export const buildRejectedVpnDisplayConfig = (ord: any, grant?: any): Record<string, any> => {
+  let pmJson: any = {};
+  try {
+    pmJson =
+      typeof ord.payment_method === 'string'
+        ? JSON.parse(ord.payment_method)
+        : (ord.payment_method || {});
+  } catch (_e) {}
+
+  const orderDocId = String(ord.id || '').trim();
+  const displayOrderId = String(ord.order_id || ord.id || '').trim();
+  const packageName = String(
+    ord.package_name || ord.plan || pmJson.packageName || pmJson.plan || 'FIREVPN Package'
+  ).trim();
+  const serverNode = String(ord.server || pmJson.server || 'Singapore').trim();
+  const isTrialOrd = Boolean(
+    pmJson.is_trial ||
+      pmJson.isTrial ||
+      pmJson.paymentMethod === 'Free Trial' ||
+      displayOrderId.startsWith('TRIAL-')
+  );
+  const rawProv = String(ord.provisioning_status || grant?.status || 'revoked').toLowerCase().trim() || 'revoked';
+  const safeReason = sanitizeRejectionReasonForCustomer(
+    ord.reject_reason || ord.rejection_reason || grant?.revoke_reason || null
+  );
+  const expiryDate = ord.expiry_date || ord.expiryDate || '';
+
+  return {
+    id: `rejected-${orderDocId || displayOrderId}`,
+    orderId: displayOrderId,
+    orderDocId: orderDocId || null,
+    packageName,
+    subscriptionName: packageName,
+    name: packageName,
+    // Strictly redact all usable VPN credentials
+    uuid: '',
+    configUrl: '',
+    vlessUrl: null,
+    subscriptionUrl: null,
+    inboundId: null,
+    trafficLimit: isTrialOrd ? '1GB' : (ord.traffic_limit || 'Unlimited'),
+    usedGB: 0,
+    remainingGB: 'Disabled',
+    upBytes: 0,
+    downBytes: 0,
+    upload: 0,
+    download: 0,
+    liveUsageFound: false,
+    panelStatusVerified: true,
+    statusReason: 'payment_rejected',
+    totalTrafficBytes: 0,
+    remainingTrafficBytes: 0,
+    expiryDate,
+    expiryTime: expiryDate,
+    status: 'Disabled',
+    enable: false,
+    enableStatus: false,
+    onlineStatus: false,
+    lastOnline: 0,
+    serverNode,
+    port: null,
+    protocol: '',
+    network: '',
+    security: '',
+    serverAddress: '',
+    isTrial: isTrialOrd,
+    templateId: null,
+    isRejected: true,
+    actionsDisabled: true,
+    paymentStatus: 'Rejected',
+    provisioningStatus: rawProv,
+    rejectionMessage: REJECTED_VPN_CUSTOMER_MESSAGE,
+    rejectionReason: safeReason,
+  };
+};
+
 export const getMyConfigs = async (uid: string, email?: string, _token?: string): Promise<{ configs: any[]; dbTime: number }> => {
   const dbStart = Date.now();
   const userEmail = email ? email.toLowerCase().trim() : '';
@@ -143,7 +269,11 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
   const vpnConfigsData = Array.from(vpnConfigsMap.values());
   const inboundMap = new Map<string, number>();
   const deletedOrInactiveUuids = new Set<string>();
+  const vpnConfigOrderIds = new Set<string>();
   vpnConfigsData.forEach(cfg => {
+    if (cfg.order_id) {
+      vpnConfigOrderIds.add(String(cfg.order_id).trim());
+    }
     const cfgStatus = String(cfg.status || '').toLowerCase().trim();
     if (
       cfgStatus === 'deleted' ||
@@ -228,20 +358,30 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
 
   const nonApprovedOrderIds = new Set<string>();
   const nonApprovedOrderUuids = new Set<string>();
+  const grantByOrderId = new Map<string, any>();
 
   // Defense-in-depth: also inspect vpn_entitlement_grants for this customer's orders
-  // so revoked / revoke_failed grants are strictly excluded and authoritative inbound_id is available.
+  // so revoked / revoke_failed grants are strictly excluded from active configs and
+  // authoritative inbound_id / revoke_reason are available.
   const customerOrderRowIds = allOrders
     .map(ord => (ord?.id ? String(ord.id).trim() : ''))
     .filter(Boolean);
   if (customerOrderRowIds.length > 0 && supabaseAdmin) {
     try {
-      const { data: grants } = await supabaseAdmin
+      let grantsRes = await supabaseAdmin
         .from('vpn_entitlement_grants')
-        .select('order_id, client_uuid, inbound_id, status')
+        .select('grant_type, order_id, client_uuid, inbound_id, status, revoke_reason')
         .in('order_id', customerOrderRowIds);
+      if (grantsRes.error && String(grantsRes.error.message || '').includes('revoke_reason')) {
+        grantsRes = await supabaseAdmin
+          .from('vpn_entitlement_grants')
+          .select('grant_type, order_id, client_uuid, inbound_id, status')
+          .in('order_id', customerOrderRowIds) as any;
+      }
+      const grants = grantsRes.data;
       if (Array.isArray(grants)) {
         grants.forEach((g: any) => {
+          const gType = String(g.grant_type || 'new_order').toLowerCase().trim();
           const gStatus = String(g.status || '').toLowerCase().trim();
           const gUuid = String(g.client_uuid || '').trim().toLowerCase();
           const gOrderId = String(g.order_id || '').trim();
@@ -250,17 +390,23 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
             if (gOrderId && !inboundMap.has(gOrderId)) inboundMap.set(gOrderId, gIbId);
             if (gUuid && !inboundMap.has(gUuid)) inboundMap.set(gUuid, gIbId);
           }
-          if (
-            gStatus === 'revoked' ||
-            gStatus === 'revoke_failed' ||
-            gStatus === 'rejected' ||
-            gStatus === 'cancelled' ||
-            gStatus === 'deleted'
-          ) {
-            if (gOrderId) nonApprovedOrderIds.add(gOrderId);
-            if (gUuid) {
-              nonApprovedOrderUuids.add(gUuid);
-              deletedOrInactiveUuids.add(gUuid);
+          // CRITICAL: Only a 'new_order' entitlement grant represents the order's own base VPN creation.
+          // A rejected/revoked 'renewal' grant restores the existing paid VPN to its pre-renewal state
+          // and must NEVER mark the parent order or client_uuid as non-approved, deleted, or rejected!
+          if (gType === 'new_order') {
+            if (gOrderId) grantByOrderId.set(gOrderId, g);
+            if (
+              gStatus === 'revoked' ||
+              gStatus === 'revoke_failed' ||
+              gStatus === 'rejected' ||
+              gStatus === 'cancelled' ||
+              gStatus === 'deleted'
+            ) {
+              if (gOrderId) nonApprovedOrderIds.add(gOrderId);
+              if (gUuid) {
+                nonApprovedOrderUuids.add(gUuid);
+                deletedOrInactiveUuids.add(gUuid);
+              }
             }
           }
         });
@@ -737,7 +883,44 @@ export const getMyConfigs = async (uid: string, email?: string, _token?: string)
     })
     .map(({ _expectedInboundWasLive, ...publicCfg }) => publicCfg);
 
-  return { configs: finalConfigs, dbTime };
+  // 3. Append strictly owner-scoped, redacted display-only cards for rejected/revoked orders
+  // that previously had a provisioned VPN client. These never expose usable credentials and
+  // always remain Disabled even if a 3X-UI client is manually re-enabled.
+  const seenRejectedOrderKeys = new Set<string>();
+  const rejectedConfigs: any[] = [];
+  allOrders.forEach(ord => {
+    const docUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || '').trim();
+    const docEmail = String(ord.email || ord.customerEmail || ord.userEmail || '').toLowerCase().trim();
+    const matchesUser = userUid
+      ? (docUid === userUid || (!docUid && userEmail && docEmail === userEmail))
+      : (userEmail && docEmail === userEmail);
+    if (!matchesUser) return;
+
+    const ordRowId = String(ord.id || '').trim();
+    const ordPublicId = String(ord.order_id || '').trim();
+    const grant = ordRowId ? grantByOrderId.get(ordRowId) : undefined;
+
+    if (!isOrderRejectedOrRevoked(ord, grant?.status)) return;
+
+    const hadProvisionedVpn = Boolean(
+      ord.client_uuid ||
+      ord.vless_url ||
+      ord.vpn_credentials?.configLink ||
+      ord.vpn_credentials?.password ||
+      grant?.client_uuid ||
+      (ordRowId && vpnConfigOrderIds.has(ordRowId)) ||
+      (ordPublicId && vpnConfigOrderIds.has(ordPublicId))
+    );
+    if (!hadProvisionedVpn) return;
+
+    const dedupeKey = ordRowId || ordPublicId;
+    if (!dedupeKey || seenRejectedOrderKeys.has(dedupeKey)) return;
+    seenRejectedOrderKeys.add(dedupeKey);
+
+    rejectedConfigs.push(buildRejectedVpnDisplayConfig(ord, grant));
+  });
+
+  return { configs: [...finalConfigs, ...rejectedConfigs], dbTime };
 };
 
 export interface TrafficResetPolicy {
@@ -1071,11 +1254,26 @@ export const getResetTrafficStatus = async (
     };
   }
 
-  const st = String(rec.status || '').toLowerCase();
-  if (st === 'expired' || st === 'disabled' || rec.enable === false) {
+  const st = String(rec.status || '').toLowerCase().trim();
+  const recProvSt = String(rec.provisioning_status || '').toLowerCase().trim();
+  const recPaySt = String(rec.payment_status || '').toLowerCase().trim();
+  if (
+    st === 'expired' ||
+    st === 'disabled' ||
+    st === 'rejected' ||
+    st === 'revoked' ||
+    st === 'cancelled' ||
+    st === 'deleted' ||
+    recProvSt === 'revoked' ||
+    recProvSt === 'revoke_failed' ||
+    recProvSt === 'rejected' ||
+    recPaySt === 'rejected' ||
+    recPaySt === 'cancelled' ||
+    rec.enable === false
+  ) {
     return {
       canReset: false,
-      reason: 'Cannot reset traffic for an expired or disabled configuration. Please renew your plan.',
+      reason: 'Cannot reset traffic for an expired, disabled, or rejected configuration.',
       cooldownHours: policy.cooldownHours,
       cooldownRemainingHours: 0,
       resetsUsedInPeriod: 0,
@@ -1084,6 +1282,32 @@ export const getResetTrafficStatus = async (
       nextAvailableReset: null
     };
   }
+
+  // Defense-in-depth: verify no linked order or entitlement grant for this UUID is rejected/revoked
+  try {
+    const cleanUuid = configUuid.trim();
+    const [{ data: linkedOrders }, { data: linkedGrants }] = await Promise.all([
+      supabase.from('orders').select('status, payment_status, provisioning_status').ilike('client_uuid', cleanUuid),
+      supabase.from('vpn_entitlement_grants').select('status').ilike('client_uuid', cleanUuid),
+    ]);
+    const hasRejectedOrder = Array.isArray(linkedOrders) && linkedOrders.some((o: any) => isOrderRejectedOrRevoked(o));
+    const hasRevokedGrant = Array.isArray(linkedGrants) && linkedGrants.some((g: any) => {
+      const gs = String(g.status || '').toLowerCase().trim();
+      return gs === 'revoked' || gs === 'revoke_failed' || gs === 'rejected';
+    });
+    if (hasRejectedOrder || hasRevokedGrant) {
+      return {
+        canReset: false,
+        reason: 'Traffic reset is disabled because this VPN order was rejected.',
+        cooldownHours: policy.cooldownHours,
+        cooldownRemainingHours: 0,
+        resetsUsedInPeriod: 0,
+        maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+        lastResetTimestamp: null,
+        nextAvailableReset: null
+      };
+    }
+  } catch (_revCheckErr) {}
 
   const expDate = rec.expiry_date || rec.expires_at || rec.expiryDate;
   if (expDate && new Date(expDate).getTime() <= Date.now()) {
