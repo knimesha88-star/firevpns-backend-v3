@@ -50,6 +50,67 @@ export const isUserAuthorizedForAutoActivateNewOrders = (uid?: string | null, em
 
 export const isAutoActivateRenewalsEnabled = (): boolean => false;
 
+const getSafeOrderSourceLabel = (
+  rawSource: unknown
+): 'store_checkout' | 'billing_page' | 'other' | 'missing' => {
+  const normalized = String(rawSource || '').trim().toLowerCase();
+  if (!normalized) return 'missing';
+  if (normalized === 'store_checkout') return 'store_checkout';
+  if (normalized === 'billing_page') return 'billing_page';
+  return 'other';
+};
+
+const evaluateAutoActivationDebugContext = (
+  uid?: string | null,
+  email?: string | null,
+  rawSource?: unknown
+) => {
+  const flagEnvPresent = process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED !== undefined;
+  const allowlistEnvPresent = process.env.AUTO_ACTIVATE_NEW_ORDERS_ALLOWLIST !== undefined;
+  const flagEnabled = isAutoActivateNewOrdersEnabled();
+  const allowlist = getAutoActivateNewOrdersAllowlist();
+  const allowlistConfigured = allowlist.length > 0;
+  const normUid = String(uid || '').trim().toLowerCase();
+  const normEmail = String(email || '').trim().toLowerCase();
+  const customerMatchesAllowlist = allowlistConfigured
+    ? Boolean((normUid && allowlist.includes(normUid)) || (normEmail && allowlist.includes(normEmail)))
+    : true;
+  const authorizedForAutoActivation = isUserAuthorizedForAutoActivateNewOrders(uid, email);
+  const orderSource = getSafeOrderSourceLabel(rawSource);
+  const isManualBilling = rawSource === 'billing_page';
+
+  return {
+    flagEnvPresent,
+    flagEnabled,
+    allowlistEnvPresent,
+    allowlistConfigured,
+    allowlistEntryCount: allowlist.length,
+    customerMatchesAllowlist,
+    authorizedForAutoActivation,
+    orderSource,
+    isManualBilling,
+  };
+};
+
+const resolveAutoActivationSkipReason = (ctx: {
+  flagEnabled: boolean;
+  isManualBilling: boolean;
+  allowlistConfigured: boolean;
+  customerMatchesAllowlist: boolean;
+}): string => {
+  if (!ctx.flagEnabled) return 'FLAG_DISABLED';
+  if (ctx.isManualBilling) return 'MANUAL_BILLING_ORDER';
+  if (ctx.allowlistConfigured && !ctx.customerMatchesAllowlist) return 'ALLOWLIST_MISMATCH';
+  return 'NOT_AUTHORIZED';
+};
+
+const logAutoActivationDebug = (
+  stage: string,
+  payload: Record<string, string | number | boolean | null>
+): void => {
+  console.log('[AutoActivationDebug]', JSON.stringify({ stage, ...payload }));
+};
+
 const ALLOWED_SLIP_STORAGE_BUCKETS = new Set(['payment-slips', 'payment_slips']);
 const ALLOWED_NEW_ORDER_SLIP_FOLDERS = new Set(['orders', 'billing']);
 
@@ -899,6 +960,16 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
       .maybeSingle();
 
     if (existingPendingOrder) {
+      const dedupDebugCtx = evaluateAutoActivationDebugContext(uid, authEmail, data.source);
+      logAutoActivationDebug('deduplication_early_return', {
+        endpoint: 'createOrder',
+        orderId: existingPendingOrder.order_id || null,
+        ...dedupDebugCtx,
+        deduplicationTriggered: true,
+        enteredAutoActivationBlock: false,
+        provisionalProvisioningInvoked: false,
+        reason: 'DEDUPLICATION_EARLY_RETURN',
+      });
       res.status(200).json({
         success: true,
         deduplicated: true,
@@ -920,6 +991,7 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const autoActivateOrdersEnabled = isUserAuthorizedForAutoActivateNewOrders(uid, authEmail);
+    const autoActivationDebugCtx = evaluateAutoActivationDebugContext(uid, authEmail, data.source);
 
     // When automatic activation is enabled, strictly validate storage slip ownership up front;
     // when AUTO_ACTIVATE_NEW_ORDERS_ENABLED=false, preserve 100% backward-compatible manual order submission.
@@ -930,6 +1002,14 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
         email: authEmail,
       });
       if (!ownershipCheck.valid) {
+        logAutoActivationDebug('upfront_ownership_rejected', {
+          endpoint: 'createOrder',
+          ...autoActivationDebugCtx,
+          deduplicationTriggered: false,
+          enteredAutoActivationBlock: false,
+          provisionalProvisioningInvoked: false,
+          reason: `UPFRONT_OWNERSHIP_REJECTED:${ownershipCheck.reason || 'INVALID_SLIP_PATH'}`,
+        });
         res.status(400).json({
           success: false,
           error:
@@ -1092,6 +1172,14 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
     let autoActivationResult: any = null;
     let autoActivationBlockedReason: string | null = null;
     if (autoActivateOrdersEnabled && !isManualBilling) {
+      logAutoActivationDebug('auto_activation_entered', {
+        endpoint: 'createOrder',
+        orderId: insertedOrder.order_id || null,
+        ...autoActivationDebugCtx,
+        deduplicationTriggered: false,
+        enteredAutoActivationBlock: true,
+        reason: 'NONE',
+      });
       try {
         const slipCheck = await computePaymentSlipSha256AndVerifyStorage({
           slipUrl,
@@ -1099,6 +1187,16 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
           userEmail: authEmail,
           allowedFolders: ['orders', 'billing'],
           storageClient: dbClient.storage,
+        });
+
+        logAutoActivationDebug('receipt_verification', {
+          endpoint: 'createOrder',
+          orderId: insertedOrder.order_id || null,
+          enteredAutoActivationBlock: true,
+          receiptVerificationSucceeded: Boolean(slipCheck.valid),
+          receiptVerificationCode: slipCheck.code || (slipCheck.valid ? 'OK' : 'SLIP_VERIFICATION_FAILED'),
+          provisionalProvisioningInvoked: false,
+          reason: slipCheck.valid ? 'NONE' : `SLIP_VERIFICATION_FAILED:${slipCheck.code || 'UNKNOWN'}`,
         });
 
         if (!slipCheck.valid) {
@@ -1118,6 +1216,20 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
             dbClient,
           });
 
+          logAutoActivationDebug('receipt_claim', {
+            endpoint: 'createOrder',
+            orderId: insertedOrder.order_id || null,
+            enteredAutoActivationBlock: true,
+            receiptVerificationSucceeded: true,
+            receiptClaimSucceeded: Boolean(claimRes.claimed),
+            receiptClaimCode: claimRes.code || null,
+            receiptConflictReason: claimRes.conflictReason || null,
+            provisionalProvisioningInvoked: false,
+            reason: claimRes.claimed
+              ? 'NONE'
+              : `RECEIPT_CLAIM_FAILED:${claimRes.conflictReason || claimRes.code || 'DUPLICATE_SLIP'}`,
+          });
+
           if (!claimRes.claimed) {
             autoActivationBlockedReason = claimRes.conflictReason || claimRes.code || 'DUPLICATE_SLIP';
             console.warn(
@@ -1127,9 +1239,27 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
             console.log(
               `[RenewController] AUTO_ACTIVATE_NEW_ORDERS_ENABLED=true: Receipt claimed (${slipCheck.sha256.slice(0, 12)}...). Provisioning full purchased VPN package for order ${insertedOrder.order_id || insertedOrder.id} (payment remains Pending Verification)...`
             );
+            logAutoActivationDebug('provisional_provisioning_invoked', {
+              endpoint: 'createOrder',
+              orderId: insertedOrder.order_id || null,
+              enteredAutoActivationBlock: true,
+              receiptVerificationSucceeded: true,
+              receiptClaimSucceeded: true,
+              provisionalProvisioningInvoked: true,
+              reason: 'NONE',
+            });
             autoActivationResult = await xuiService.provisionOrderClient(insertedOrder.id, undefined, {
               provisional: true,
               dbClient,
+            });
+            const provisioningSucceeded = Boolean(autoActivationResult?.success && autoActivationResult?.vlessUrl);
+            logAutoActivationDebug('provisional_provisioning_result', {
+              endpoint: 'createOrder',
+              orderId: insertedOrder.order_id || null,
+              enteredAutoActivationBlock: true,
+              provisionalProvisioningInvoked: true,
+              provisionalProvisioningSucceeded: provisioningSucceeded,
+              reason: provisioningSucceeded ? 'ACTIVATED' : 'PROVISIONING_RETURNED_NO_CONFIG',
             });
             if (autoActivationResult?.success && autoActivationResult?.vlessUrl) {
               const { data: refreshedOrder } = await dbClient
@@ -1156,11 +1286,30 @@ export const createOrder = async (req: AuthRequest, res: Response): Promise<void
         }
       } catch (autoErr: any) {
         autoActivationBlockedReason = autoActivationBlockedReason || 'PROVISIONING_ERROR';
+        logAutoActivationDebug('auto_activation_exception', {
+          endpoint: 'createOrder',
+          orderId: insertedOrder.order_id || null,
+          enteredAutoActivationBlock: true,
+          errorName: String(autoErr?.name || 'Error').slice(0, 64),
+          reason: autoActivationBlockedReason,
+        });
         console.error(
           `[RenewController] Provisional automatic VPN activation failed for order ${insertedOrder.id} (order preserved in pending queue for manual admin review):`,
           autoErr?.message || autoErr
         );
       }
+    } else {
+      logAutoActivationDebug('auto_activation_skipped', {
+        endpoint: 'createOrder',
+        orderId: insertedOrder.order_id || null,
+        ...autoActivationDebugCtx,
+        deduplicationTriggered: false,
+        enteredAutoActivationBlock: false,
+        receiptVerificationSucceeded: false,
+        receiptClaimSucceeded: false,
+        provisionalProvisioningInvoked: false,
+        reason: resolveAutoActivationSkipReason(autoActivationDebugCtx),
+      });
     }
 
     let resolvedCustomerName = String(
@@ -1394,7 +1543,16 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
             })
             .eq('id', existingOrder.id);
 
+          const notifyDebugCtx = evaluateAutoActivationDebugContext(uid, authEmail, resolvedExtra.source);
           if (isUserAuthorizedForAutoActivateNewOrders(uid, authEmail) && resolvedExtra.source !== 'billing_page') {
+            logAutoActivationDebug('auto_activation_entered', {
+              endpoint: 'createOrderNotification',
+              orderId: existingOrder.order_id || null,
+              ...notifyDebugCtx,
+              deduplicationTriggered: false,
+              enteredAutoActivationBlock: true,
+              reason: 'NONE',
+            });
             const candidateSlip = String(
               data.slipUrl || existingOrder.slip_url || extra.slipUrl || extra.slip_url || ''
             ).trim();
@@ -1405,6 +1563,16 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
                 userEmail: authEmail,
                 allowedFolders: ['orders', 'billing'],
                 storageClient: dbClient.storage,
+              });
+
+              logAutoActivationDebug('receipt_verification', {
+                endpoint: 'createOrderNotification',
+                orderId: existingOrder.order_id || null,
+                enteredAutoActivationBlock: true,
+                receiptVerificationSucceeded: Boolean(slipCheck.valid),
+                receiptVerificationCode: slipCheck.code || (slipCheck.valid ? 'OK' : 'SLIP_VERIFICATION_FAILED'),
+                provisionalProvisioningInvoked: false,
+                reason: slipCheck.valid ? 'NONE' : `SLIP_VERIFICATION_FAILED:${slipCheck.code || 'UNKNOWN'}`,
               });
 
               if (!slipCheck.valid) {
@@ -1423,14 +1591,46 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
                   dbClient,
                 });
 
+                logAutoActivationDebug('receipt_claim', {
+                  endpoint: 'createOrderNotification',
+                  orderId: existingOrder.order_id || null,
+                  enteredAutoActivationBlock: true,
+                  receiptVerificationSucceeded: true,
+                  receiptClaimSucceeded: Boolean(claimRes.claimed),
+                  receiptClaimCode: claimRes.code || null,
+                  receiptConflictReason: claimRes.conflictReason || null,
+                  provisionalProvisioningInvoked: false,
+                  reason: claimRes.claimed
+                    ? 'NONE'
+                    : `RECEIPT_CLAIM_FAILED:${claimRes.conflictReason || claimRes.code || 'DUPLICATE_SLIP'}`,
+                });
+
                 if (!claimRes.claimed) {
                   console.warn(
                     `[RenewController] createOrderNotification auto-activation held for ${existingOrder.id} (${claimRes.conflictReason || claimRes.code}): ${claimRes.error}`
                   );
                 } else {
+                  logAutoActivationDebug('provisional_provisioning_invoked', {
+                    endpoint: 'createOrderNotification',
+                    orderId: existingOrder.order_id || null,
+                    enteredAutoActivationBlock: true,
+                    receiptVerificationSucceeded: true,
+                    receiptClaimSucceeded: true,
+                    provisionalProvisioningInvoked: true,
+                    reason: 'NONE',
+                  });
                   const autoProvRes = await xuiService.provisionOrderClient(existingOrder.id, undefined, {
                     provisional: true,
                     dbClient,
+                  });
+                  const provisioningSucceeded = Boolean(autoProvRes?.success && autoProvRes?.vlessUrl);
+                  logAutoActivationDebug('provisional_provisioning_result', {
+                    endpoint: 'createOrderNotification',
+                    orderId: existingOrder.order_id || null,
+                    enteredAutoActivationBlock: true,
+                    provisionalProvisioningInvoked: true,
+                    provisionalProvisioningSucceeded: provisioningSucceeded,
+                    reason: provisioningSucceeded ? 'ACTIVATED' : 'PROVISIONING_RETURNED_NO_CONFIG',
                   });
                   if (autoProvRes?.success && autoProvRes?.vlessUrl) {
                     resolvedOrderRow = {
@@ -1445,8 +1645,27 @@ export const createOrderNotification = async (req: AuthRequest, res: Response): 
                 }
               }
             } catch (autoErr: any) {
+              logAutoActivationDebug('auto_activation_exception', {
+                endpoint: 'createOrderNotification',
+                orderId: existingOrder.order_id || null,
+                enteredAutoActivationBlock: true,
+                errorName: String(autoErr?.name || 'Error').slice(0, 64),
+                reason: 'PROVISIONING_ERROR',
+              });
               console.error(`[RenewController] createOrderNotification provisional activation error for ${existingOrder.id}:`, autoErr?.message || autoErr);
             }
+          } else {
+            logAutoActivationDebug('auto_activation_skipped', {
+              endpoint: 'createOrderNotification',
+              orderId: existingOrder.order_id || null,
+              ...notifyDebugCtx,
+              deduplicationTriggered: false,
+              enteredAutoActivationBlock: false,
+              receiptVerificationSucceeded: false,
+              receiptClaimSucceeded: false,
+              provisionalProvisioningInvoked: false,
+              reason: resolveAutoActivationSkipReason(notifyDebugCtx),
+            });
           }
         }
       }
