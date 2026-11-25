@@ -28,6 +28,16 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
 
     const totalTime = Date.now() - reqStart;
     console.log(`[API Performance] [GET /api/client/status] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
+    if (client && client._deleted === true) {
+      res.json({
+        success: true,
+        data: null,
+        deleted: true,
+        deletedUuid: client.deletedUuid || targetUuid || null,
+        deletedUuids: Array.isArray(client.deletedUuids) ? client.deletedUuids : [],
+      });
+      return;
+    }
     res.json({ success: true, data: client });
   } catch (error: any) {
     const totalTime = Date.now() - reqStart;

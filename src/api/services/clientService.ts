@@ -25,10 +25,26 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
   // Fetch all real user configs from Supabase
   const myConfigsRes = await vpnService.getMyConfigs(uid || '', email, token);
   const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
+  const deletedUuids: string[] = Array.isArray((myConfigsRes as any)?.deletedUuids)
+    ? (myConfigsRes as any).deletedUuids.map((u: string) => String(u || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const deletedUuidSet = new Set<string>(deletedUuids);
+
+  // If the caller explicitly requested a UUID that is confirmed permanently deleted in 3X-UI,
+  // return an explicit deleted marker instead of silently falling back to another configuration.
+  if (targetUuid && deletedUuidSet.has(String(targetUuid).trim().toLowerCase())) {
+    return {
+      _deleted: true,
+      deletedUuid: String(targetUuid).trim(),
+      deletedUuids,
+    };
+  }
 
   // Only include configurations that have a real UUID, configUrl, and are not pending/rejected/deleted/revoked
   const myConfigs = rawConfigs.filter((c: any) => {
     if (!c || c.isRejected === true || !c.uuid || !c.configUrl) return false;
+    const normUuid = String(c.uuid || '').trim().toLowerCase();
+    if (deletedUuidSet.has(normUuid)) return false;
     const st = String(c.status || '').toLowerCase().trim();
     const paySt = String(c.paymentStatus || '').toLowerCase().trim();
     const provSt = String(c.provisioningStatus || '').toLowerCase().trim();
@@ -70,7 +86,7 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
 
     let selectedConfig = null;
 
-    if (activeUuid) {
+    if (activeUuid && !deletedUuidSet.has(String(activeUuid).trim().toLowerCase())) {
       selectedConfig = activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase())
         || myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
     }

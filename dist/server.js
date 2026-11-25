@@ -8526,7 +8526,8 @@ async function withInboundWriteLock(params, fn) {
         clientUuid: params.clientUuid || null,
         leaseSeconds: INBOUND_LOCK_LEASE_SECONDS,
         metadata: { inboundId, targetId: params.targetId },
-        requireDurableLock: params.requireDurableLock ?? isAutoActivateNewOrdersFlagEnabled()
+        requireDurableLock: params.requireDurableLock ?? isAutoActivateNewOrdersFlagEnabled(),
+        allowUncertainRecovery: params.allowUncertainRecovery
       });
       if (res.acquired) {
         acquiredLock = res;
@@ -8535,8 +8536,19 @@ async function withInboundWriteLock(params, fn) {
       if (!res.tableAvailable) {
         throw new Error(res.error || `Unable to acquire durable inbound lock for inbound ${inboundId}.`);
       }
+      if (params.allowUncertainRecovery === false && res.previousStatus === "uncertain") {
+        const uncertainErr = new Error(
+          `Inbound ${inboundId} has an uncertain prior provisioning lock; skipping without forcing recovery.`
+        );
+        uncertainErr.statusCode = 409;
+        uncertainErr.code = "INBOUND_LOCK_UNCERTAIN";
+        throw uncertainErr;
+      }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for durable inbound write lock on inbound ${inboundId}.`);
+        const busyErr = new Error(`Timed out waiting for durable inbound write lock on inbound ${inboundId}.`);
+        busyErr.statusCode = 409;
+        busyErr.code = "INBOUND_LOCK_BUSY";
+        throw busyErr;
       }
       const backoffMs = Math.min(40 * attempt + Math.floor(Math.random() * 25), 250);
       await new Promise((r) => setTimeout(r, backoffMs));
@@ -10118,7 +10130,7 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
     }
   );
 }
-var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, lastInboundsCacheTime, cachedXuiConfig, XUI_CONFIG_TTL_MS, cachedXuiAuth, XUI_AUTH_TTL_MS, invalidateXuiConfigCache, validateXuiPanelUrl, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isMissingSchemaOrRpcError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, triggerBackgroundSyncIfNeeded, runBackgroundSync, syncDeleted3XUiClients, resetClientTraffic;
+var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, lastInboundsCacheTime, cachedXuiConfig, XUI_CONFIG_TTL_MS, cachedXuiAuth, XUI_AUTH_TTL_MS, invalidateXuiConfigCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isMissingSchemaOrRpcError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, triggerBackgroundSyncIfNeeded, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundById, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
 var init_xuiService = __esm({
   "src/api/services/xuiService.ts"() {
     "use strict";
@@ -10158,6 +10170,30 @@ var init_xuiService = __esm({
         throw new Error("3X-UI Panel URL cannot target localhost or cloud metadata addresses.");
       }
       return trimmed;
+    };
+    computePanelIdentity = (panelUrl) => {
+      const trimmed = String(panelUrl || "").trim();
+      if (!trimmed) return "";
+      let parsed;
+      try {
+        parsed = new URL(trimmed);
+      } catch {
+        return "";
+      }
+      const protocol = parsed.protocol.toLowerCase();
+      const hostname = parsed.hostname.toLowerCase();
+      const port = parsed.port || (protocol === "https:" ? "443" : "80");
+      let basePath = parsed.pathname.replace(/\/+$/, "");
+      if (basePath.endsWith("/panel")) {
+        basePath = basePath.slice(0, -6);
+      }
+      const canonical = `${protocol}//${hostname}:${port}${basePath}`;
+      const hash = crypto5.createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+      return `panel:${hash}`;
+    };
+    getCurrentPanelIdentity = async (forceRefresh = false) => {
+      const cfg = await getXuiConfig(forceRefresh);
+      return computePanelIdentity(cfg.panelUrl);
     };
     getXuiConfig = async (forceRefresh = false) => {
       const now = Date.now();
@@ -12885,10 +12921,8 @@ var init_xuiService = __esm({
         const inbounds = await getInbounds(force);
         const trialCleanupResult = await cleanupExpiredTrials();
         let deletedCount = 0;
-        if (inbounds && inbounds.length > 0) {
-          const syncResult = await syncDeleted3XUiClients(inbounds);
-          deletedCount = syncResult.deletedCount;
-        }
+        const syncResult = await syncDeleted3XUiClients();
+        deletedCount = syncResult.deletedCount;
         runScheduledExpiryEmailCheck().catch((expErr) => {
           console.warn("[Background Sync] Scheduled expiry email check warning:", expErr?.message || expErr);
         });
@@ -12925,154 +12959,947 @@ var init_xuiService = __esm({
         isSyncInProgress = false;
       }
     };
-    syncDeleted3XUiClients = async (inboundsOverride) => {
-      console.log("[3X-UI Sync] Starting VPN client synchronization check with 3X-UI panel...");
-      let inbounds = [];
-      if (inboundsOverride && Array.isArray(inboundsOverride) && inboundsOverride.length > 0) {
-        inbounds = inboundsOverride;
+    parseInboundSettingsClientsStrict = (inbound) => {
+      if (!inbound || typeof inbound !== "object") {
+        return { ok: false, reason: "inbound_not_object" };
+      }
+      const inboundId = Number(inbound.id);
+      if (!Number.isInteger(inboundId) || inboundId <= 0) {
+        return { ok: false, reason: "invalid_inbound_id" };
+      }
+      if (inbound.settings === null || inbound.settings === void 0) {
+        return { ok: false, reason: "missing_settings" };
+      }
+      let parsedSettings = null;
+      if (typeof inbound.settings === "string") {
+        const trimmed = inbound.settings.trim();
+        if (!trimmed) {
+          return { ok: false, reason: "empty_settings_string" };
+        }
+        try {
+          parsedSettings = JSON.parse(trimmed);
+        } catch {
+          return { ok: false, reason: "malformed_settings_json" };
+        }
+      } else if (typeof inbound.settings === "object") {
+        parsedSettings = inbound.settings;
       } else {
-        try {
-          const endpoint = "/panel/api/inbounds/list";
-          const inboundsData = await requestApi(endpoint);
-          if (!Array.isArray(inboundsData)) {
-            console.warn("[3X-UI Sync] 3X-UI panel returned non-array inbounds response. Skipping deletion check for safety.");
-            return { synced: false, deletedCount: 0 };
-          }
-          inbounds = inboundsData;
-          setCachedInbounds(inbounds);
-        } catch (error) {
-          console.warn(`[3X-UI Sync] 3X-UI panel is temporarily unavailable. Skipping deletion/sync cycle and will retry on next cycle. Error: ${error.message || error}`);
-          return { synced: false, deletedCount: 0 };
+        return { ok: false, reason: "invalid_settings_type" };
+      }
+      if (!parsedSettings || typeof parsedSettings !== "object" || !Array.isArray(parsedSettings.clients)) {
+        return { ok: false, reason: "missing_clients_array" };
+      }
+      const clients = parsedSettings.clients;
+      const clientUuidSet = /* @__PURE__ */ new Set();
+      for (const c of clients) {
+        if (c && typeof c === "object" && typeof c.id === "string" && c.id.trim()) {
+          clientUuidSet.add(c.id.trim().toLowerCase());
         }
       }
-      const live3XUiUuids = /* @__PURE__ */ new Set();
-      for (const ib of inbounds) {
-        let settingsObj = {};
-        try {
-          if (ib.settings) {
-            settingsObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings;
-          }
-        } catch (e) {
-          console.warn("[3X-UI Sync] Warning parsing inbound settings during sync:", e);
-        }
-        const clients = settingsObj.clients || [];
-        for (const c of clients) {
-          if (c.id) {
-            live3XUiUuids.add(String(c.id).trim().toLowerCase());
-          }
-        }
-        const clientStats = ib.clientStats || [];
-        for (const s of clientStats) {
-          if (s.id) {
-            live3XUiUuids.add(String(s.id).trim().toLowerCase());
-          }
-        }
+      return { ok: true, inboundId, clients, clientUuidSet };
+    };
+    fetchUncachedLiveInboundById = async (inboundId) => {
+      const normalizedId = Number(inboundId);
+      if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+        return { status: "error", reason: "invalid_inbound_id" };
       }
-      console.log(`[3X-UI Sync] 3X-UI panel reachable. Found ${live3XUiUuids.size} active client UUIDs across ${inbounds.length} inbounds.`);
-      let deletedCount = 0;
-      const dbClient = supabaseAdmin;
-      const now = Date.now();
-      const RECENT_PROVISION_GRACE_PERIOD_MS = 3e4;
-      const timestamp = (/* @__PURE__ */ new Date()).toISOString();
       try {
-        const accIdsToDisable = [];
-        const cfgIdsToDisable = [];
-        const orderIdsToExpire = [];
-        const { data: accounts, error: accError } = await dbClient.from("vpn_accounts").select("id, uuid, status, enable, created_at, email, order_id");
-        if (accError) {
-          console.error("[3X-UI Sync] Error querying vpn_accounts:", accError.message || accError);
-        } else if (accounts && Array.isArray(accounts)) {
-          for (const acc of accounts) {
-            const uuid = acc.uuid ? String(acc.uuid).trim().toLowerCase() : "";
-            const currentStatus = String(acc.status || "").toLowerCase();
-            if (currentStatus === "disabled" || currentStatus === "expired" || acc.enable === false) {
-              continue;
-            }
-            if (acc.created_at) {
-              const createdAtMs = new Date(acc.created_at).getTime();
-              if (!isNaN(createdAtMs) && now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS) {
-                continue;
-              }
-            }
-            if (uuid && !live3XUiUuids.has(uuid)) {
-              accIdsToDisable.push(acc.id);
-            }
-          }
+        const res = await requestApi(`/panel/api/inbounds/get/${normalizedId}`, "GET");
+        const inbound = res && typeof res === "object" && "obj" in res ? res.obj : res;
+        if (inbound === null || inbound === void 0) {
+          return { status: "not_found" };
         }
-        const { data: configs, error: cfgError } = await dbClient.from("vpn_configs").select("id, uuid, status, enabled, created_at, order_id");
-        if (cfgError) {
-          console.error("[3X-UI Sync] Error querying vpn_configs:", cfgError.message || cfgError);
-        } else if (configs && Array.isArray(configs)) {
-          for (const cfg of configs) {
-            const uuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : "";
-            const currentStatus = String(cfg.status || "").toLowerCase();
-            if (currentStatus === "disabled" || currentStatus === "expired" || cfg.enabled === false) {
-              continue;
-            }
-            if (cfg.created_at) {
-              const createdAtMs = new Date(cfg.created_at).getTime();
-              if (!isNaN(createdAtMs) && now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS) {
-                continue;
-              }
-            }
-            if (uuid && !live3XUiUuids.has(uuid)) {
-              cfgIdsToDisable.push(cfg.id);
-            }
-          }
+        if (typeof inbound !== "object") {
+          return { status: "error", reason: "malformed_inbound_payload" };
         }
-        const { data: orders, error: ordError } = await dbClient.from("orders").select("id, client_uuid, uuid, vpn_credentials, status, created_at");
-        if (!ordError && orders && Array.isArray(orders)) {
-          for (const ord of orders) {
-            const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || "").trim().toLowerCase();
-            const currentStatus = String(ord.status || "").toLowerCase();
-            if (currentStatus === "expired" || currentStatus === "disabled" || currentStatus === "cancelled" || currentStatus === "rejected" || currentStatus === "pending") {
-              continue;
-            }
-            if (ord.created_at) {
-              const createdAtMs = new Date(ord.created_at).getTime();
-              if (!isNaN(createdAtMs) && now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS) {
-                continue;
-              }
-            }
-            if (uuid && !live3XUiUuids.has(uuid)) {
-              orderIdsToExpire.push(ord.id);
-            }
-          }
+        if (Number(inbound.id) !== normalizedId) {
+          return { status: "error", reason: "inbound_id_mismatch" };
         }
-        if (accIdsToDisable.length > 0) {
-          console.log(`[3X-UI Sync] Bulk updating ${accIdsToDisable.length} vpn_accounts to 'disabled'...`);
-          const { error: updateAccErr } = await dbClient.from("vpn_accounts").update({ status: "disabled", enable: false, updated_at: timestamp }).in("id", accIdsToDisable);
-          if (updateAccErr) {
-            console.error("[3X-UI Sync] Bulk update error for vpn_accounts:", updateAccErr.message || updateAccErr);
-          } else {
-            deletedCount += accIdsToDisable.length;
-          }
+        const parsed = parseInboundSettingsClientsStrict(inbound);
+        if ("reason" in parsed) {
+          return { status: "error", reason: parsed.reason };
         }
-        if (cfgIdsToDisable.length > 0) {
-          console.log(`[3X-UI Sync] Bulk updating ${cfgIdsToDisable.length} vpn_configs to 'disabled'...`);
-          const { error: updateCfgErr } = await dbClient.from("vpn_configs").update({ status: "disabled", enabled: false, updated_at: timestamp }).in("id", cfgIdsToDisable);
-          if (updateCfgErr) {
-            console.error("[3X-UI Sync] Bulk update error for vpn_configs:", updateCfgErr.message || updateCfgErr);
-          } else {
-            deletedCount += cfgIdsToDisable.length;
-          }
-        }
-        if (orderIdsToExpire.length > 0) {
-          console.log(`[3X-UI Sync] Bulk updating ${orderIdsToExpire.length} orders to 'expired'...`);
-          const { error: updateOrdErr } = await dbClient.from("orders").update({ status: "expired", payment_status: "Expired", updated_at: timestamp }).in("id", orderIdsToExpire);
-          if (updateOrdErr) {
-            console.error("[3X-UI Sync] Bulk update error for orders:", updateOrdErr.message || updateOrdErr);
-          }
-        }
-        if (deletedCount > 0) {
-          console.log(`[3X-UI Sync] Synchronization completed. Removed/archived ${deletedCount} records for client UUIDs deleted from 3X-UI.`);
-        } else {
-          console.log("[3X-UI Sync] Synchronization completed. All stored VPN UUIDs exist in 3X-UI panel.");
-        }
-        return { synced: true, deletedCount };
+        return {
+          status: "found",
+          inbound,
+          clients: parsed.clients,
+          clientUuidSet: parsed.clientUuidSet
+        };
       } catch (err) {
-        console.error("[3X-UI Sync] Unexpected error during synchronization cycle:", err.message || err);
-        return { synced: false, deletedCount: 0 };
+        return {
+          status: "error",
+          reason: err?.message || "network_or_panel_error"
+        };
+      }
+    };
+    fetchUncachedLiveInboundsList = async () => {
+      try {
+        const rawList = await requestApi("/panel/api/inbounds/list", "GET");
+        if (!Array.isArray(rawList)) {
+          return {
+            ok: false,
+            reason: "non_array_inbounds_response",
+            inbounds: [],
+            parsedByInboundId: /* @__PURE__ */ new Map(),
+            unparsedInboundIds: [],
+            allInboundsCleanlyParsed: false,
+            liveClientByUuid: /* @__PURE__ */ new Map()
+          };
+        }
+        const parsedByInboundId = /* @__PURE__ */ new Map();
+        const unparsedInboundIds = [];
+        const liveClientByUuid = /* @__PURE__ */ new Map();
+        for (const ib of rawList) {
+          const parsed = parseInboundSettingsClientsStrict(ib);
+          if (!parsed.ok) {
+            const rawId = Number(ib?.id);
+            unparsedInboundIds.push(Number.isInteger(rawId) && rawId > 0 ? rawId : -1);
+            continue;
+          }
+          parsedByInboundId.set(parsed.inboundId, {
+            inbound: ib,
+            inboundId: parsed.inboundId,
+            clients: parsed.clients,
+            clientUuidSet: parsed.clientUuidSet
+          });
+          const stats = Array.isArray(ib.clientStats) ? ib.clientStats : [];
+          for (const c of parsed.clients) {
+            const normUuid = String(c?.id || "").trim().toLowerCase();
+            if (!normUuid) continue;
+            const cEmail = String(c?.email || "").trim().toLowerCase();
+            const stat = stats.find((s) => s && s.email && String(s.email).trim().toLowerCase() === cEmail) || null;
+            liveClientByUuid.set(normUuid, { inbound: ib, client: c, stat });
+          }
+        }
+        return {
+          ok: true,
+          inbounds: rawList,
+          parsedByInboundId,
+          unparsedInboundIds,
+          allInboundsCleanlyParsed: unparsedInboundIds.length === 0,
+          liveClientByUuid
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: err?.message || "panel_unreachable",
+          inbounds: [],
+          parsedByInboundId: /* @__PURE__ */ new Map(),
+          unparsedInboundIds: [],
+          allInboundsCleanlyParsed: false,
+          liveClientByUuid: /* @__PURE__ */ new Map()
+        };
+      }
+    };
+    verifyRecordPanelIdentity = (input) => {
+      const currentPanelId = String(input.currentPanelIdentity || "").trim();
+      if (!currentPanelId) {
+        return {
+          ok: false,
+          code: "missing_current_panel_identity",
+          reason: "Active 3X-UI panel identity could not be resolved."
+        };
+      }
+      const ownerUid = String(input.recordOwnerUid || "").trim();
+      if (!ownerUid) {
+        return {
+          ok: false,
+          code: "missing_customer_ownership",
+          reason: "VPN record is missing verified customer user_id ownership."
+        };
+      }
+      const inboundId = Number(input.recordInboundId);
+      if (!Number.isInteger(inboundId) || inboundId <= 0) {
+        return {
+          ok: false,
+          code: "missing_inbound_id",
+          reason: "VPN record is missing an authoritative inbound_id."
+        };
+      }
+      const recordPanelId = String(input.recordPanelIdentity || "").trim();
+      if (recordPanelId) {
+        if (recordPanelId !== currentPanelId) {
+          return {
+            ok: false,
+            code: "wrong_panel_identity",
+            reason: `Record panel_identity (${recordPanelId}) does not match active panel (${currentPanelId}).`
+          };
+        }
+        return {
+          ok: true,
+          code: "matched_explicit_panel_identity",
+          reason: "Exact panel_identity match verified."
+        };
+      }
+      const configuredServers = Array.isArray(input.configuredServers) ? input.configuredServers : [];
+      const recordServerId = String(input.recordServerId || "").trim();
+      if (recordServerId) {
+        const matchedServer = configuredServers.find((s) => String(s?.id || "").trim() === recordServerId);
+        if (!matchedServer || !matchedServer.panel_url) {
+          return {
+            ok: false,
+            code: "ambiguous_panel_identity",
+            reason: `Record references server_id '${recordServerId}' whose panel URL cannot be resolved.`
+          };
+        }
+        const serverPanelId = computePanelIdentity(matchedServer.panel_url);
+        if (!serverPanelId || serverPanelId !== currentPanelId) {
+          return {
+            ok: false,
+            code: "wrong_panel_identity",
+            reason: `Record server_id '${recordServerId}' belongs to a different panel (${serverPanelId || "unknown"}) than active panel (${currentPanelId}).`
+          };
+        }
+        return {
+          ok: true,
+          code: "matched_server_id",
+          reason: "Server ID resolved unambiguously to active panel identity."
+        };
+      }
+      const distinctExternalPanel = configuredServers.find((s) => {
+        if (s?.is_active === false) return false;
+        if (!s?.panel_url) return false;
+        const pid = computePanelIdentity(s.panel_url);
+        return Boolean(pid && pid !== currentPanelId);
+      });
+      if (distinctExternalPanel) {
+        return {
+          ok: false,
+          code: "ambiguous_panel_identity",
+          reason: "Multiple 3X-UI panels are configured and legacy record has no explicit panel_identity or server_id."
+        };
+      }
+      return {
+        ok: true,
+        code: "matched_single_panel_legacy",
+        reason: "Single-panel deployment with verified customer ownership and authoritative inbound_id."
+      };
+    };
+    loadConfiguredXuiServers = async (dbClient) => {
+      if (!dbClient || typeof dbClient.from !== "function") return [];
+      try {
+        const { data, error } = await dbClient.from("xui_servers").select("id, panel_url, is_active");
+        if (error || !Array.isArray(data)) return [];
+        return data;
+      } catch {
+        return [];
+      }
+    };
+    recordDeduplicatedSyncAuditLog = async (params) => {
+      const { dbClient, userId, action, targetType, targetId, details } = params;
+      const dedupeWindowHours = params.dedupeWindowHours ?? 24;
+      if (!dbClient || typeof dbClient.from !== "function") return false;
+      try {
+        const cutoffIso = new Date(Date.now() - dedupeWindowHours * 60 * 60 * 1e3).toISOString();
+        const { data: existing } = await dbClient.from("audit_logs").select("id").eq("action", action).eq("target_type", targetType).eq("target_id", targetId).gte("created_at", cutoffIso).limit(1);
+        if (Array.isArray(existing) && existing.length > 0) {
+          return false;
+        }
+        const { error: insertErr } = await dbClient.from("audit_logs").insert({
+          user_id: userId || null,
+          action,
+          target_type: targetType,
+          target_id: targetId,
+          details
+        });
+        return !insertErr;
+      } catch {
+        return false;
+      }
+    };
+    verifyAndMarkClientDeletedIfConfirmed = async (params) => {
+      const normUuid = String(params.clientUuid || "").trim().toLowerCase();
+      if (!normUuid) {
+        return { confirmedDeleted: false, dbWrites: 0, reason: "missing_client_uuid" };
+      }
+      const existingStatus = String(params.existingStatus || "").trim().toLowerCase();
+      if (existingStatus === "deleted" || Boolean(params.deletedFromPanelAt)) {
+        return {
+          confirmedDeleted: true,
+          alreadyDeleted: true,
+          applied: false,
+          dbWrites: 0,
+          reason: "already_deleted"
+        };
+      }
+      const nowMs = params.nowMs ?? Date.now();
+      const RECENT_PROVISION_GRACE_MS = 60 * 1e3;
+      if (params.createdAt) {
+        const createdAtMs = new Date(params.createdAt).getTime();
+        if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS) {
+          return {
+            confirmedDeleted: false,
+            dbWrites: 0,
+            reason: "recent_provision_grace_period"
+          };
+        }
+      }
+      const dbClient = params.dbClient || supabaseAdmin;
+      let currentPanelIdentity = String(params.currentPanelIdentity || "").trim();
+      if (!currentPanelIdentity) {
+        try {
+          currentPanelIdentity = await getCurrentPanelIdentity();
+        } catch {
+          return {
+            confirmedDeleted: false,
+            dbWrites: 0,
+            reason: "panel_identity_unavailable"
+          };
+        }
+      }
+      const configuredServers = params.configuredServers !== void 0 ? params.configuredServers : await loadConfiguredXuiServers(dbClient);
+      const identityCheck = verifyRecordPanelIdentity({
+        currentPanelIdentity,
+        recordPanelIdentity: params.recordPanelIdentity,
+        recordServerId: params.recordServerId,
+        recordInboundId: params.inboundId,
+        recordOwnerUid: params.userId,
+        recordOwnerEmail: params.userEmail,
+        configuredServers
+      });
+      if (!identityCheck.ok) {
+        const auditAction = identityCheck.code === "wrong_panel_identity" ? "panel_deletion_wrong_panel_identity" : "panel_deletion_ambiguous_identity";
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: params.userId || null,
+          action: auditAction,
+          targetType: "vpn_client",
+          targetId: normUuid,
+          details: {
+            client_uuid: normUuid,
+            inbound_id: params.inboundId ?? null,
+            current_panel_identity: currentPanelIdentity || null,
+            record_panel_identity: params.recordPanelIdentity || null,
+            record_server_id: params.recordServerId || null,
+            code: identityCheck.code,
+            reason: identityCheck.reason,
+            source: params.source || "background_sync"
+          }
+        });
+        return {
+          confirmedDeleted: false,
+          manualReviewFlagged: true,
+          dbWrites: 0,
+          reason: identityCheck.code
+        };
+      }
+      const inboundId = Number(params.inboundId);
+      const readInbound = params.fetchUncachedInbound || fetchUncachedLiveInboundById;
+      const readList = params.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
+      const reReadDelayMs = params.reReadDelayMs ?? 150;
+      const performSingleAuthoritativeAbsenceRead = async (readLabel) => {
+        const directRes = await readInbound(inboundId);
+        if (directRes.status === "error") {
+          return { absent: false, reason: `${readLabel}_error:${directRes.reason}` };
+        }
+        if (directRes.status === "found") {
+          if (directRes.clientUuidSet.has(normUuid)) {
+            return { absent: false, reason: `${readLabel}_client_present` };
+          }
+          return { absent: true, reason: `${readLabel}_confirmed_absent_from_inbound` };
+        }
+        const listRes = await readList();
+        if (!listRes.ok || !listRes.allInboundsCleanlyParsed || listRes.inbounds.length === 0) {
+          return {
+            absent: false,
+            reason: `${readLabel}_inbound_missing_unverified_list:${listRes.reason || "incomplete_or_empty_list"}`
+          };
+        }
+        if (listRes.parsedByInboundId.has(inboundId)) {
+          const ibEntry = listRes.parsedByInboundId.get(inboundId);
+          if (ibEntry.clientUuidSet.has(normUuid)) {
+            return { absent: false, reason: `${readLabel}_client_present_in_list` };
+          }
+          return { absent: true, reason: `${readLabel}_confirmed_absent_from_list_inbound` };
+        }
+        if (listRes.liveClientByUuid.has(normUuid)) {
+          return { absent: false, reason: `${readLabel}_client_moved_to_another_inbound` };
+        }
+        return { absent: true, inboundMissing: true, reason: `${readLabel}_inbound_and_client_confirmed_absent` };
+      };
+      try {
+        return await withClientMutationLock(
+          {
+            dbClient,
+            clientUuid: normUuid,
+            operationType: "client_lock",
+            targetId: `panel-delete-sync:${normUuid}`,
+            requireDurableLock: true,
+            allowUncertainRecovery: false,
+            metadata: {
+              syncSource: params.source || "background_sync",
+              inboundId,
+              panelIdentity: currentPanelIdentity
+            }
+          },
+          async (assertClientLockStillHeld) => {
+            return await withInboundWriteLock(
+              {
+                dbClient,
+                inboundId,
+                targetId: `panel-delete-sync:${normUuid}`,
+                clientUuid: normUuid,
+                requireDurableLock: true,
+                allowUncertainRecovery: false,
+                maxWaitMs: 2e3
+              },
+              async (assertInboundLockStillHeld) => {
+                await assertClientLockStillHeld();
+                await assertInboundLockStillHeld();
+                const read1 = await performSingleAuthoritativeAbsenceRead("read1");
+                if (!read1.absent) {
+                  return {
+                    confirmedDeleted: false,
+                    dbWrites: 0,
+                    reason: read1.reason
+                  };
+                }
+                if (reReadDelayMs > 0) {
+                  await new Promise((r) => setTimeout(r, reReadDelayMs));
+                }
+                await assertClientLockStillHeld();
+                await assertInboundLockStillHeld();
+                const read2 = await performSingleAuthoritativeAbsenceRead("read2");
+                if (!read2.absent) {
+                  return {
+                    confirmedDeleted: false,
+                    dbWrites: 0,
+                    reason: read2.reason
+                  };
+                }
+                const reason = "confirmed_absent_two_fresh_uncached_reads";
+                const details = {
+                  source: params.source || "background_sync",
+                  identity_match: identityCheck.code,
+                  read1_reason: read1.reason,
+                  read2_reason: read2.reason,
+                  inbound_missing: Boolean(read1.inboundMissing && read2.inboundMissing)
+                };
+                if (!dbClient || typeof dbClient.rpc !== "function") {
+                  console.error(
+                    `[3X-UI Sync] Fail closed for ${normUuid}: atomic deletion RPC client is unavailable.`
+                  );
+                  return {
+                    confirmedDeleted: false,
+                    applied: false,
+                    dbWrites: 0,
+                    reason: "rpc_unavailable"
+                  };
+                }
+                let rpcData = null;
+                let rpcErr = null;
+                try {
+                  const rpcRes = await dbClient.rpc("mark_vpn_client_panel_deleted", {
+                    p_client_uuid: normUuid,
+                    p_inbound_id: inboundId,
+                    p_panel_identity: currentPanelIdentity,
+                    p_user_id: params.userId || null,
+                    p_reason: reason,
+                    p_details: details
+                  });
+                  rpcData = rpcRes?.data;
+                  rpcErr = rpcRes?.error;
+                } catch (rpcException) {
+                  rpcErr = rpcException;
+                }
+                if (rpcErr) {
+                  console.error(
+                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted RPC unavailable or failed for ${normUuid}:`,
+                    rpcErr?.message || rpcErr
+                  );
+                  return {
+                    confirmedDeleted: false,
+                    applied: false,
+                    dbWrites: 0,
+                    reason: isMissingSchemaOrRpcError(rpcErr) ? `rpc_missing:${rpcErr?.message || "not_installed"}` : `rpc_error:${rpcErr?.message || "unknown"}`
+                  };
+                }
+                const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+                if (!row || typeof row !== "object") {
+                  console.error(
+                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted returned empty response for ${normUuid}.`
+                  );
+                  return {
+                    confirmedDeleted: false,
+                    applied: false,
+                    dbWrites: 0,
+                    reason: "rpc_empty_response"
+                  };
+                }
+                if (row.skip_reason && !row.already_deleted) {
+                  console.warn(
+                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted skipped ${normUuid} (skip_reason=${row.skip_reason}).`
+                  );
+                  return {
+                    confirmedDeleted: false,
+                    applied: false,
+                    dbWrites: 0,
+                    reason: `rpc_skipped:${row.skip_reason}`
+                  };
+                }
+                const applied = Boolean(row.applied);
+                const alreadyDeleted = Boolean(row.already_deleted);
+                if (!applied && !alreadyDeleted) {
+                  console.warn(
+                    `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted neither applied nor confirmed already_deleted for ${normUuid}.`
+                  );
+                  return {
+                    confirmedDeleted: false,
+                    applied: false,
+                    dbWrites: 0,
+                    reason: "rpc_not_applied"
+                  };
+                }
+                const reconciliationRequired = Boolean(row.reconciliation_required);
+                const unresolvedGrantCount = Number(row.unresolved_grant_count || 0);
+                const auditLogged = Boolean(row.audit_log_inserted ?? row.audit_logged);
+                const dbWrites = applied ? 1 : 0;
+                invalidateInboundCache(inboundId);
+                return {
+                  confirmedDeleted: true,
+                  applied,
+                  reconciliationRequired,
+                  unresolvedGrantCount,
+                  auditLogged,
+                  dbWrites,
+                  reason
+                };
+              }
+            );
+          }
+        );
+      } catch (lockErr) {
+        const code = String(lockErr?.code || "").trim();
+        console.log(
+          `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid} due to active/uncertain lock (${code || lockErr?.message || "busy"}).`
+        );
+        return {
+          confirmedDeleted: false,
+          dbWrites: 0,
+          reason: code ? `lock_skipped:${code}` : `lock_skipped:${lockErr?.message || "busy"}`
+        };
+      }
+    };
+    isSafeToRestoreActiveStatus = async (params) => {
+      const normStatus = String(params.currentDbStatus || "").trim().toLowerCase();
+      if (normStatus === "deleted" || Boolean(params.deletedFromPanelAt)) {
+        return false;
+      }
+      if (normStatus !== "disabled" && normStatus !== "expired") {
+        return false;
+      }
+      if (params.liveInbound?.enable !== true || params.liveClient?.enable !== true) {
+        return false;
+      }
+      if (params.liveStat && params.liveStat.enable === false) {
+        return false;
+      }
+      const nowMs = params.nowMs ?? Date.now();
+      let expMs = Number(params.liveClient.expiryTime || 0);
+      if (expMs > 0 && expMs < 1e10) expMs *= 1e3;
+      if (expMs > 0 && expMs <= nowMs || expMs < 0) {
+        return false;
+      }
+      const totalLimit = Number(params.liveClient.totalGB || (params.liveStat?.total ?? 0) || 0);
+      const usedBytes = Number(params.liveStat?.up || 0) + Number(params.liveStat?.down || 0);
+      if (totalLimit > 0 && usedBytes >= totalLimit) {
+        return false;
+      }
+      const dbClient = params.dbClient || supabaseAdmin;
+      const normUuid = String(params.clientUuid || "").trim().toLowerCase();
+      const orderId = String(params.orderId || "").trim();
+      if (orderId && dbClient && typeof dbClient.from === "function") {
+        try {
+          const { data: ord } = await dbClient.from("orders").select("id, status, payment_status, provisioning_status, reject_reason").eq("id", orderId).maybeSingle();
+          if (ord) {
+            const os = String(ord.status || "").toLowerCase().trim();
+            const ps = String(ord.payment_status || "").toLowerCase().trim();
+            const prs = String(ord.provisioning_status || "").toLowerCase().trim();
+            if (os === "rejected" || os === "cancelled" || os === "canceled" || os === "deleted" || os === "revoked" || os === "pending" || ps === "rejected" || ps === "cancelled" || prs === "revoked" || prs === "revoke_failed" || prs === "rejected" || Boolean(ord.reject_reason)) {
+              return false;
+            }
+          }
+        } catch {
+          return false;
+        }
+      }
+      if (dbClient && typeof dbClient.from === "function") {
+        try {
+          const { data: grants, error: grantErr } = await dbClient.from("vpn_entitlement_grants").select("grant_type, status").ilike("client_uuid", normUuid);
+          if (grantErr && !isMissingSchemaOrRpcError(grantErr)) {
+            return false;
+          }
+          if (Array.isArray(grants)) {
+            for (const g of grants) {
+              const gType = String(g.grant_type || "new_order").toLowerCase().trim();
+              const gStatus = String(g.status || "").toLowerCase().trim();
+              if (gStatus === "provisioning" || gStatus === "uncertain" || gStatus === "revoke_failed") {
+                return false;
+              }
+              if (gType === "new_order" && (gStatus === "revoked" || gStatus === "rejected" || gStatus === "cancelled" || gStatus === "deleted")) {
+                return false;
+              }
+            }
+          }
+        } catch {
+          return false;
+        }
+        try {
+          const keysToCheck = [`client:${normUuid}`];
+          if (orderId) keysToCheck.push(`order:${orderId}`);
+          const { data: ops, error: opsErr } = await dbClient.from("provisioning_operations").select("operation_key, status").in("operation_key", keysToCheck).in("status", ["in_progress", "uncertain"]);
+          if (opsErr && !isMissingSchemaOrRpcError(opsErr)) {
+            return false;
+          }
+          if (Array.isArray(ops) && ops.length > 0) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    };
+    syncDeleted3XUiClients = async (options) => {
+      console.log("[3X-UI Sync] Starting authoritative VPN client synchronization with 3X-UI panel...");
+      const dbClient = options?.dbClient || supabaseAdmin;
+      const readList = options?.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
+      const readInbound = options?.fetchUncachedInbound || fetchUncachedLiveInboundById;
+      const nowMs = options?.nowMs ?? Date.now();
+      let currentPanelIdentity = String(options?.currentPanelIdentity || "").trim();
+      if (!currentPanelIdentity) {
+        try {
+          currentPanelIdentity = await getCurrentPanelIdentity();
+        } catch (err) {
+          console.warn("[3X-UI Sync] Cannot resolve active 3X-UI panel identity. Skipping cycle safely.", err?.message || err);
+          return {
+            synced: false,
+            deletedCount: 0,
+            restoredCount: 0,
+            skippedCount: 0,
+            manualReviewCount: 0,
+            reconciliationFlaggedCount: 0
+          };
+        }
+      }
+      const listRes = await readList();
+      if (!listRes.ok) {
+        console.warn(`[3X-UI Sync] Live 3X-UI panel list failed (${listRes.reason}). Skipping cycle with zero writes.`);
+        return {
+          synced: false,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0
+        };
+      }
+      if (listRes.allInboundsCleanlyParsed && listRes.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
+        setCachedInbounds(listRes.inbounds);
+      }
+      const configuredServers = options?.configuredServers !== void 0 ? options.configuredServers : await loadConfiguredXuiServers(dbClient);
+      console.log(
+        `[3X-UI Sync] Live panel reachable (identity=${currentPanelIdentity}). Found ${listRes.liveClientByUuid.size} live client UUIDs across ${listRes.inbounds.length} inbounds (unparsed=${listRes.unparsedInboundIds.length}).`
+      );
+      let deletedCount = 0;
+      let restoredCount = 0;
+      let skippedCount = 0;
+      let manualReviewCount = 0;
+      let reconciliationFlaggedCount = 0;
+      const details = [];
+      try {
+        const [accRes, cfgRes] = await Promise.all([
+          dbClient.from("vpn_accounts").select("*"),
+          dbClient.from("vpn_configs").select("*")
+        ]);
+        const accounts = Array.isArray(accRes?.data) ? accRes.data : [];
+        const configs = Array.isArray(cfgRes?.data) ? cfgRes.data : [];
+        const grantInboundByUuid = /* @__PURE__ */ new Map();
+        try {
+          const { data: grants } = await dbClient.from("vpn_entitlement_grants").select("client_uuid, inbound_id").not("inbound_id", "is", null);
+          if (Array.isArray(grants)) {
+            for (const g of grants) {
+              const gu = String(g?.client_uuid || "").trim().toLowerCase();
+              const gib = Number(g?.inbound_id);
+              if (gu && Number.isInteger(gib) && gib > 0 && !grantInboundByUuid.has(gu)) {
+                grantInboundByUuid.set(gu, gib);
+              }
+            }
+          }
+        } catch {
+        }
+        const groups = /* @__PURE__ */ new Map();
+        const ensureGroup = (rawUuid) => {
+          const norm = String(rawUuid || "").trim().toLowerCase();
+          if (!norm) return null;
+          let g = groups.get(norm);
+          if (!g) {
+            g = {
+              clientUuid: norm,
+              accounts: [],
+              configs: [],
+              inboundId: grantInboundByUuid.get(norm) ?? null,
+              userId: null,
+              distinctOwners: /* @__PURE__ */ new Set(),
+              hasConflictingOwnership: false,
+              hasMissingOwnership: false,
+              userEmail: null,
+              orderId: null,
+              panelIdentity: null,
+              serverId: null,
+              createdAt: null,
+              anyNonDeleted: false,
+              allDeleted: true
+            };
+            groups.set(norm, g);
+          }
+          return g;
+        };
+        for (const acc of accounts) {
+          const g = ensureGroup(acc.uuid);
+          if (!g) continue;
+          g.accounts.push(acc);
+          const accOwner = String(acc.user_id || "").trim();
+          if (accOwner) {
+            g.distinctOwners.add(accOwner.toLowerCase());
+            if (!g.userId) g.userId = accOwner;
+          } else {
+            g.hasMissingOwnership = true;
+          }
+          if (!g.userEmail && acc.email) g.userEmail = String(acc.email).trim().toLowerCase();
+          if (!g.orderId && acc.order_id) g.orderId = String(acc.order_id).trim();
+          if (!g.panelIdentity && acc.panel_identity) g.panelIdentity = String(acc.panel_identity).trim();
+          if (!g.serverId && acc.server_id) g.serverId = String(acc.server_id).trim();
+          if (acc.created_at && (!g.createdAt || new Date(acc.created_at).getTime() > new Date(g.createdAt).getTime())) {
+            g.createdAt = acc.created_at;
+          }
+          const st = String(acc.status || "").trim().toLowerCase();
+          if (st !== "deleted" && !acc.deleted_from_panel_at) {
+            g.anyNonDeleted = true;
+            g.allDeleted = false;
+          }
+        }
+        for (const cfg of configs) {
+          const g = ensureGroup(cfg.uuid);
+          if (!g) continue;
+          g.configs.push(cfg);
+          const ibId = Number(cfg.inbound_id);
+          if (Number.isInteger(ibId) && ibId > 0) g.inboundId = ibId;
+          const cfgCustUid = String(cfg.customer_uid || "").trim();
+          const cfgUserId = String(cfg.user_id || "").trim();
+          if (cfgCustUid && cfgUserId && cfgCustUid.toLowerCase() !== cfgUserId.toLowerCase()) {
+            g.hasConflictingOwnership = true;
+          }
+          if (cfgCustUid) {
+            g.distinctOwners.add(cfgCustUid.toLowerCase());
+            if (!g.userId) g.userId = cfgCustUid;
+          }
+          if (cfgUserId) {
+            g.distinctOwners.add(cfgUserId.toLowerCase());
+            if (!g.userId) g.userId = cfgUserId;
+          }
+          if (!cfgCustUid && !cfgUserId) {
+            g.hasMissingOwnership = true;
+          }
+          if (!g.userEmail && (cfg.customer_email || cfg.email)) {
+            g.userEmail = String(cfg.customer_email || cfg.email).trim().toLowerCase();
+          }
+          if (!g.orderId && cfg.order_id) g.orderId = String(cfg.order_id).trim();
+          if (!g.panelIdentity && cfg.panel_identity) g.panelIdentity = String(cfg.panel_identity).trim();
+          if (!g.serverId && cfg.server_id) g.serverId = String(cfg.server_id).trim();
+          if (cfg.created_at && (!g.createdAt || new Date(cfg.created_at).getTime() > new Date(g.createdAt).getTime())) {
+            g.createdAt = cfg.created_at;
+          }
+          const st = String(cfg.status || "").trim().toLowerCase();
+          if (st !== "deleted" && !cfg.deleted_from_panel_at) {
+            g.anyNonDeleted = true;
+            g.allDeleted = false;
+          }
+        }
+        const nowIso = new Date(nowMs).toISOString();
+        for (const group of groups.values()) {
+          if (!group.anyNonDeleted || group.allDeleted) {
+            continue;
+          }
+          const liveMatch = listRes.liveClientByUuid.get(group.clientUuid);
+          if (liveMatch) {
+            for (const acc of group.accounts) {
+              const st = String(acc.status || "").trim().toLowerCase();
+              if (st === "deleted" || acc.deleted_from_panel_at) continue;
+              const updates = {};
+              if (!acc.panel_identity && currentPanelIdentity) {
+                updates.panel_identity = currentPanelIdentity;
+              }
+              if ((st === "disabled" || st === "expired") && await isSafeToRestoreActiveStatus({
+                dbClient,
+                clientUuid: group.clientUuid,
+                orderId: acc.order_id || group.orderId,
+                currentDbStatus: st,
+                deletedFromPanelAt: acc.deleted_from_panel_at,
+                liveInbound: liveMatch.inbound,
+                liveClient: liveMatch.client,
+                liveStat: liveMatch.stat,
+                nowMs
+              })) {
+                updates.status = "active";
+                updates.enable = true;
+                updates.updated_at = nowIso;
+                restoredCount += 1;
+              }
+              if (Object.keys(updates).length > 0) {
+                try {
+                  const { error } = await dbClient.from("vpn_accounts").update(updates).eq("id", acc.id);
+                  if (error && isMissingSchemaOrRpcError(error) && "panel_identity" in updates) {
+                    delete updates.panel_identity;
+                    if (Object.keys(updates).length > 0) {
+                      await dbClient.from("vpn_accounts").update(updates).eq("id", acc.id);
+                    }
+                  }
+                } catch {
+                }
+              }
+            }
+            for (const cfg of group.configs) {
+              const st = String(cfg.status || "").trim().toLowerCase();
+              if (st === "deleted" || cfg.deleted_from_panel_at) continue;
+              const updates = {};
+              if (!cfg.panel_identity && currentPanelIdentity) {
+                updates.panel_identity = currentPanelIdentity;
+              }
+              if ((!cfg.inbound_id || Number(cfg.inbound_id) <= 0) && liveMatch.inbound?.id) {
+                updates.inbound_id = Number(liveMatch.inbound.id);
+              }
+              if ((st === "disabled" || st === "expired") && await isSafeToRestoreActiveStatus({
+                dbClient,
+                clientUuid: group.clientUuid,
+                orderId: cfg.order_id || group.orderId,
+                currentDbStatus: st,
+                deletedFromPanelAt: cfg.deleted_from_panel_at,
+                liveInbound: liveMatch.inbound,
+                liveClient: liveMatch.client,
+                liveStat: liveMatch.stat,
+                nowMs
+              })) {
+                updates.status = "active";
+                updates.enabled = true;
+              }
+              if (Object.keys(updates).length > 0) {
+                try {
+                  const { error } = await dbClient.from("vpn_configs").update(updates).eq("id", cfg.id);
+                  if (error && isMissingSchemaOrRpcError(error) && "panel_identity" in updates) {
+                    delete updates.panel_identity;
+                    if (Object.keys(updates).length > 0) {
+                      await dbClient.from("vpn_configs").update(updates).eq("id", cfg.id);
+                    }
+                  }
+                } catch {
+                }
+              }
+            }
+            continue;
+          }
+          if (!listRes.allInboundsCleanlyParsed && (!group.inboundId || listRes.unparsedInboundIds.includes(group.inboundId) || listRes.unparsedInboundIds.includes(-1))) {
+            skippedCount += 1;
+            details.push({
+              clientUuid: group.clientUuid,
+              outcome: "skipped",
+              reason: "malformed_inbound_settings_in_list"
+            });
+            continue;
+          }
+          if (group.hasConflictingOwnership || group.distinctOwners.size > 1 || group.hasMissingOwnership || !group.userId) {
+            const ownershipCode = group.hasConflictingOwnership || group.distinctOwners.size > 1 ? "conflicting_or_duplicate_ownership" : "missing_customer_ownership";
+            await recordDeduplicatedSyncAuditLog({
+              dbClient,
+              userId: group.distinctOwners.size === 1 ? group.userId : null,
+              action: "panel_deletion_ambiguous_identity",
+              targetType: "vpn_client",
+              targetId: group.clientUuid,
+              details: {
+                client_uuid: group.clientUuid,
+                inbound_id: group.inboundId ?? null,
+                distinct_owners: Array.from(group.distinctOwners),
+                has_conflicting_ownership: group.hasConflictingOwnership,
+                has_missing_ownership: group.hasMissingOwnership,
+                code: ownershipCode,
+                source: "background_sync"
+              }
+            });
+            manualReviewCount += 1;
+            skippedCount += 1;
+            details.push({
+              clientUuid: group.clientUuid,
+              outcome: "manual_review",
+              reason: ownershipCode
+            });
+            continue;
+          }
+          const verifyRes = await verifyAndMarkClientDeletedIfConfirmed({
+            clientUuid: group.clientUuid,
+            inboundId: group.inboundId,
+            userId: group.userId,
+            userEmail: group.userEmail,
+            recordPanelIdentity: group.panelIdentity,
+            recordServerId: group.serverId,
+            createdAt: group.createdAt,
+            existingStatus: null,
+            deletedFromPanelAt: null,
+            source: "background_sync",
+            dbClient,
+            currentPanelIdentity,
+            configuredServers,
+            fetchUncachedInbound: readInbound,
+            fetchUncachedInboundsList: readList,
+            reReadDelayMs: options?.reReadDelayMs,
+            nowMs
+          });
+          if (verifyRes.confirmedDeleted) {
+            if (verifyRes.applied) deletedCount += 1;
+            if (verifyRes.reconciliationRequired) reconciliationFlaggedCount += 1;
+            details.push({
+              clientUuid: group.clientUuid,
+              outcome: "deleted",
+              reason: verifyRes.reason
+            });
+          } else if (verifyRes.manualReviewFlagged) {
+            manualReviewCount += 1;
+            skippedCount += 1;
+            details.push({
+              clientUuid: group.clientUuid,
+              outcome: "manual_review",
+              reason: verifyRes.reason
+            });
+          } else {
+            skippedCount += 1;
+            details.push({
+              clientUuid: group.clientUuid,
+              outcome: "skipped",
+              reason: verifyRes.reason
+            });
+          }
+        }
+        console.log(
+          `[3X-UI Sync] Completed. confirmedDeleted=${deletedCount}, restoredActive=${restoredCount}, skipped=${skippedCount}, manualReview=${manualReviewCount}, reconciliationFlagged=${reconciliationFlaggedCount}.`
+        );
+        return {
+          synced: true,
+          deletedCount,
+          restoredCount,
+          skippedCount,
+          manualReviewCount,
+          reconciliationFlaggedCount,
+          details
+        };
+      } catch (err) {
+        console.error("[3X-UI Sync] Unexpected error during synchronization cycle:", err?.message || err);
+        return {
+          synced: false,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0
+        };
       }
     };
     resetClientTraffic = async (email, inboundId, clientUuid, options) => {
@@ -14510,13 +15337,15 @@ var buildRejectedVpnDisplayConfig = (ord, grant) => {
     rejectionReason: safeReason
   };
 };
-var getMyConfigs = async (uid, email, _token) => {
+var getMyConfigs = async (uid, email, _token, options) => {
   const dbStart = Date.now();
   const userEmail = email ? email.toLowerCase().trim() : "";
   const userUid = uid ? uid.trim() : "";
-  const db = getSupabaseClient(_token);
+  const db = options?.dbClient || getSupabaseClient(_token);
+  const adminDb = options?.adminDbClient || supabaseAdmin;
+  const nowMs = options?.nowMs ?? Date.now();
   if (!userUid && !userEmail) {
-    return { configs: [], dbTime: 0 };
+    return { configs: [], deletedUuids: [], dbTime: 0 };
   }
   const vpnConfigsMap = /* @__PURE__ */ new Map();
   if (userUid) {
@@ -14538,20 +15367,31 @@ var getMyConfigs = async (uid, email, _token) => {
   }
   const vpnConfigsData = Array.from(vpnConfigsMap.values());
   const inboundMap = /* @__PURE__ */ new Map();
-  const deletedOrInactiveUuids = /* @__PURE__ */ new Set();
+  const confirmedDeletedUuids = /* @__PURE__ */ new Set();
+  const blockedNonActiveUuids = /* @__PURE__ */ new Set();
   const vpnConfigOrderIds = /* @__PURE__ */ new Set();
+  const vpnConfigByUuid = /* @__PURE__ */ new Map();
   vpnConfigsData.forEach((cfg) => {
+    const normUuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : "";
+    if (normUuid) {
+      vpnConfigByUuid.set(normUuid, cfg);
+    }
     if (cfg.order_id) {
       vpnConfigOrderIds.add(String(cfg.order_id).trim());
     }
     const cfgStatus = String(cfg.status || "").toLowerCase().trim();
-    if (cfgStatus === "deleted" || cfgStatus === "rejected" || cfgStatus === "cancelled" || cfgStatus === "pending" || cfgStatus === "disabled" || cfgStatus === "revoked") {
-      if (cfg.uuid) deletedOrInactiveUuids.add(String(cfg.uuid).trim().toLowerCase());
+    const isDeleted = cfgStatus === "deleted" || Boolean(cfg.deleted_from_panel_at);
+    if (isDeleted && normUuid) {
+      confirmedDeletedUuids.add(normUuid);
+      blockedNonActiveUuids.add(normUuid);
+    }
+    if (cfgStatus === "deleted" || cfgStatus === "rejected" || cfgStatus === "cancelled" || cfgStatus === "pending" || cfgStatus === "revoked") {
+      if (normUuid) blockedNonActiveUuids.add(normUuid);
     }
     const ibId = Number(cfg.inbound_id);
     if (!isNaN(ibId) && ibId > 0) {
       if (cfg.order_id) inboundMap.set(String(cfg.order_id), ibId);
-      if (cfg.uuid) inboundMap.set(String(cfg.uuid).toLowerCase(), ibId);
+      if (normUuid) inboundMap.set(normUuid, ibId);
     }
   });
   const ordersById = /* @__PURE__ */ new Map();
@@ -14586,7 +15426,7 @@ var getMyConfigs = async (uid, email, _token) => {
   const isOrderProvisionallyActive = (ord) => {
     const rawStatus = String(ord.status || "").toLowerCase().trim();
     const rawPayStatus = String(ord.payment_status || "").toLowerCase().trim();
-    if (rawStatus === "rejected" || rawStatus === "cancelled" || rawStatus === "deleted" || rawStatus === "expired" || rawPayStatus === "cancelled" || rawPayStatus === "rejected") {
+    if (rawStatus === "rejected" || rawStatus === "cancelled" || rawStatus === "deleted" || rawPayStatus === "cancelled" || rawPayStatus === "rejected") {
       return false;
     }
     const provStatus = String(ord.provisioning_status || "").toLowerCase().trim();
@@ -14594,7 +15434,7 @@ var getMyConfigs = async (uid, email, _token) => {
       return false;
     }
     const cUuid = String(ord.client_uuid || "").trim().toLowerCase();
-    if (cUuid && deletedOrInactiveUuids.has(cUuid)) {
+    if (cUuid && (confirmedDeletedUuids.has(cUuid) || blockedNonActiveUuids.has(cUuid))) {
       return false;
     }
     return provStatus === "provisional" && Boolean(ord.vless_url) && Boolean(ord.client_uuid);
@@ -14603,11 +15443,11 @@ var getMyConfigs = async (uid, email, _token) => {
   const nonApprovedOrderUuids = /* @__PURE__ */ new Set();
   const grantByOrderId = /* @__PURE__ */ new Map();
   const customerOrderRowIds = allOrders.map((ord) => ord?.id ? String(ord.id).trim() : "").filter(Boolean);
-  if (customerOrderRowIds.length > 0 && supabaseAdmin) {
+  if (customerOrderRowIds.length > 0 && adminDb) {
     try {
-      let grantsRes = await supabaseAdmin.from("vpn_entitlement_grants").select("grant_type, order_id, client_uuid, inbound_id, status, revoke_reason").in("order_id", customerOrderRowIds);
+      let grantsRes = await adminDb.from("vpn_entitlement_grants").select("grant_type, order_id, client_uuid, inbound_id, status, revoke_reason").in("order_id", customerOrderRowIds);
       if (grantsRes.error && String(grantsRes.error.message || "").includes("revoke_reason")) {
-        grantsRes = await supabaseAdmin.from("vpn_entitlement_grants").select("grant_type, order_id, client_uuid, inbound_id, status").in("order_id", customerOrderRowIds);
+        grantsRes = await adminDb.from("vpn_entitlement_grants").select("grant_type, order_id, client_uuid, inbound_id, status").in("order_id", customerOrderRowIds);
       }
       const grants = grantsRes.data;
       if (Array.isArray(grants)) {
@@ -14627,7 +15467,7 @@ var getMyConfigs = async (uid, email, _token) => {
               if (gOrderId) nonApprovedOrderIds.add(gOrderId);
               if (gUuid) {
                 nonApprovedOrderUuids.add(gUuid);
-                deletedOrInactiveUuids.add(gUuid);
+                blockedNonActiveUuids.add(gUuid);
               }
             }
           }
@@ -14642,7 +15482,7 @@ var getMyConfigs = async (uid, email, _token) => {
       return;
     }
     const provStatus = String(ord.provisioning_status || "").toLowerCase().trim();
-    if (rawStatus === "pending" || rawStatus === "rejected" || rawStatus === "cancelled" || rawStatus === "deleted" || rawStatus === "expired" || rawStatus === "provisioning" || provStatus === "revoked" || provStatus === "revoke_failed" || provStatus === "rejected") {
+    if (rawStatus === "pending" || rawStatus === "rejected" || rawStatus === "cancelled" || rawStatus === "deleted" || rawStatus === "provisioning" || provStatus === "revoked" || provStatus === "revoke_failed" || provStatus === "rejected") {
       if (ord.id) nonApprovedOrderIds.add(String(ord.id).trim());
       if (ord.order_id) nonApprovedOrderIds.add(String(ord.order_id).trim());
       const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || "").trim().toLowerCase();
@@ -14650,6 +15490,7 @@ var getMyConfigs = async (uid, email, _token) => {
     }
   });
   const configs = [];
+  const vpnAccountByUuid = /* @__PURE__ */ new Map();
   try {
     let vpnAccs = [];
     if (userUid) {
@@ -14670,15 +15511,27 @@ var getMyConfigs = async (uid, email, _token) => {
         const docUserId = String(acc.user_id || "").trim();
         const docEmail = String(acc.email || "").toLowerCase().trim();
         const matchesUser = userUid ? docUserId === userUid || !docUserId && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
+        if (!matchesUser) return;
         const accStatus = String(acc.status || "active").toLowerCase().trim();
-        const isApprovedStatus = accStatus === "active" || accStatus === "enabled" || accStatus === "approved";
         const configUuid = String(acc.uuid || "").trim();
         const normUuid = configUuid.toLowerCase();
         const orderId = String(acc.order_id || acc.id || "").trim();
-        const isBlockedByOrder = orderId && nonApprovedOrderIds.has(orderId) || normUuid && nonApprovedOrderUuids.has(normUuid) || normUuid && deletedOrInactiveUuids.has(normUuid);
-        if (matchesUser && isApprovedStatus && !isBlockedByOrder && configUuid && acc.vless_url) {
+        if (normUuid) {
+          vpnAccountByUuid.set(normUuid, acc);
+        }
+        if (accStatus === "deleted" || Boolean(acc.deleted_from_panel_at)) {
+          if (normUuid) {
+            confirmedDeletedUuids.add(normUuid);
+            blockedNonActiveUuids.add(normUuid);
+          }
+          return;
+        }
+        const isDisplayableStatus = accStatus === "active" || accStatus === "enabled" || accStatus === "approved" || accStatus === "disabled" || accStatus === "expired";
+        const isBlockedByOrder = orderId && nonApprovedOrderIds.has(orderId) || normUuid && nonApprovedOrderUuids.has(normUuid) || normUuid && blockedNonActiveUuids.has(normUuid);
+        if (isDisplayableStatus && !isBlockedByOrder && configUuid && acc.vless_url) {
           const isTrialAcc = !!(acc.is_trial || orderId.startsWith("TRIAL-"));
           const inboundId = inboundMap.get(orderId) || inboundMap.get(normUuid) || null;
+          const cfgRow = vpnConfigByUuid.get(normUuid);
           configs.push({
             orderId: acc.order_id || acc.id,
             packageName: acc.remark || "FIREVPN Package",
@@ -14690,7 +15543,15 @@ var getMyConfigs = async (uid, email, _token) => {
             serverNode: acc.server_name || "Singapore",
             _rawLimit: isTrialAcc ? 1 * 1024 * 1024 * 1024 : acc.total_bytes || 0,
             isTrial: isTrialAcc,
-            templateId: acc.template_id || null
+            templateId: acc.template_id || null,
+            _dbAccountId: acc.id || null,
+            _dbConfigId: cfgRow?.id || null,
+            _dbStatus: accStatus,
+            _recordPanelIdentity: acc.panel_identity || cfgRow?.panel_identity || null,
+            _recordServerId: acc.server_id || cfgRow?.server_id || null,
+            _createdAt: acc.created_at || cfgRow?.created_at || null,
+            _ownerUid: docUserId || userUid || null,
+            _ownerEmail: docEmail || userEmail || null
           });
         }
       });
@@ -14703,14 +15564,14 @@ var getMyConfigs = async (uid, email, _token) => {
     const docEmail = String(data.email || data.customerEmail || data.userEmail || "").toLowerCase().trim();
     const orderStatus = String(data.status || "").toLowerCase().trim();
     const matchesUser = userUid ? docUid === userUid || !docUid && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
-    const isApproved = orderStatus === "approved" || orderStatus === "completed" || orderStatus === "active" || isOrderProvisionallyActive(data);
+    const isApproved = orderStatus === "approved" || orderStatus === "completed" || orderStatus === "active" || orderStatus === "expired" || isOrderProvisionallyActive(data);
     return matchesUser && isApproved;
   });
   matchedDocs.forEach((data) => {
     const vlessUrl = String(data.vless_url || data.vpn_credentials?.configLink || data.vpn_credentials?.qrcodeData || data.configUrl || "").trim();
     const clientUuid = String(data.client_uuid || data.vpn_credentials?.password || data.uuid || "").trim();
     const normUuid = clientUuid.toLowerCase();
-    if (vlessUrl && clientUuid && !deletedOrInactiveUuids.has(normUuid)) {
+    if (vlessUrl && clientUuid && !confirmedDeletedUuids.has(normUuid) && !blockedNonActiveUuids.has(normUuid) && !nonApprovedOrderUuids.has(normUuid)) {
       let pmJson = {};
       try {
         pmJson = typeof data.payment_method === "string" ? JSON.parse(data.payment_method) : data.payment_method || {};
@@ -14729,6 +15590,8 @@ var getMyConfigs = async (uid, email, _token) => {
         const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
         const orderId = data.id || data.order_id;
         const inboundId = inboundMap.get(String(orderId)) || inboundMap.get(normUuid) || data.inbound_id || null;
+        const cfgRow = vpnConfigByUuid.get(normUuid);
+        const accRow = vpnAccountByUuid.get(normUuid);
         configs.push({
           orderId,
           packageName: data.package_name || data.plan || "FIREVPN Package",
@@ -14742,29 +15605,33 @@ var getMyConfigs = async (uid, email, _token) => {
           isTrial: isTrialOrd,
           templateId: tplId,
           paymentStatus: data.payment_status || (isProvisionalOrd ? "Pending Verification" : "Paid"),
-          provisioningStatus: data.provisioning_status || pmJson.provisioning_status || (isProvisionalOrd ? "provisional" : "completed")
+          provisioningStatus: data.provisioning_status || pmJson.provisioning_status || (isProvisionalOrd ? "provisional" : "completed"),
+          _dbAccountId: accRow?.id || null,
+          _dbConfigId: cfgRow?.id || null,
+          _dbStatus: String(accRow?.status || cfgRow?.status || "active").toLowerCase().trim(),
+          _recordPanelIdentity: accRow?.panel_identity || cfgRow?.panel_identity || null,
+          _recordServerId: accRow?.server_id || cfgRow?.server_id || null,
+          _createdAt: accRow?.created_at || cfgRow?.created_at || data.created_at || null,
+          _ownerUid: String(data.customer_id || userUid || "").trim() || null,
+          _ownerEmail: String(data.email || userEmail || "").trim().toLowerCase() || null
         });
       }
     }
   });
-  const cached = await getCachedInbounds();
+  const fetchCachedInbounds = options?.getCachedInboundsFn || getCachedInbounds;
+  const fetchLiveInbound = options?.getLiveInboundFn || getLiveInbound;
+  const fetchInboundsList = options?.getInboundsFn || getInbounds;
+  const cached = await fetchCachedInbounds();
   const resolveMissingInboundIds = (inboundList) => {
     if (!Array.isArray(inboundList) || inboundList.length === 0) return;
     configs.forEach((config) => {
       if (config.uuid && (config.inboundId === null || config.inboundId === void 0 || Number(config.inboundId) <= 0)) {
         for (const ib of inboundList) {
-          let settingsObj = {};
-          try {
-            if (ib.settings) {
-              settingsObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings;
-            }
-          } catch (e) {
-          }
-          const clients = settingsObj.clients || [];
-          const found = clients.some((c) => String(c.id || "").toLowerCase() === String(config.uuid).toLowerCase());
-          if (found) {
-            config.inboundId = Number(ib.id);
-            console.log(`[Live Traffic Engine] Found missing inboundId ${ib.id} for UUID ${config.uuid} from inbound list.`);
+          const parsed = parseInboundSettingsClientsStrict(ib);
+          if (!parsed.ok) continue;
+          if (parsed.clientUuidSet.has(String(config.uuid).trim().toLowerCase())) {
+            config.inboundId = parsed.inboundId;
+            console.log(`[Live Traffic Engine] Found missing inboundId ${parsed.inboundId} for UUID ${config.uuid} from inbound list.`);
             break;
           }
         }
@@ -14773,14 +15640,16 @@ var getMyConfigs = async (uid, email, _token) => {
   };
   resolveMissingInboundIds(cached);
   const liveInboundsMap = /* @__PURE__ */ new Map();
+  const cleanlyParsedLiveInboundIds = /* @__PURE__ */ new Set();
   let liveFullListFetched = false;
+  let liveFullListCleanlyParsed = false;
   const hasMissingInboundId = configs.some(
     (c) => c.uuid && (c.inboundId === null || c.inboundId === void 0 || Number(c.inboundId) <= 0)
   );
   if (hasMissingInboundId && configs.length > 0) {
     try {
       const freshList = await Promise.race([
-        getInbounds(true),
+        fetchInboundsList(true),
         new Promise(
           (resolve) => setTimeout(() => {
             console.warn("[Live Traffic Engine] Fresh full inbound list fetch timed out after 5s.");
@@ -14790,9 +15659,17 @@ var getMyConfigs = async (uid, email, _token) => {
       ]);
       if (Array.isArray(freshList) && freshList.length > 0) {
         liveFullListFetched = true;
+        let allClean = true;
         freshList.forEach((ib) => {
-          if (ib && ib.id) liveInboundsMap.set(Number(ib.id), ib);
+          const parsed = parseInboundSettingsClientsStrict(ib);
+          if (parsed.ok) {
+            liveInboundsMap.set(parsed.inboundId, ib);
+            cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+          } else {
+            allClean = false;
+          }
         });
+        liveFullListCleanlyParsed = allClean;
         resolveMissingInboundIds(freshList);
       }
     } catch (err) {
@@ -14806,7 +15683,7 @@ var getMyConfigs = async (uid, email, _token) => {
     try {
       console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds from 3X-UI...`);
       const liveResults = await Promise.race([
-        Promise.all(userInboundIds.map((id) => getLiveInbound(id))),
+        Promise.all(userInboundIds.map((id) => fetchLiveInbound(id))),
         new Promise(
           (resolve) => setTimeout(() => {
             console.warn("[Live Traffic Engine] Live inbound fetch timed out after 5s; panel status unverified.");
@@ -14816,7 +15693,11 @@ var getMyConfigs = async (uid, email, _token) => {
       ]);
       liveResults.forEach((ib) => {
         if (ib && ib.id) {
-          liveInboundsMap.set(Number(ib.id), ib);
+          const parsed = parseInboundSettingsClientsStrict(ib);
+          if (parsed.ok) {
+            liveInboundsMap.set(parsed.inboundId, ib);
+            cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+          }
         }
       });
     } catch (err) {
@@ -14824,40 +15705,43 @@ var getMyConfigs = async (uid, email, _token) => {
     }
   }
   const liveInbounds = Array.from(liveInboundsMap.values());
-  const resultConfigs = configs.map((config) => {
+  const liveClientByUuid = /* @__PURE__ */ new Map();
+  for (const ib of liveInbounds) {
+    const parsed = parseInboundSettingsClientsStrict(ib);
+    if (!parsed.ok) continue;
+    for (const c of parsed.clients) {
+      const cUuid = String(c?.id || "").trim().toLowerCase();
+      if (cUuid) {
+        liveClientByUuid.set(cUuid, { inbound: ib, client: c });
+      }
+    }
+  }
+  let resolvedPanelIdentity = String(options?.currentPanelIdentity || "").trim();
+  if (!resolvedPanelIdentity && liveInbounds.length > 0) {
+    try {
+      resolvedPanelIdentity = await getCurrentPanelIdentity();
+    } catch {
+      resolvedPanelIdentity = "";
+    }
+  }
+  const verifyDeleted = options?.verifyDeletedFn || verifyAndMarkClientDeletedIfConfirmed;
+  const finalConfigs = [];
+  for (const config of configs) {
     let up = 0;
     let down = 0;
     let total = config._rawLimit || 0;
     let expiryTime = 0;
     let lastOnline = 0;
     let inboundId = config.inboundId ? Number(config.inboundId) : null;
-    console.log(`[Provisioning Audit] Database inbound_id after reload: ${config.inboundId}`);
-    console.log(`[Provisioning Audit] UUID to match: ${config.uuid}`);
+    const normUuid = String(config.uuid || "").trim().toLowerCase();
     let clientEmail = userEmail;
     let matchedInbound = null;
     let stat = null;
     let foundClient = null;
-    const checkedUuids = [];
-    if (liveInbounds.length > 0 && config.uuid) {
-      for (const ib of liveInbounds) {
-        let settingsObj = {};
-        try {
-          if (ib.settings) {
-            settingsObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings;
-          }
-        } catch (e) {
-        }
-        const clients = settingsObj.clients || [];
-        for (const c of clients) {
-          if (c.id) checkedUuids.push(c.id);
-          if (String(c.id || "").toLowerCase() === String(config.uuid).toLowerCase()) {
-            matchedInbound = ib;
-            foundClient = c;
-            break;
-          }
-        }
-        if (matchedInbound) break;
-      }
+    if (normUuid && liveClientByUuid.has(normUuid)) {
+      const hit = liveClientByUuid.get(normUuid);
+      matchedInbound = hit.inbound;
+      foundClient = hit.client;
     }
     if (matchedInbound && foundClient) {
       if (!inboundId) {
@@ -14874,7 +15758,7 @@ var getMyConfigs = async (uid, email, _token) => {
       }
       const clientStats = matchedInbound.clientStats || [];
       if (config.uuid) {
-        stat = clientStats.find((s) => String(s.id || "").toLowerCase() === String(config.uuid).toLowerCase()) || clientStats.find((s) => String(s.email || "").toLowerCase() === String(clientEmail).toLowerCase());
+        stat = clientStats.find((s) => String(s.id || "").toLowerCase() === normUuid) || clientStats.find((s) => String(s.email || "").toLowerCase() === String(clientEmail).toLowerCase());
       }
       const extractTraffic = (obj, type) => {
         if (!obj) return 0;
@@ -14901,7 +15785,7 @@ var getMyConfigs = async (uid, email, _token) => {
         lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
       }
     } else {
-      console.log(`[Provisioning Audit] No live 3X-UI state verified for UUID: ${config.uuid}. Marking status unverified.`);
+      console.log(`[Provisioning Audit] No live 3X-UI state verified for UUID: ${config.uuid}.`);
     }
     let lastOnlineMs = lastOnline;
     if (lastOnlineMs > 0 && lastOnlineMs < 1e10) {
@@ -14911,7 +15795,6 @@ var getMyConfigs = async (uid, email, _token) => {
     const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
     const usedGB = parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2));
     const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : "Unlimited";
-    const now = Date.now();
     let expTimeMs = expiryTime;
     if (expTimeMs > 0 && expTimeMs < 1e10) {
       expTimeMs = expTimeMs * 1e3;
@@ -14920,11 +15803,35 @@ var getMyConfigs = async (uid, email, _token) => {
       const parsed = new Date(config.expiryDate).getTime();
       if (!isNaN(parsed)) expTimeMs = parsed;
     }
-    const expectedInboundWasLive = Boolean(
-      inboundId && liveInboundsMap.has(Number(inboundId)) || liveFullListFetched
+    const expectedInboundCleanlyFetched = Boolean(
+      inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId)) || liveFullListFetched && liveFullListCleanlyParsed
     );
+    if (!matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
+      const delCheck = await verifyDeleted({
+        clientUuid: normUuid,
+        inboundId,
+        userId: config._ownerUid || userUid || null,
+        userEmail: config._ownerEmail || userEmail || null,
+        recordPanelIdentity: config._recordPanelIdentity || null,
+        recordServerId: config._recordServerId || null,
+        createdAt: config._createdAt || null,
+        existingStatus: config._dbStatus || null,
+        deletedFromPanelAt: null,
+        source: "customer_read",
+        dbClient: adminDb,
+        currentPanelIdentity: resolvedPanelIdentity || void 0,
+        nowMs
+      });
+      if (delCheck.confirmedDeleted) {
+        confirmedDeletedUuids.add(normUuid);
+        console.log(
+          `[3X-UI Sync] Authoritatively confirmed permanently deleted UUID ${config.uuid} (${delCheck.reason}); removing from customer view.`
+        );
+        continue;
+      }
+    }
     const evaluated = evaluateVpnClientStatus({
-      panelReachable: expectedInboundWasLive || Boolean(matchedInbound),
+      panelReachable: expectedInboundCleanlyFetched || Boolean(matchedInbound),
       inboundFound: Boolean(matchedInbound),
       inboundEnable: matchedInbound ? matchedInbound.enable : null,
       clientFound: Boolean(foundClient),
@@ -14934,8 +15841,43 @@ var getMyConfigs = async (uid, email, _token) => {
       downBytes: down,
       totalLimitBytes: total,
       expiryTimeMs: expTimeMs,
-      nowMs: now
+      nowMs
     });
+    if (matchedInbound && foundClient && evaluated.status === "Active" && (config._dbStatus === "disabled" || config._dbStatus === "expired") && adminDb) {
+      const canRestore = await isSafeToRestoreActiveStatus({
+        dbClient: adminDb,
+        clientUuid: normUuid,
+        orderId: config.orderId,
+        currentDbStatus: config._dbStatus,
+        deletedFromPanelAt: null,
+        liveInbound: matchedInbound,
+        liveClient: foundClient,
+        liveStat: stat,
+        nowMs
+      });
+      if (canRestore) {
+        const nowIso = new Date(nowMs).toISOString();
+        if (config._dbAccountId) {
+          adminDb.from("vpn_accounts").update({
+            status: "active",
+            enable: true,
+            updated_at: nowIso,
+            ...resolvedPanelIdentity && !config._recordPanelIdentity ? { panel_identity: resolvedPanelIdentity } : {}
+          }).eq("id", config._dbAccountId).then(() => {
+          }).catch(() => {
+          });
+        }
+        if (config._dbConfigId) {
+          adminDb.from("vpn_configs").update({
+            status: "active",
+            enabled: true,
+            ...resolvedPanelIdentity && !config._recordPanelIdentity ? { panel_identity: resolvedPanelIdentity } : {}
+          }).eq("id", config._dbConfigId).then(() => {
+          }).catch(() => {
+          });
+        }
+      }
+    }
     let currentExpiryDate = config.expiryDate;
     if (expTimeMs > 0) {
       currentExpiryDate = new Date(expTimeMs).toISOString();
@@ -14958,8 +15900,7 @@ var getMyConfigs = async (uid, email, _token) => {
       } catch (e) {
       }
     }
-    console.log(`[Provisioning Audit] API response inboundId: ${inboundId} | observedStatus: ${evaluated.status} (${evaluated.statusReason})`);
-    return {
+    finalConfigs.push({
       orderId: config.orderId,
       packageName: config.packageName,
       uuid: config.uuid,
@@ -14995,38 +15936,10 @@ var getMyConfigs = async (uid, email, _token) => {
       isTrial: !!config.isTrial,
       templateId: config.templateId || null,
       paymentStatus: config.paymentStatus || null,
-      provisioningStatus: config.provisioningStatus || null,
-      _expectedInboundWasLive: expectedInboundWasLive
-    };
-  });
-  const dbTime = Date.now() - dbStart;
-  const liveUuids = /* @__PURE__ */ new Set();
-  for (const ib of liveInbounds) {
-    let settingsObj = {};
-    try {
-      if (ib.settings) {
-        settingsObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings;
-      }
-    } catch (e) {
-    }
-    const clients = settingsObj.clients || [];
-    for (const c of clients) {
-      if (c.id) liveUuids.add(String(c.id).trim().toLowerCase());
-    }
-    const clientStats = ib.clientStats || [];
-    for (const s of clientStats) {
-      if (s.id) liveUuids.add(String(s.id).trim().toLowerCase());
-    }
+      provisioningStatus: config.provisioningStatus || null
+    });
   }
-  const finalConfigs = resultConfigs.filter((cfg) => {
-    if (!cfg.uuid) return false;
-    const normUuid = String(cfg.uuid).trim().toLowerCase();
-    if (cfg._expectedInboundWasLive && liveInbounds.length > 0 && !liveUuids.has(normUuid)) {
-      console.log(`[3X-UI Sync] Excluding deleted configuration (UUID: ${cfg.uuid}) confirmed absent from live 3X-UI inbound.`);
-      return false;
-    }
-    return true;
-  }).map(({ _expectedInboundWasLive, ...publicCfg }) => publicCfg);
+  const dbTime = Date.now() - dbStart;
   const seenRejectedOrderKeys = /* @__PURE__ */ new Set();
   const rejectedConfigs = [];
   allOrders.forEach((ord) => {
@@ -15047,7 +15960,11 @@ var getMyConfigs = async (uid, email, _token) => {
     seenRejectedOrderKeys.add(dedupeKey);
     rejectedConfigs.push(buildRejectedVpnDisplayConfig(ord, grant));
   });
-  return { configs: [...finalConfigs, ...rejectedConfigs], dbTime };
+  return {
+    configs: [...finalConfigs, ...rejectedConfigs],
+    deletedUuids: Array.from(confirmedDeletedUuids),
+    dbTime
+  };
 };
 var DEFAULT_RESET_POLICY = {
   enabled: true,
@@ -15603,10 +16520,10 @@ var getMyConfigs2 = async (req, res) => {
       res.status(401).json({ success: false, error: "Unauthorized: No UID found" });
       return;
     }
-    const { configs, dbTime } = await getMyConfigs(uid, email, token);
+    const { configs, deletedUuids, dbTime } = await getMyConfigs(uid, email, token);
     const totalTime = Date.now() - reqStart;
     console.log(`[API Performance] [GET /api/vpn/my-configs] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
-    res.json({ success: true, configs });
+    res.json({ success: true, configs, deletedUuids });
   } catch (error) {
     const totalTime = Date.now() - reqStart;
     console.error(`[API Performance] [GET /api/vpn/my-configs] Request failed after ${totalTime}ms:`, error);
@@ -16040,13 +16957,26 @@ var trackOrder = async (req, res) => {
       return;
     }
     let vpnConfig = null;
+    let vpnAccount = null;
+    const db = supabaseAdmin || supabase;
     try {
-      const { data: cfgByOrder } = await supabase.from("vpn_configs").select("*").eq("order_id", orderRecord.id).maybeSingle();
+      const { data: cfgByOrder } = await db.from("vpn_configs").select("*").eq("order_id", orderRecord.id).maybeSingle();
       if (cfgByOrder) {
         vpnConfig = cfgByOrder;
       } else if (orderRecord.client_uuid) {
-        const { data: cfgByUuid } = await supabase.from("vpn_configs").select("*").eq("uuid", orderRecord.client_uuid).maybeSingle();
+        const { data: cfgByUuid } = await db.from("vpn_configs").select("*").eq("uuid", orderRecord.client_uuid).maybeSingle();
         vpnConfig = cfgByUuid;
+      }
+    } catch {
+    }
+    try {
+      const lookupUuid = String(orderRecord.client_uuid || vpnConfig?.uuid || "").trim();
+      const { data: accByOrder } = await db.from("vpn_accounts").select("*").eq("order_id", orderRecord.id).maybeSingle();
+      if (accByOrder) {
+        vpnAccount = accByOrder;
+      } else if (lookupUuid) {
+        const { data: accByUuid } = await db.from("vpn_accounts").select("*").ilike("uuid", lookupUuid).maybeSingle();
+        vpnAccount = accByUuid;
       }
     } catch {
     }
@@ -16060,8 +16990,13 @@ var trackOrder = async (req, res) => {
     const rawStatus = String(orderRecord.status || "").toLowerCase();
     const rawProv = String(orderRecord.provisioning_status || "").toLowerCase();
     const rawPay = String(orderRecord.payment_status || "").toLowerCase();
-    const resolvedClientUuid = String(orderRecord.client_uuid || vpnConfig?.uuid || "").trim() || null;
-    const resolvedVlessUrl = String(orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || "").trim() || null;
+    const vpnDeletedFromPanel = Boolean(
+      String(vpnConfig?.status || "").toLowerCase() === "deleted" || Boolean(vpnConfig?.deleted_from_panel_at) || String(vpnAccount?.status || "").toLowerCase() === "deleted" || Boolean(vpnAccount?.deleted_from_panel_at)
+    );
+    const deletedFromPanelAt = vpnAccount?.deleted_from_panel_at || vpnConfig?.deleted_from_panel_at || null;
+    const resolvedClientUuid = vpnDeletedFromPanel ? null : String(orderRecord.client_uuid || vpnConfig?.uuid || "").trim() || null;
+    const resolvedVlessUrl = vpnDeletedFromPanel ? null : String(orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || "").trim() || null;
+    const resolvedSubUrl = vpnDeletedFromPanel ? null : orderRecord.subscription_url || vpnConfig?.subscription_url || null;
     const hasVpnCredentials = Boolean(resolvedVlessUrl || resolvedClientUuid);
     const hasCompleteVpnCredentials = Boolean(resolvedVlessUrl && resolvedClientUuid);
     const isRejectedOrRevoked = Boolean(
@@ -16069,7 +17004,7 @@ var trackOrder = async (req, res) => {
     );
     const isFailedState = rawProv === "failed" || rawPay === "failed";
     const isConfirmedAutoActivated = Boolean(
-      !isRejectedOrRevoked && !isFailedState && hasCompleteVpnCredentials && (rawProv === "provisional" || rawProv === "completed" || rawProv === "active" || rawStatus === "completed" || rawStatus === "active")
+      !vpnDeletedFromPanel && !isRejectedOrRevoked && !isFailedState && hasCompleteVpnCredentials && (rawProv === "provisional" || rawProv === "completed" || rawProv === "active" || rawStatus === "completed" || rawStatus === "active")
     );
     let normalizedStage = "Pending";
     if (isRejectedOrRevoked) {
@@ -16085,10 +17020,17 @@ var trackOrder = async (req, res) => {
     } else {
       normalizedStage = "Pending";
     }
+    const sanitizedOrderBase = vpnDeletedFromPanel ? {
+      ...orderRecord,
+      client_uuid: null,
+      vless_url: null,
+      subscription_url: null,
+      vpn_credentials: null
+    } : orderRecord;
     res.json({
       success: true,
       order: {
-        ...orderRecord,
+        ...sanitizedOrderBase,
         orderId: orderRecord.order_id || orderRecord.id,
         customerId: orderRecord.customer_id,
         plan: extra.plan || orderRecord.package_name,
@@ -16099,13 +17041,15 @@ var trackOrder = async (req, res) => {
         provisioning_status: normalizedStage,
         rawProvisioningStatus: orderRecord.provisioning_status || null,
         autoActivated: isConfirmedAutoActivated,
+        vpnDeletedFromPanel,
+        deletedFromPanelAt,
         createdAt: orderRecord.created_at,
         activatedAt: orderRecord.activated_at || vpnConfig?.activated_at || null,
-        expiryDate: orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null,
-        inboundId: vpnConfig?.inbound_id || null,
+        expiryDate: vpnDeletedFromPanel ? null : orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null,
+        inboundId: vpnDeletedFromPanel ? null : vpnConfig?.inbound_id || null,
         clientUuid: resolvedClientUuid,
         vlessUrl: resolvedVlessUrl,
-        subscriptionUrl: orderRecord.subscription_url || vpnConfig?.subscription_url || null,
+        subscriptionUrl: resolvedSubUrl,
         dataLimit: vpnConfig?.data_limit || extra.dataLimit || null,
         reject_reason: orderRecord.reject_reason || null
       }
@@ -17723,8 +18667,19 @@ var getClientStatus = async (email, targetUuid, uid, token) => {
   }
   const myConfigsRes = await getMyConfigs(uid || "", email, token);
   const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : myConfigsRes.configs || [];
+  const deletedUuids = Array.isArray(myConfigsRes?.deletedUuids) ? myConfigsRes.deletedUuids.map((u) => String(u || "").trim().toLowerCase()).filter(Boolean) : [];
+  const deletedUuidSet = new Set(deletedUuids);
+  if (targetUuid && deletedUuidSet.has(String(targetUuid).trim().toLowerCase())) {
+    return {
+      _deleted: true,
+      deletedUuid: String(targetUuid).trim(),
+      deletedUuids
+    };
+  }
   const myConfigs = rawConfigs.filter((c) => {
     if (!c || c.isRejected === true || !c.uuid || !c.configUrl) return false;
+    const normUuid = String(c.uuid || "").trim().toLowerCase();
+    if (deletedUuidSet.has(normUuid)) return false;
     const st = String(c.status || "").toLowerCase().trim();
     const paySt = String(c.paymentStatus || "").toLowerCase().trim();
     const provSt = String(c.provisioningStatus || "").toLowerCase().trim();
@@ -17747,7 +18702,7 @@ var getClientStatus = async (email, targetUuid, uid, token) => {
       return true;
     });
     let selectedConfig = null;
-    if (activeUuid) {
+    if (activeUuid && !deletedUuidSet.has(String(activeUuid).trim().toLowerCase())) {
       selectedConfig = activeOnly.find((c) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase()) || myConfigs.find((c) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
     }
     if (!selectedConfig) {
@@ -17830,6 +18785,16 @@ var getStatus = async (req, res) => {
     const dbTime = Date.now() - dbStart;
     const totalTime = Date.now() - reqStart;
     console.log(`[API Performance] [GET /api/client/status] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
+    if (client && client._deleted === true) {
+      res.json({
+        success: true,
+        data: null,
+        deleted: true,
+        deletedUuid: client.deletedUuid || targetUuid || null,
+        deletedUuids: Array.isArray(client.deletedUuids) ? client.deletedUuids : []
+      });
+      return;
+    }
     res.json({ success: true, data: client });
   } catch (error) {
     const totalTime = Date.now() - reqStart;

@@ -2,6 +2,74 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { updateClientExpiry, addCalendarMonths, XuiInbound } from '../xuiService.js';
 
+function createIsolatedLockMockDb(options?: { failAcquireError?: string; busyLock?: boolean }) {
+  const heldLocks = new Map<string, string>();
+  const rpcCalls: Array<{ fn: string; args: Record<string, any> }> = [];
+
+  const dbClient = {
+    rpcCalls,
+    heldLocks,
+    async rpc(fn: string, args: Record<string, any>) {
+      rpcCalls.push({ fn, args });
+
+      if (fn === 'acquire_provisioning_lock') {
+        if (options?.failAcquireError) {
+          return {
+            data: null,
+            error: { message: options.failAcquireError, code: '42501' },
+          };
+        }
+        const key = String(args.p_operation_key);
+        if (options?.busyLock || heldLocks.has(key)) {
+          return {
+            data: [
+              {
+                acquired: false,
+                stale_recovery: false,
+                previous_status: 'in_progress',
+                holder_owner_id: heldLocks.get(key) || 'other-worker',
+              },
+            ],
+            error: null,
+          };
+        }
+        heldLocks.set(key, String(args.p_lock_owner_id));
+        return {
+          data: [
+            {
+              acquired: true,
+              stale_recovery: false,
+              previous_status: null,
+              holder_owner_id: args.p_lock_owner_id,
+            },
+          ],
+          error: null,
+        };
+      }
+
+      if (fn === 'renew_provisioning_lock') {
+        const key = String(args.p_operation_key);
+        return {
+          data: heldLocks.get(key) === String(args.p_lock_owner_id),
+          error: null,
+        };
+      }
+
+      if (fn === 'release_provisioning_lock') {
+        const key = String(args.p_operation_key);
+        if (heldLocks.get(key) === String(args.p_lock_owner_id)) {
+          heldLocks.delete(key);
+        }
+        return { data: true, error: null };
+      }
+
+      return { data: null, error: { message: `Unexpected RPC in isolated lock mock: ${fn}` } };
+    },
+  };
+
+  return dbClient;
+}
+
 test('updateClientExpiry re-enables an expired client (enable: false -> true), extends expiry, preserves all existing properties, and leaves unrelated clients untouched', async () => {
   const fixedNow = Date.UTC(2026, 10, 12, 12, 0, 0); // 2026-11-12T12:00:00Z
   const expiredTime = Date.UTC(2026, 10, 5, 12, 0, 0); // 2026-11-05T12:00:00Z (in the past)
@@ -60,6 +128,7 @@ test('updateClientExpiry re-enables an expired client (enable: false -> true), e
     },
   ];
 
+  const mockLockDb = createIsolatedLockMockDb();
   const capturedApiCalls: Array<{ endpoint: string; method?: string; data?: any }> = [];
 
   const result = await updateClientExpiry(
@@ -69,6 +138,7 @@ test('updateClientExpiry re-enables an expired client (enable: false -> true), e
     expiredTime,
     {
       nowMs: fixedNow,
+      dbClient: mockLockDb,
       getInboundsFn: async () => buildMockInbounds(),
       requestApiFn: async <T>(endpoint: string, method?: 'GET' | 'POST', data?: any): Promise<T> => {
         capturedApiCalls.push({ endpoint, method, data });
@@ -93,6 +163,12 @@ test('updateClientExpiry re-enables an expired client (enable: false -> true), e
   assert.equal(result.inboundId, 2);
   assert.equal(result.new_expiryMs, expectedExpiryMs);
   assert.equal(result.newTotalBytes, 200 * 1024 * 1024 * 1024);
+
+  // Verify durable inbound lock was acquired, renewed before mutation, and released cleanly
+  assert.ok(mockLockDb.rpcCalls.some((c) => c.fn === 'acquire_provisioning_lock' && c.args.p_operation_key === 'inbound:2'));
+  assert.ok(mockLockDb.rpcCalls.some((c) => c.fn === 'renew_provisioning_lock' && c.args.p_operation_key === 'inbound:2'));
+  assert.ok(mockLockDb.rpcCalls.some((c) => c.fn === 'release_provisioning_lock' && c.args.p_operation_key === 'inbound:2'));
+  assert.equal(mockLockDb.heldLocks.size, 0, 'Inbound lock must be released after renewal');
 
   // Verify the updated client in 3X-UI state has enable: true and all original properties preserved
   const renewedClient = liveClientsState.find((c) => c.id === targetUuid);
@@ -148,14 +224,24 @@ test('updateClientExpiry throws a clear error if 3X-UI fails to reactivate the c
     },
   ];
 
+  const mockLockDb = createIsolatedLockMockDb();
+
   await assert.rejects(
     async () => {
       await updateClientExpiry(targetUuid, 1, 'SIM Unlimited', expiredTime, {
         nowMs: fixedNow,
+        dbClient: mockLockDb,
         getInboundsFn: async () => mockInbounds, // Simulates 3X-UI still returning enable: false after update
         requestApiFn: async <T>(): Promise<T> => ({ success: true } as unknown as T),
       });
     },
     /Failed to verify 3X-UI client reactivation/
+  );
+
+  // Verify lock was released as failed even when reactivation verification threw
+  assert.equal(mockLockDb.heldLocks.size, 0, 'Inbound lock must be released on failure');
+  assert.ok(
+    mockLockDb.rpcCalls.some((c) => c.fn === 'release_provisioning_lock' && c.args.p_status === 'failed'),
+    'Lock release must record failed status'
   );
 });

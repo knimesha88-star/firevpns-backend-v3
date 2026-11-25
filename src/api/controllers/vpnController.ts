@@ -24,10 +24,10 @@ export const getMyConfigs = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    const { configs, dbTime } = await vpnService.getMyConfigs(uid, email, token);
+    const { configs, deletedUuids, dbTime } = await vpnService.getMyConfigs(uid, email, token);
     const totalTime = Date.now() - reqStart;
     console.log(`[API Performance] [GET /api/vpn/my-configs] Request finished | Total Execution: ${totalTime}ms | Database Time: ${dbTime}ms | 3X-UI Time: 0ms`);
-    res.json({ success: true, configs });
+    res.json({ success: true, configs, deletedUuids });
   } catch (error: any) {
     const totalTime = Date.now() - reqStart;
     console.error(`[API Performance] [GET /api/vpn/my-configs] Request failed after ${totalTime}ms:`, error);
@@ -601,10 +601,12 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // Also fetch associated VPN configuration if provisioned
+    // Also fetch associated VPN configuration & account if provisioned
     let vpnConfig: any = null;
+    let vpnAccount: any = null;
+    const db = supabaseAdmin || supabase;
     try {
-      const { data: cfgByOrder } = await supabase
+      const { data: cfgByOrder } = await db
         .from('vpn_configs')
         .select('*')
         .eq('order_id', orderRecord.id)
@@ -613,12 +615,32 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
       if (cfgByOrder) {
         vpnConfig = cfgByOrder;
       } else if (orderRecord.client_uuid) {
-        const { data: cfgByUuid } = await supabase
+        const { data: cfgByUuid } = await db
           .from('vpn_configs')
           .select('*')
           .eq('uuid', orderRecord.client_uuid)
           .maybeSingle();
         vpnConfig = cfgByUuid;
+      }
+    } catch {}
+
+    try {
+      const lookupUuid = String(orderRecord.client_uuid || vpnConfig?.uuid || '').trim();
+      const { data: accByOrder } = await db
+        .from('vpn_accounts')
+        .select('*')
+        .eq('order_id', orderRecord.id)
+        .maybeSingle();
+
+      if (accByOrder) {
+        vpnAccount = accByOrder;
+      } else if (lookupUuid) {
+        const { data: accByUuid } = await db
+          .from('vpn_accounts')
+          .select('*')
+          .ilike('uuid', lookupUuid)
+          .maybeSingle();
+        vpnAccount = accByUuid;
       }
     } catch {}
 
@@ -632,8 +654,24 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
     const rawStatus = String(orderRecord.status || '').toLowerCase();
     const rawProv = String(orderRecord.provisioning_status || '').toLowerCase();
     const rawPay = String(orderRecord.payment_status || '').toLowerCase();
-    const resolvedClientUuid = String(orderRecord.client_uuid || vpnConfig?.uuid || '').trim() || null;
-    const resolvedVlessUrl = String(orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || '').trim() || null;
+    const vpnDeletedFromPanel = Boolean(
+      String(vpnConfig?.status || '').toLowerCase() === 'deleted' ||
+      Boolean(vpnConfig?.deleted_from_panel_at) ||
+      String(vpnAccount?.status || '').toLowerCase() === 'deleted' ||
+      Boolean(vpnAccount?.deleted_from_panel_at)
+    );
+    const deletedFromPanelAt =
+      vpnAccount?.deleted_from_panel_at || vpnConfig?.deleted_from_panel_at || null;
+
+    const resolvedClientUuid = vpnDeletedFromPanel
+      ? null
+      : (String(orderRecord.client_uuid || vpnConfig?.uuid || '').trim() || null);
+    const resolvedVlessUrl = vpnDeletedFromPanel
+      ? null
+      : (String(orderRecord.vless_url || vpnConfig?.vless_link || vpnConfig?.vless_url || '').trim() || null);
+    const resolvedSubUrl = vpnDeletedFromPanel
+      ? null
+      : (orderRecord.subscription_url || vpnConfig?.subscription_url || null);
     const hasVpnCredentials = Boolean(resolvedVlessUrl || resolvedClientUuid);
     const hasCompleteVpnCredentials = Boolean(resolvedVlessUrl && resolvedClientUuid);
     const isRejectedOrRevoked = Boolean(
@@ -650,6 +688,7 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
     );
     const isFailedState = rawProv === 'failed' || rawPay === 'failed';
     const isConfirmedAutoActivated = Boolean(
+      !vpnDeletedFromPanel &&
       !isRejectedOrRevoked &&
       !isFailedState &&
       hasCompleteVpnCredentials &&
@@ -684,10 +723,21 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
       normalizedStage = 'Pending';
     }
 
+    // Preserve all historical order/payment fields while removing VPN connection details when deleted from 3X-UI
+    const sanitizedOrderBase = vpnDeletedFromPanel
+      ? {
+          ...orderRecord,
+          client_uuid: null,
+          vless_url: null,
+          subscription_url: null,
+          vpn_credentials: null,
+        }
+      : orderRecord;
+
     res.json({
       success: true,
       order: {
-        ...orderRecord,
+        ...sanitizedOrderBase,
         orderId: orderRecord.order_id || orderRecord.id,
         customerId: orderRecord.customer_id,
         plan: extra.plan || orderRecord.package_name,
@@ -698,13 +748,17 @@ export const trackOrder = async (req: AuthRequest, res: Response): Promise<void>
         provisioning_status: normalizedStage,
         rawProvisioningStatus: orderRecord.provisioning_status || null,
         autoActivated: isConfirmedAutoActivated,
+        vpnDeletedFromPanel,
+        deletedFromPanelAt,
         createdAt: orderRecord.created_at,
         activatedAt: orderRecord.activated_at || vpnConfig?.activated_at || null,
-        expiryDate: orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null,
-        inboundId: vpnConfig?.inbound_id || null,
+        expiryDate: vpnDeletedFromPanel
+          ? null
+          : (orderRecord.expiry_date || orderRecord.expires_at || vpnConfig?.expiry_date || vpnConfig?.expires_at || null),
+        inboundId: vpnDeletedFromPanel ? null : (vpnConfig?.inbound_id || null),
         clientUuid: resolvedClientUuid,
         vlessUrl: resolvedVlessUrl,
-        subscriptionUrl: orderRecord.subscription_url || vpnConfig?.subscription_url || null,
+        subscriptionUrl: resolvedSubUrl,
         dataLimit: vpnConfig?.data_limit || extra.dataLimit || null,
         reject_reason: orderRecord.reject_reason || null
       }

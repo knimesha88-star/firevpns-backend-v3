@@ -122,6 +122,37 @@ export const validateXuiPanelUrl = (urlStr: string): string => {
   return trimmed;
 };
 
+/**
+ * Computes a deterministic, opaque 3X-UI panel identity fingerprint from the
+ * configured 3X-UI panel URL (normalized scheme + host + explicit/default port + base path).
+ * Never derives panel identity from VLESS hostnames, CDN domains, SNI, or server display names.
+ */
+export const computePanelIdentity = (panelUrl: string): string => {
+  const trimmed = String(panelUrl || '').trim();
+  if (!trimmed) return '';
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return '';
+  }
+  const protocol = parsed.protocol.toLowerCase();
+  const hostname = parsed.hostname.toLowerCase();
+  const port = parsed.port || (protocol === 'https:' ? '443' : '80');
+  let basePath = parsed.pathname.replace(/\/+$/, '');
+  if (basePath.endsWith('/panel')) {
+    basePath = basePath.slice(0, -6);
+  }
+  const canonical = `${protocol}//${hostname}:${port}${basePath}`;
+  const hash = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  return `panel:${hash}`;
+};
+
+export const getCurrentPanelIdentity = async (forceRefresh = false): Promise<string> => {
+  const cfg = await getXuiConfig(forceRefresh);
+  return computePanelIdentity(cfg.panelUrl);
+};
+
 export const getXuiConfig = async (forceRefresh = false): Promise<XuiConfig> => {
   const now = Date.now();
   if (!forceRefresh && cachedXuiConfig && cachedXuiConfig.expiresAt > now) {
@@ -1625,6 +1656,7 @@ export async function withInboundWriteLock<T>(
     targetId: string;
     clientUuid?: string | null;
     requireDurableLock?: boolean;
+    allowUncertainRecovery?: boolean;
     maxWaitMs?: number;
   },
   fn: (assertInboundLockStillHeld: () => Promise<void>) => Promise<T>
@@ -1661,6 +1693,7 @@ export async function withInboundWriteLock<T>(
         leaseSeconds: INBOUND_LOCK_LEASE_SECONDS,
         metadata: { inboundId, targetId: params.targetId },
         requireDurableLock: params.requireDurableLock ?? isAutoActivateNewOrdersFlagEnabled(),
+        allowUncertainRecovery: params.allowUncertainRecovery,
       });
 
       if (res.acquired) {
@@ -1673,8 +1706,21 @@ export async function withInboundWriteLock<T>(
         throw new Error(res.error || `Unable to acquire durable inbound lock for inbound ${inboundId}.`);
       }
 
+      // Never spin or steal an uncertain inbound lock when allowUncertainRecovery is explicitly false
+      if (params.allowUncertainRecovery === false && res.previousStatus === 'uncertain') {
+        const uncertainErr: any = new Error(
+          `Inbound ${inboundId} has an uncertain prior provisioning lock; skipping without forcing recovery.`
+        );
+        uncertainErr.statusCode = 409;
+        uncertainErr.code = 'INBOUND_LOCK_UNCERTAIN';
+        throw uncertainErr;
+      }
+
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for durable inbound write lock on inbound ${inboundId}.`);
+        const busyErr: any = new Error(`Timed out waiting for durable inbound write lock on inbound ${inboundId}.`);
+        busyErr.statusCode = 409;
+        busyErr.code = 'INBOUND_LOCK_BUSY';
+        throw busyErr;
       }
 
       const backoffMs = Math.min(40 * attempt + Math.floor(Math.random() * 25), 250);
@@ -4018,18 +4064,16 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
   const syncStartTime = Date.now();
 
   try {
-    // 1. Fetch live 3X-UI inbounds once and cache them in memory.
-    // If it's forced or we need a fresh list, we can pass forceRefresh=true to getInbounds.
+    // 1. Fetch live 3X-UI inbounds once and cache them in memory for metadata/stats.
     const inbounds = await getInbounds(force);
 
-    // 2. Run trial cleanup & sync deleted clients
+    // 2. Run trial cleanup & authoritative uncached deleted-client sync
+    // NEVER pass cached inbounds into syncDeleted3XUiClients — it always performs fresh uncached panel reads.
     const trialCleanupResult = await cleanupExpiredTrials();
-    
+
     let deletedCount = 0;
-    if (inbounds && inbounds.length > 0) {
-      const syncResult = await syncDeleted3XUiClients(inbounds);
-      deletedCount = syncResult.deletedCount;
-    }
+    const syncResult = await syncDeleted3XUiClients();
+    deletedCount = syncResult.deletedCount;
 
     // 3. Run scheduled VPN expiry reminder & expiration email check (non-blocking)
     runScheduledExpiryEmailCheck().catch(expErr => {
@@ -4077,210 +4121,1340 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
   }
 };
 
+export interface StrictParsedInbound {
+  inbound: XuiInbound;
+  inboundId: number;
+  clients: XuiClient[];
+  clientUuidSet: Set<string>;
+}
+
+export type UncachedInboundReadResult =
+  | { status: 'found'; inbound: XuiInbound; clients: XuiClient[]; clientUuidSet: Set<string> }
+  | { status: 'not_found' }
+  | { status: 'error'; reason: string };
+
+export interface UncachedInboundsListReadResult {
+  ok: boolean;
+  reason?: string;
+  inbounds: XuiInbound[];
+  parsedByInboundId: Map<number, StrictParsedInbound>;
+  unparsedInboundIds: number[];
+  allInboundsCleanlyParsed: boolean;
+  liveClientByUuid: Map<string, { inbound: XuiInbound; client: XuiClient; stat: XuiClientStat | null }>;
+}
+
+export interface PanelIdentityVerificationInput {
+  currentPanelIdentity: string;
+  recordPanelIdentity?: string | null;
+  recordServerId?: string | null;
+  recordInboundId?: number | null;
+  recordOwnerUid?: string | null;
+  recordOwnerEmail?: string | null;
+  configuredServers?: Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>;
+}
+
+export interface PanelIdentityVerificationResult {
+  ok: boolean;
+  code:
+    | 'matched_explicit_panel_identity'
+    | 'matched_server_id'
+    | 'matched_single_panel_legacy'
+    | 'missing_current_panel_identity'
+    | 'missing_customer_ownership'
+    | 'missing_inbound_id'
+    | 'wrong_panel_identity'
+    | 'ambiguous_panel_identity';
+  reason: string;
+}
+
+export interface VerifyAndMarkDeletedParams {
+  clientUuid: string;
+  inboundId: number | null;
+  userId?: string | null;
+  userEmail?: string | null;
+  recordPanelIdentity?: string | null;
+  recordServerId?: string | null;
+  createdAt?: string | null;
+  existingStatus?: string | null;
+  deletedFromPanelAt?: string | null;
+  source?: 'background_sync' | 'customer_read' | 'admin_sync';
+  dbClient?: any;
+  currentPanelIdentity?: string;
+  configuredServers?: Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>;
+  fetchUncachedInbound?: (inboundId: number) => Promise<UncachedInboundReadResult>;
+  fetchUncachedInboundsList?: () => Promise<UncachedInboundsListReadResult>;
+  reReadDelayMs?: number;
+  nowMs?: number;
+}
+
+export interface VerifyAndMarkDeletedResult {
+  confirmedDeleted: boolean;
+  alreadyDeleted?: boolean;
+  applied?: boolean;
+  reconciliationRequired?: boolean;
+  unresolvedGrantCount?: number;
+  auditLogged?: boolean;
+  manualReviewFlagged?: boolean;
+  dbWrites: number;
+  reason: string;
+}
+
+export interface SyncDeletedClientsOptions {
+  dbClient?: any;
+  currentPanelIdentity?: string;
+  configuredServers?: Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>;
+  fetchUncachedInbound?: (inboundId: number) => Promise<UncachedInboundReadResult>;
+  fetchUncachedInboundsList?: () => Promise<UncachedInboundsListReadResult>;
+  reReadDelayMs?: number;
+  nowMs?: number;
+}
+
+export interface SyncDeletedClientsResult {
+  synced: boolean;
+  deletedCount: number;
+  restoredCount: number;
+  skippedCount: number;
+  manualReviewCount: number;
+  reconciliationFlaggedCount: number;
+  details?: Array<{ clientUuid: string; outcome: string; reason: string }>;
+}
+
 /**
- * Automatically synchronizes 3X-UI panel clients with local database (vpn_accounts, vpn_configs, orders).
- * Verifies that every stored VPN UUID still exists in the corresponding 3X-UI panel.
- * If a client no longer exists in 3X-UI (deleted manually or otherwise), automatically removes or archives
- * the matching records so they no longer appear on the customer's dashboard or configuration list.
- * Fault-tolerant: if 3X-UI panel is temporarily unavailable, does NOT delete anything and retries next cycle.
+ * Strictly parses inbound.settings.clients[].
+ * Never uses clientStats as proof of client existence and rejects malformed JSON or missing arrays.
  */
-export const syncDeleted3XUiClients = async (inboundsOverride?: XuiInbound[]): Promise<{ synced: boolean; deletedCount: number }> => {
-  console.log('[3X-UI Sync] Starting VPN client synchronization check with 3X-UI panel...');
+export const parseInboundSettingsClientsStrict = (
+  inbound: any
+): { ok: true; inboundId: number; clients: XuiClient[]; clientUuidSet: Set<string> } | { ok: false; reason: string } => {
+  if (!inbound || typeof inbound !== 'object') {
+    return { ok: false, reason: 'inbound_not_object' };
+  }
+  const inboundId = Number(inbound.id);
+  if (!Number.isInteger(inboundId) || inboundId <= 0) {
+    return { ok: false, reason: 'invalid_inbound_id' };
+  }
+  if (inbound.settings === null || inbound.settings === undefined) {
+    return { ok: false, reason: 'missing_settings' };
+  }
 
-  let inbounds: XuiInbound[] = [];
-  if (inboundsOverride && Array.isArray(inboundsOverride) && inboundsOverride.length > 0) {
-    inbounds = inboundsOverride;
+  let parsedSettings: any = null;
+  if (typeof inbound.settings === 'string') {
+    const trimmed = inbound.settings.trim();
+    if (!trimmed) {
+      return { ok: false, reason: 'empty_settings_string' };
+    }
+    try {
+      parsedSettings = JSON.parse(trimmed);
+    } catch {
+      return { ok: false, reason: 'malformed_settings_json' };
+    }
+  } else if (typeof inbound.settings === 'object') {
+    parsedSettings = inbound.settings;
   } else {
-    try {
-      const endpoint = '/panel/api/inbounds/list';
-      const inboundsData = await requestApi<XuiInbound[]>(endpoint);
-      if (!Array.isArray(inboundsData)) {
-        console.warn('[3X-UI Sync] 3X-UI panel returned non-array inbounds response. Skipping deletion check for safety.');
-        return { synced: false, deletedCount: 0 };
-      }
-      inbounds = inboundsData;
-      setCachedInbounds(inbounds);
-    } catch (error: any) {
-      console.warn(`[3X-UI Sync] 3X-UI panel is temporarily unavailable. Skipping deletion/sync cycle and will retry on next cycle. Error: ${error.message || error}`);
-      return { synced: false, deletedCount: 0 };
+    return { ok: false, reason: 'invalid_settings_type' };
+  }
+
+  if (!parsedSettings || typeof parsedSettings !== 'object' || !Array.isArray(parsedSettings.clients)) {
+    return { ok: false, reason: 'missing_clients_array' };
+  }
+
+  const clients: XuiClient[] = parsedSettings.clients;
+  const clientUuidSet = new Set<string>();
+  for (const c of clients) {
+    if (c && typeof c === 'object' && typeof c.id === 'string' && c.id.trim()) {
+      clientUuidSet.add(c.id.trim().toLowerCase());
     }
   }
 
-  // Build the set of all live client UUIDs currently existing in 3X-UI panel across all inbounds
-  const live3XUiUuids = new Set<string>();
+  return { ok: true, inboundId, clients, clientUuidSet };
+};
 
-  for (const ib of inbounds) {
-    let settingsObj: { clients?: XuiClient[] } = {};
-    try {
-      if (ib.settings) {
-        settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
-      }
-    } catch (e) {
-      console.warn('[3X-UI Sync] Warning parsing inbound settings during sync:', e);
-    }
-
-    const clients = settingsObj.clients || [];
-    for (const c of clients) {
-      if (c.id) {
-        live3XUiUuids.add(String(c.id).trim().toLowerCase());
-      }
-    }
-
-    const clientStats = ib.clientStats || [];
-    for (const s of clientStats) {
-      if (s.id) {
-        live3XUiUuids.add(String(s.id).trim().toLowerCase());
-      }
-    }
+/**
+ * Performs a fresh, uncached live read of a single 3X-UI inbound via /panel/api/inbounds/get/{id}.
+ * Never reads liveInboundCache or cachedInbounds.
+ */
+export const fetchUncachedLiveInboundById = async (
+  inboundId: number
+): Promise<UncachedInboundReadResult> => {
+  const normalizedId = Number(inboundId);
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+    return { status: 'error', reason: 'invalid_inbound_id' };
   }
-
-  console.log(`[3X-UI Sync] 3X-UI panel reachable. Found ${live3XUiUuids.size} active client UUIDs across ${inbounds.length} inbounds.`);
-
-  let deletedCount = 0;
-  const dbClient = supabaseAdmin;
-  const now = Date.now();
-  const RECENT_PROVISION_GRACE_PERIOD_MS = 30000; // 30 seconds grace period for brand new records
-  const timestamp = new Date().toISOString();
 
   try {
-    // Collect IDs for bulk database updates instead of N+1 individual updates
-    const accIdsToDisable: string[] = [];
-    const cfgIdsToDisable: string[] = [];
-    const orderIdsToExpire: string[] = [];
+    const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET');
+    const inbound = res && typeof res === 'object' && 'obj' in res ? res.obj : res;
 
-    // 1. Sync vpn_accounts table
-    const { data: accounts, error: accError } = await dbClient.from('vpn_accounts').select('id, uuid, status, enable, created_at, email, order_id');
-    if (accError) {
-      console.error('[3X-UI Sync] Error querying vpn_accounts:', accError.message || accError);
-    } else if (accounts && Array.isArray(accounts)) {
-      for (const acc of accounts) {
-        const uuid = acc.uuid ? String(acc.uuid).trim().toLowerCase() : '';
-        const currentStatus = String(acc.status || '').toLowerCase();
-
-        if (currentStatus === 'disabled' || currentStatus === 'expired' || acc.enable === false) {
-          continue;
-        }
-
-        if (acc.created_at) {
-          const createdAtMs = new Date(acc.created_at).getTime();
-          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
-            continue;
-          }
-        }
-
-        if (uuid && !live3XUiUuids.has(uuid)) {
-          accIdsToDisable.push(acc.id);
-        }
-      }
+    if (inbound === null || inbound === undefined) {
+      return { status: 'not_found' };
     }
 
-    // 2. Sync vpn_configs table
-    const { data: configs, error: cfgError } = await dbClient.from('vpn_configs').select('id, uuid, status, enabled, created_at, order_id');
-    if (cfgError) {
-      console.error('[3X-UI Sync] Error querying vpn_configs:', cfgError.message || cfgError);
-    } else if (configs && Array.isArray(configs)) {
-      for (const cfg of configs) {
-        const uuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : '';
-        const currentStatus = String(cfg.status || '').toLowerCase();
-
-        if (currentStatus === 'disabled' || currentStatus === 'expired' || cfg.enabled === false) {
-          continue;
-        }
-
-        if (cfg.created_at) {
-          const createdAtMs = new Date(cfg.created_at).getTime();
-          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
-            continue;
-          }
-        }
-
-        if (uuid && !live3XUiUuids.has(uuid)) {
-          cfgIdsToDisable.push(cfg.id);
-        }
-      }
+    if (typeof inbound !== 'object') {
+      return { status: 'error', reason: 'malformed_inbound_payload' };
     }
 
-    // 3. Sync orders table
-    const { data: orders, error: ordError } = await dbClient.from('orders').select('id, client_uuid, uuid, vpn_credentials, status, created_at');
-    if (!ordError && orders && Array.isArray(orders)) {
-      for (const ord of orders) {
-        const uuid = (ord.client_uuid || ord.uuid || ord.vpn_credentials?.password || '').trim().toLowerCase();
-        const currentStatus = String(ord.status || '').toLowerCase();
-
-        if (
-          currentStatus === 'expired' ||
-          currentStatus === 'disabled' ||
-          currentStatus === 'cancelled' ||
-          currentStatus === 'rejected' ||
-          currentStatus === 'pending'
-        ) {
-          continue;
-        }
-
-        if (ord.created_at) {
-          const createdAtMs = new Date(ord.created_at).getTime();
-          if (!isNaN(createdAtMs) && (now - createdAtMs < RECENT_PROVISION_GRACE_PERIOD_MS)) {
-            continue;
-          }
-        }
-
-        if (uuid && !live3XUiUuids.has(uuid)) {
-          orderIdsToExpire.push(ord.id);
-        }
-      }
+    if (Number(inbound.id) !== normalizedId) {
+      return { status: 'error', reason: 'inbound_id_mismatch' };
     }
 
-    // Perform bulk database updates
-    if (accIdsToDisable.length > 0) {
-      console.log(`[3X-UI Sync] Bulk updating ${accIdsToDisable.length} vpn_accounts to 'disabled'...`);
-      const { error: updateAccErr } = await dbClient
-        .from('vpn_accounts')
-        .update({ status: 'disabled', enable: false, updated_at: timestamp })
-        .in('id', accIdsToDisable);
-
-      if (updateAccErr) {
-        console.error('[3X-UI Sync] Bulk update error for vpn_accounts:', updateAccErr.message || updateAccErr);
-      } else {
-        deletedCount += accIdsToDisable.length;
-      }
+    const parsed = parseInboundSettingsClientsStrict(inbound);
+    if ('reason' in parsed) {
+      return { status: 'error', reason: parsed.reason };
     }
 
-    if (cfgIdsToDisable.length > 0) {
-      console.log(`[3X-UI Sync] Bulk updating ${cfgIdsToDisable.length} vpn_configs to 'disabled'...`);
-      const { error: updateCfgErr } = await dbClient
-        .from('vpn_configs')
-        .update({ status: 'disabled', enabled: false, updated_at: timestamp })
-        .in('id', cfgIdsToDisable);
-
-      if (updateCfgErr) {
-        console.error('[3X-UI Sync] Bulk update error for vpn_configs:', updateCfgErr.message || updateCfgErr);
-      } else {
-        deletedCount += cfgIdsToDisable.length;
-      }
-    }
-
-    if (orderIdsToExpire.length > 0) {
-      console.log(`[3X-UI Sync] Bulk updating ${orderIdsToExpire.length} orders to 'expired'...`);
-      const { error: updateOrdErr } = await dbClient
-        .from('orders')
-        .update({ status: 'expired', payment_status: 'Expired', updated_at: timestamp })
-        .in('id', orderIdsToExpire);
-
-      if (updateOrdErr) {
-        console.error('[3X-UI Sync] Bulk update error for orders:', updateOrdErr.message || updateOrdErr);
-      }
-    }
-
-    if (deletedCount > 0) {
-      console.log(`[3X-UI Sync] Synchronization completed. Removed/archived ${deletedCount} records for client UUIDs deleted from 3X-UI.`);
-    } else {
-      console.log('[3X-UI Sync] Synchronization completed. All stored VPN UUIDs exist in 3X-UI panel.');
-    }
-
-    return { synced: true, deletedCount };
+    return {
+      status: 'found',
+      inbound: inbound as XuiInbound,
+      clients: parsed.clients,
+      clientUuidSet: parsed.clientUuidSet,
+    };
   } catch (err: any) {
-    console.error('[3X-UI Sync] Unexpected error during synchronization cycle:', err.message || err);
-    return { synced: false, deletedCount: 0 };
+    return {
+      status: 'error',
+      reason: err?.message || 'network_or_panel_error',
+    };
+  }
+};
+
+/**
+ * Performs a fresh, uncached live read of all 3X-UI inbounds via /panel/api/inbounds/list.
+ * Never reads or returns cachedInbounds on error.
+ */
+export const fetchUncachedLiveInboundsList = async (): Promise<UncachedInboundsListReadResult> => {
+  try {
+    const rawList = await requestApi<XuiInbound[]>('/panel/api/inbounds/list', 'GET');
+    if (!Array.isArray(rawList)) {
+      return {
+        ok: false,
+        reason: 'non_array_inbounds_response',
+        inbounds: [],
+        parsedByInboundId: new Map(),
+        unparsedInboundIds: [],
+        allInboundsCleanlyParsed: false,
+        liveClientByUuid: new Map(),
+      };
+    }
+
+    const parsedByInboundId = new Map<number, StrictParsedInbound>();
+    const unparsedInboundIds: number[] = [];
+    const liveClientByUuid = new Map<string, { inbound: XuiInbound; client: XuiClient; stat: XuiClientStat | null }>();
+
+    for (const ib of rawList) {
+      const parsed = parseInboundSettingsClientsStrict(ib);
+      if (!parsed.ok) {
+        const rawId = Number(ib?.id);
+        unparsedInboundIds.push(Number.isInteger(rawId) && rawId > 0 ? rawId : -1);
+        continue;
+      }
+
+      parsedByInboundId.set(parsed.inboundId, {
+        inbound: ib,
+        inboundId: parsed.inboundId,
+        clients: parsed.clients,
+        clientUuidSet: parsed.clientUuidSet,
+      });
+
+      const stats = Array.isArray(ib.clientStats) ? ib.clientStats : [];
+      for (const c of parsed.clients) {
+        const normUuid = String(c?.id || '').trim().toLowerCase();
+        if (!normUuid) continue;
+        const cEmail = String(c?.email || '').trim().toLowerCase();
+        const stat =
+          stats.find((s: any) => s && s.email && String(s.email).trim().toLowerCase() === cEmail) ||
+          null;
+        liveClientByUuid.set(normUuid, { inbound: ib, client: c, stat });
+      }
+    }
+
+    return {
+      ok: true,
+      inbounds: rawList,
+      parsedByInboundId,
+      unparsedInboundIds,
+      allInboundsCleanlyParsed: unparsedInboundIds.length === 0,
+      liveClientByUuid,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      reason: err?.message || 'panel_unreachable',
+      inbounds: [],
+      parsedByInboundId: new Map(),
+      unparsedInboundIds: [],
+      allInboundsCleanlyParsed: false,
+      liveClientByUuid: new Map(),
+    };
+  }
+};
+
+/**
+ * Verifies panel identity, customer ownership, and inbound association strictly.
+ * Never uses VLESS hostnames, CDN domains, SNI, or server display names.
+ */
+export const verifyRecordPanelIdentity = (
+  input: PanelIdentityVerificationInput
+): PanelIdentityVerificationResult => {
+  const currentPanelId = String(input.currentPanelIdentity || '').trim();
+  if (!currentPanelId) {
+    return {
+      ok: false,
+      code: 'missing_current_panel_identity',
+      reason: 'Active 3X-UI panel identity could not be resolved.',
+    };
+  }
+
+  const ownerUid = String(input.recordOwnerUid || '').trim();
+  if (!ownerUid) {
+    return {
+      ok: false,
+      code: 'missing_customer_ownership',
+      reason: 'VPN record is missing verified customer user_id ownership.',
+    };
+  }
+
+  const inboundId = Number(input.recordInboundId);
+  if (!Number.isInteger(inboundId) || inboundId <= 0) {
+    return {
+      ok: false,
+      code: 'missing_inbound_id',
+      reason: 'VPN record is missing an authoritative inbound_id.',
+    };
+  }
+
+  const recordPanelId = String(input.recordPanelIdentity || '').trim();
+  if (recordPanelId) {
+    if (recordPanelId !== currentPanelId) {
+      return {
+        ok: false,
+        code: 'wrong_panel_identity',
+        reason: `Record panel_identity (${recordPanelId}) does not match active panel (${currentPanelId}).`,
+      };
+    }
+    return {
+      ok: true,
+      code: 'matched_explicit_panel_identity',
+      reason: 'Exact panel_identity match verified.',
+    };
+  }
+
+  const configuredServers = Array.isArray(input.configuredServers) ? input.configuredServers : [];
+  const recordServerId = String(input.recordServerId || '').trim();
+  if (recordServerId) {
+    const matchedServer = configuredServers.find((s) => String(s?.id || '').trim() === recordServerId);
+    if (!matchedServer || !matchedServer.panel_url) {
+      return {
+        ok: false,
+        code: 'ambiguous_panel_identity',
+        reason: `Record references server_id '${recordServerId}' whose panel URL cannot be resolved.`,
+      };
+    }
+    const serverPanelId = computePanelIdentity(matchedServer.panel_url);
+    if (!serverPanelId || serverPanelId !== currentPanelId) {
+      return {
+        ok: false,
+        code: 'wrong_panel_identity',
+        reason: `Record server_id '${recordServerId}' belongs to a different panel (${serverPanelId || 'unknown'}) than active panel (${currentPanelId}).`,
+      };
+    }
+    return {
+      ok: true,
+      code: 'matched_server_id',
+      reason: 'Server ID resolved unambiguously to active panel identity.',
+    };
+  }
+
+  // Legacy row without panel_identity or server_id: ONLY allow if no configured active server points to a different panel.
+  const distinctExternalPanel = configuredServers.find((s) => {
+    if (s?.is_active === false) return false;
+    if (!s?.panel_url) return false;
+    const pid = computePanelIdentity(s.panel_url);
+    return Boolean(pid && pid !== currentPanelId);
+  });
+
+  if (distinctExternalPanel) {
+    return {
+      ok: false,
+      code: 'ambiguous_panel_identity',
+      reason: 'Multiple 3X-UI panels are configured and legacy record has no explicit panel_identity or server_id.',
+    };
+  }
+
+  return {
+    ok: true,
+    code: 'matched_single_panel_legacy',
+    reason: 'Single-panel deployment with verified customer ownership and authoritative inbound_id.',
+  };
+};
+
+const loadConfiguredXuiServers = async (
+  dbClient: any
+): Promise<Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>> => {
+  if (!dbClient || typeof dbClient.from !== 'function') return [];
+  try {
+    const { data, error } = await dbClient
+      .from('xui_servers')
+      .select('id, panel_url, is_active');
+    if (error || !Array.isArray(data)) return [];
+    return data;
+  } catch {
+    return [];
+  }
+};
+
+const recordDeduplicatedSyncAuditLog = async (params: {
+  dbClient: any;
+  userId?: string | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  details: Record<string, any>;
+  dedupeWindowHours?: number;
+}): Promise<boolean> => {
+  const { dbClient, userId, action, targetType, targetId, details } = params;
+  const dedupeWindowHours = params.dedupeWindowHours ?? 24;
+  if (!dbClient || typeof dbClient.from !== 'function') return false;
+
+  try {
+    const cutoffIso = new Date(Date.now() - dedupeWindowHours * 60 * 60 * 1000).toISOString();
+    const { data: existing } = await dbClient
+      .from('audit_logs')
+      .select('id')
+      .eq('action', action)
+      .eq('target_type', targetType)
+      .eq('target_id', targetId)
+      .gte('created_at', cutoffIso)
+      .limit(1);
+
+    if (Array.isArray(existing) && existing.length > 0) {
+      return false;
+    }
+
+    const { error: insertErr } = await dbClient.from('audit_logs').insert({
+      user_id: userId || null,
+      action,
+      target_type: targetType,
+      target_id: targetId,
+      details,
+    });
+    return !insertErr;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Authoritative, lock-coordinated, fresh uncached two-read deletion verifier and marker.
+ *
+ * Guarantees:
+ * - Never treats stale caches, clientStats IDs, network errors, timeouts, malformed JSON,
+ *   or incomplete inbound payloads as evidence of deletion.
+ * - Requires reliable panel identity, customer ownership, and authoritative inbound association.
+ * - Acquires durable client (`client:<uuid>`) then inbound (`inbound:<inboundId>`) locks
+ *   in the established lock order with `allowUncertainRecovery: false` (never steals/forces locks).
+ * - Performs TWO independent fresh, uncached reads inside the locks before marking deleted.
+ * - Updates DB ONLY atomically and idempotently via `mark_vpn_client_panel_deleted` RPC.
+ *   If the atomic RPC is missing, unavailable, returns an error, or returns a skip_reason,
+ *   deletion synchronization fails CLOSED with ZERO independent database updates.
+ * - Never mutates historical financial records (`orders`, `renew_requests`, `payment_receipt_claims`, `vpn_entitlement_grants`).
+ */
+export const verifyAndMarkClientDeletedIfConfirmed = async (
+  params: VerifyAndMarkDeletedParams
+): Promise<VerifyAndMarkDeletedResult> => {
+  const normUuid = String(params.clientUuid || '').trim().toLowerCase();
+  if (!normUuid) {
+    return { confirmedDeleted: false, dbWrites: 0, reason: 'missing_client_uuid' };
+  }
+
+  // Never resurrect or re-write an already confirmed deleted configuration
+  const existingStatus = String(params.existingStatus || '').trim().toLowerCase();
+  if (existingStatus === 'deleted' || Boolean(params.deletedFromPanelAt)) {
+    return {
+      confirmedDeleted: true,
+      alreadyDeleted: true,
+      applied: false,
+      dbWrites: 0,
+      reason: 'already_deleted',
+    };
+  }
+
+  const nowMs = params.nowMs ?? Date.now();
+  const RECENT_PROVISION_GRACE_MS = 60 * 1000;
+  if (params.createdAt) {
+    const createdAtMs = new Date(params.createdAt).getTime();
+    if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS) {
+      return {
+        confirmedDeleted: false,
+        dbWrites: 0,
+        reason: 'recent_provision_grace_period',
+      };
+    }
+  }
+
+  const dbClient = params.dbClient || supabaseAdmin;
+  let currentPanelIdentity = String(params.currentPanelIdentity || '').trim();
+  if (!currentPanelIdentity) {
+    try {
+      currentPanelIdentity = await getCurrentPanelIdentity();
+    } catch {
+      return {
+        confirmedDeleted: false,
+        dbWrites: 0,
+        reason: 'panel_identity_unavailable',
+      };
+    }
+  }
+
+  const configuredServers =
+    params.configuredServers !== undefined
+      ? params.configuredServers
+      : await loadConfiguredXuiServers(dbClient);
+
+  const identityCheck = verifyRecordPanelIdentity({
+    currentPanelIdentity,
+    recordPanelIdentity: params.recordPanelIdentity,
+    recordServerId: params.recordServerId,
+    recordInboundId: params.inboundId,
+    recordOwnerUid: params.userId,
+    recordOwnerEmail: params.userEmail,
+    configuredServers,
+  });
+
+  if (!identityCheck.ok) {
+    const auditAction =
+      identityCheck.code === 'wrong_panel_identity'
+        ? 'panel_deletion_wrong_panel_identity'
+        : 'panel_deletion_ambiguous_identity';
+
+    await recordDeduplicatedSyncAuditLog({
+      dbClient,
+      userId: params.userId || null,
+      action: auditAction,
+      targetType: 'vpn_client',
+      targetId: normUuid,
+      details: {
+        client_uuid: normUuid,
+        inbound_id: params.inboundId ?? null,
+        current_panel_identity: currentPanelIdentity || null,
+        record_panel_identity: params.recordPanelIdentity || null,
+        record_server_id: params.recordServerId || null,
+        code: identityCheck.code,
+        reason: identityCheck.reason,
+        source: params.source || 'background_sync',
+      },
+    });
+
+    return {
+      confirmedDeleted: false,
+      manualReviewFlagged: true,
+      dbWrites: 0,
+      reason: identityCheck.code,
+    };
+  }
+
+  const inboundId = Number(params.inboundId);
+  const readInbound = params.fetchUncachedInbound || fetchUncachedLiveInboundById;
+  const readList = params.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
+  const reReadDelayMs = params.reReadDelayMs ?? 150;
+
+  // Verify fresh uncached absence for a single read pass
+  const performSingleAuthoritativeAbsenceRead = async (
+    readLabel: 'read1' | 'read2'
+  ): Promise<{ absent: boolean; reason: string; inboundMissing?: boolean }> => {
+    const directRes = await readInbound(inboundId);
+    if (directRes.status === 'error') {
+      return { absent: false, reason: `${readLabel}_error:${directRes.reason}` };
+    }
+
+    if (directRes.status === 'found') {
+      if (directRes.clientUuidSet.has(normUuid)) {
+        return { absent: false, reason: `${readLabel}_client_present` };
+      }
+      return { absent: true, reason: `${readLabel}_confirmed_absent_from_inbound` };
+    }
+
+    // directRes.status === 'not_found': NEVER assume deletion from an empty get/{id} alone!
+    // Require a fresh, uncached, 100%-cleanly-parsed non-empty /inbounds/list confirming that
+    // the inbound truly does not exist AND the client UUID does not exist on any other inbound.
+    const listRes = await readList();
+    if (!listRes.ok || !listRes.allInboundsCleanlyParsed || listRes.inbounds.length === 0) {
+      return {
+        absent: false,
+        reason: `${readLabel}_inbound_missing_unverified_list:${listRes.reason || 'incomplete_or_empty_list'}`,
+      };
+    }
+
+    if (listRes.parsedByInboundId.has(inboundId)) {
+      const ibEntry = listRes.parsedByInboundId.get(inboundId)!;
+      if (ibEntry.clientUuidSet.has(normUuid)) {
+        return { absent: false, reason: `${readLabel}_client_present_in_list` };
+      }
+      return { absent: true, reason: `${readLabel}_confirmed_absent_from_list_inbound` };
+    }
+
+    if (listRes.liveClientByUuid.has(normUuid)) {
+      return { absent: false, reason: `${readLabel}_client_moved_to_another_inbound` };
+    }
+
+    return { absent: true, inboundMissing: true, reason: `${readLabel}_inbound_and_client_confirmed_absent` };
+  };
+
+  // Acquire durable locks in the established order: client:<uuid> -> inbound:<inboundId>
+  // NEVER force-release or steal existing/uncertain locks (allowUncertainRecovery: false).
+  try {
+    return await withClientMutationLock(
+      {
+        dbClient,
+        clientUuid: normUuid,
+        operationType: 'client_lock',
+        targetId: `panel-delete-sync:${normUuid}`,
+        requireDurableLock: true,
+        allowUncertainRecovery: false,
+        metadata: {
+          syncSource: params.source || 'background_sync',
+          inboundId,
+          panelIdentity: currentPanelIdentity,
+        },
+      },
+      async (assertClientLockStillHeld) => {
+        return await withInboundWriteLock(
+          {
+            dbClient,
+            inboundId,
+            targetId: `panel-delete-sync:${normUuid}`,
+            clientUuid: normUuid,
+            requireDurableLock: true,
+            allowUncertainRecovery: false,
+            maxWaitMs: 2000,
+          },
+          async (assertInboundLockStillHeld) => {
+            await assertClientLockStillHeld();
+            await assertInboundLockStillHeld();
+
+            // Fresh uncached Read 1
+            const read1 = await performSingleAuthoritativeAbsenceRead('read1');
+            if (!read1.absent) {
+              return {
+                confirmedDeleted: false,
+                dbWrites: 0,
+                reason: read1.reason,
+              };
+            }
+
+            if (reReadDelayMs > 0) {
+              await new Promise((r) => setTimeout(r, reReadDelayMs));
+            }
+
+            // Re-fence both locks right before Read 2 and DB commit
+            await assertClientLockStillHeld();
+            await assertInboundLockStillHeld();
+
+            // Fresh uncached Read 2
+            const read2 = await performSingleAuthoritativeAbsenceRead('read2');
+            if (!read2.absent) {
+              return {
+                confirmedDeleted: false,
+                dbWrites: 0,
+                reason: read2.reason,
+              };
+            }
+
+            const reason = 'confirmed_absent_two_fresh_uncached_reads';
+            const details = {
+              source: params.source || 'background_sync',
+              identity_match: identityCheck.code,
+              read1_reason: read1.reason,
+              read2_reason: read2.reason,
+              inbound_missing: Boolean(read1.inboundMissing && read2.inboundMissing),
+            };
+
+            // Atomic & idempotent database deletion marking via service-role RPC ONLY.
+            // FAIL CLOSED: Never fall back to independent non-atomic table updates if the RPC
+            // is missing, unavailable, returns an error, or rejects the record with a skip_reason.
+            if (!dbClient || typeof dbClient.rpc !== 'function') {
+              console.error(
+                `[3X-UI Sync] Fail closed for ${normUuid}: atomic deletion RPC client is unavailable.`
+              );
+              return {
+                confirmedDeleted: false,
+                applied: false,
+                dbWrites: 0,
+                reason: 'rpc_unavailable',
+              };
+            }
+
+            let rpcData: any = null;
+            let rpcErr: any = null;
+            try {
+              const rpcRes = await dbClient.rpc('mark_vpn_client_panel_deleted', {
+                p_client_uuid: normUuid,
+                p_inbound_id: inboundId,
+                p_panel_identity: currentPanelIdentity,
+                p_user_id: params.userId || null,
+                p_reason: reason,
+                p_details: details,
+              });
+              rpcData = rpcRes?.data;
+              rpcErr = rpcRes?.error;
+            } catch (rpcException: any) {
+              rpcErr = rpcException;
+            }
+
+            if (rpcErr) {
+              console.error(
+                `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted RPC unavailable or failed for ${normUuid}:`,
+                rpcErr?.message || rpcErr
+              );
+              return {
+                confirmedDeleted: false,
+                applied: false,
+                dbWrites: 0,
+                reason: isMissingSchemaOrRpcError(rpcErr)
+                  ? `rpc_missing:${rpcErr?.message || 'not_installed'}`
+                  : `rpc_error:${rpcErr?.message || 'unknown'}`,
+              };
+            }
+
+            const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+            if (!row || typeof row !== 'object') {
+              console.error(
+                `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted returned empty response for ${normUuid}.`
+              );
+              return {
+                confirmedDeleted: false,
+                applied: false,
+                dbWrites: 0,
+                reason: 'rpc_empty_response',
+              };
+            }
+
+            if (row.skip_reason && !row.already_deleted) {
+              console.warn(
+                `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted skipped ${normUuid} (skip_reason=${row.skip_reason}).`
+              );
+              return {
+                confirmedDeleted: false,
+                applied: false,
+                dbWrites: 0,
+                reason: `rpc_skipped:${row.skip_reason}`,
+              };
+            }
+
+            const applied = Boolean(row.applied);
+            const alreadyDeleted = Boolean(row.already_deleted);
+            if (!applied && !alreadyDeleted) {
+              console.warn(
+                `[3X-UI Sync] Fail closed: mark_vpn_client_panel_deleted neither applied nor confirmed already_deleted for ${normUuid}.`
+              );
+              return {
+                confirmedDeleted: false,
+                applied: false,
+                dbWrites: 0,
+                reason: 'rpc_not_applied',
+              };
+            }
+
+            const reconciliationRequired = Boolean(row.reconciliation_required);
+            const unresolvedGrantCount = Number(row.unresolved_grant_count || 0);
+            const auditLogged = Boolean(row.audit_log_inserted ?? row.audit_logged);
+            const dbWrites = applied ? 1 : 0;
+
+            // Invalidate in-memory inbound cache so subsequent reads reflect the confirmed deletion immediately
+            invalidateInboundCache(inboundId);
+
+            return {
+              confirmedDeleted: true,
+              applied,
+              reconciliationRequired,
+              unresolvedGrantCount,
+              auditLogged,
+              dbWrites,
+              reason,
+            };
+          }
+        );
+      }
+    );
+  } catch (lockErr: any) {
+    // Lock contention, uncertain lock, or lost fence -> NEVER force-release and perform ZERO writes
+    const code = String(lockErr?.code || '').trim();
+    console.log(
+      `[3X-UI Sync] Skipping deletion verification for UUID ${normUuid} due to active/uncertain lock (${code || lockErr?.message || 'busy'}).`
+    );
+    return {
+      confirmedDeleted: false,
+      dbWrites: 0,
+      reason: code ? `lock_skipped:${code}` : `lock_skipped:${lockErr?.message || 'busy'}`,
+    };
+  }
+};
+
+/**
+ * Checks whether a non-deleted VPN record that is observed live & Active in 3X-UI
+ * is eligible to have its DB status restored from 'disabled'/'expired' back to 'active'.
+ * Never auto-resurrects deleted configs, rejected/revoked orders/grants, or unresolved provisioning ops.
+ */
+export const isSafeToRestoreActiveStatus = async (params: {
+  dbClient: any;
+  clientUuid: string;
+  orderId?: string | null;
+  currentDbStatus?: string | null;
+  deletedFromPanelAt?: string | null;
+  liveInbound: XuiInbound;
+  liveClient: XuiClient;
+  liveStat?: XuiClientStat | null;
+  nowMs?: number;
+}): Promise<boolean> => {
+  const normStatus = String(params.currentDbStatus || '').trim().toLowerCase();
+  if (normStatus === 'deleted' || Boolean(params.deletedFromPanelAt)) {
+    return false;
+  }
+  if (normStatus !== 'disabled' && normStatus !== 'expired') {
+    return false;
+  }
+
+  // Require live 3X-UI state to be unambiguously Active (enabled, unexpired, under quota)
+  if (params.liveInbound?.enable !== true || params.liveClient?.enable !== true) {
+    return false;
+  }
+  if (params.liveStat && params.liveStat.enable === false) {
+    return false;
+  }
+
+  const nowMs = params.nowMs ?? Date.now();
+  let expMs = Number(params.liveClient.expiryTime || 0);
+  if (expMs > 0 && expMs < 10000000000) expMs *= 1000;
+  if ((expMs > 0 && expMs <= nowMs) || expMs < 0) {
+    return false;
+  }
+
+  const totalLimit = Number(params.liveClient.totalGB || (params.liveStat?.total ?? 0) || 0);
+  const usedBytes = Number(params.liveStat?.up || 0) + Number(params.liveStat?.down || 0);
+  if (totalLimit > 0 && usedBytes >= totalLimit) {
+    return false;
+  }
+
+  const dbClient = params.dbClient || supabaseAdmin;
+  const normUuid = String(params.clientUuid || '').trim().toLowerCase();
+  const orderId = String(params.orderId || '').trim();
+
+  // Check order status is NOT rejected/revoked/cancelled/deleted/pending
+  if (orderId && dbClient && typeof dbClient.from === 'function') {
+    try {
+      const { data: ord } = await dbClient
+        .from('orders')
+        .select('id, status, payment_status, provisioning_status, reject_reason')
+        .eq('id', orderId)
+        .maybeSingle();
+
+      if (ord) {
+        const os = String(ord.status || '').toLowerCase().trim();
+        const ps = String(ord.payment_status || '').toLowerCase().trim();
+        const prs = String(ord.provisioning_status || '').toLowerCase().trim();
+        if (
+          os === 'rejected' ||
+          os === 'cancelled' ||
+          os === 'canceled' ||
+          os === 'deleted' ||
+          os === 'revoked' ||
+          os === 'pending' ||
+          ps === 'rejected' ||
+          ps === 'cancelled' ||
+          prs === 'revoked' ||
+          prs === 'revoke_failed' ||
+          prs === 'rejected' ||
+          Boolean(ord.reject_reason)
+        ) {
+          return false;
+        }
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  // Check new_order entitlement grants are NOT revoked/rejected/provisioning/uncertain
+  if (dbClient && typeof dbClient.from === 'function') {
+    try {
+      const { data: grants, error: grantErr } = await dbClient
+        .from('vpn_entitlement_grants')
+        .select('grant_type, status')
+        .ilike('client_uuid', normUuid);
+
+      if (grantErr && !isMissingSchemaOrRpcError(grantErr)) {
+        return false;
+      }
+      if (Array.isArray(grants)) {
+        for (const g of grants) {
+          const gType = String(g.grant_type || 'new_order').toLowerCase().trim();
+          const gStatus = String(g.status || '').toLowerCase().trim();
+          if (
+            gStatus === 'provisioning' ||
+            gStatus === 'uncertain' ||
+            gStatus === 'revoke_failed'
+          ) {
+            return false;
+          }
+          if (
+            gType === 'new_order' &&
+            (gStatus === 'revoked' || gStatus === 'rejected' || gStatus === 'cancelled' || gStatus === 'deleted')
+          ) {
+            return false;
+          }
+        }
+      }
+    } catch {
+      return false;
+    }
+
+    // Check no active or uncertain provisioning_operations exist for this client or order
+    try {
+      const keysToCheck = [`client:${normUuid}`];
+      if (orderId) keysToCheck.push(`order:${orderId}`);
+      const { data: ops, error: opsErr } = await dbClient
+        .from('provisioning_operations')
+        .select('operation_key, status')
+        .in('operation_key', keysToCheck)
+        .in('status', ['in_progress', 'uncertain']);
+
+      if (opsErr && !isMissingSchemaOrRpcError(opsErr)) {
+        return false;
+      }
+      if (Array.isArray(ops) && ops.length > 0) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+/**
+ * Authoritatively synchronizes 3X-UI panel clients with local database (`vpn_accounts`, `vpn_configs`).
+ *
+ * Critical guarantees:
+ * - Always uses fresh, uncached live panel reads (ignores stale caches; never uses clientStats for existence).
+ * - Scans ALL non-deleted clients (including active, disabled, and expired) so permanently deleted
+ *   clients in any state are detected and removed from customer-facing VPN views.
+ * - Requires reliable panel identity, customer ownership, inbound association, durable client+inbound locks,
+ *   and two independent fresh uncached reads before marking any client as `deleted`.
+ * - NEVER mutates `orders.status` or `orders.payment_status` and NEVER writes `updated_at` to `vpn_configs`.
+ * - Safely backfills `panel_identity` for observed live clients and restores `disabled`/`expired` -> `active`
+ *   only when live state is unambiguously Active and no rejection/revocation/unresolved lock exists.
+ */
+export const syncDeleted3XUiClients = async (
+  options?: SyncDeletedClientsOptions
+): Promise<SyncDeletedClientsResult> => {
+  console.log('[3X-UI Sync] Starting authoritative VPN client synchronization with 3X-UI panel...');
+
+  const dbClient = options?.dbClient || supabaseAdmin;
+  const readList = options?.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
+  const readInbound = options?.fetchUncachedInbound || fetchUncachedLiveInboundById;
+  const nowMs = options?.nowMs ?? Date.now();
+
+  let currentPanelIdentity = String(options?.currentPanelIdentity || '').trim();
+  if (!currentPanelIdentity) {
+    try {
+      currentPanelIdentity = await getCurrentPanelIdentity();
+    } catch (err: any) {
+      console.warn('[3X-UI Sync] Cannot resolve active 3X-UI panel identity. Skipping cycle safely.', err?.message || err);
+      return {
+        synced: false,
+        deletedCount: 0,
+        restoredCount: 0,
+        skippedCount: 0,
+        manualReviewCount: 0,
+        reconciliationFlaggedCount: 0,
+      };
+    }
+  }
+
+  // Step 1: Fresh, uncached live panel list read (NEVER uses cachedInbounds)
+  const listRes = await readList();
+  if (!listRes.ok) {
+    console.warn(`[3X-UI Sync] Live 3X-UI panel list failed (${listRes.reason}). Skipping cycle with zero writes.`);
+    return {
+      synced: false,
+      deletedCount: 0,
+      restoredCount: 0,
+      skippedCount: 0,
+      manualReviewCount: 0,
+      reconciliationFlaggedCount: 0,
+    };
+  }
+
+  if (listRes.allInboundsCleanlyParsed && listRes.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
+    setCachedInbounds(listRes.inbounds);
+  }
+
+  const configuredServers =
+    options?.configuredServers !== undefined
+      ? options.configuredServers
+      : await loadConfiguredXuiServers(dbClient);
+
+  console.log(
+    `[3X-UI Sync] Live panel reachable (identity=${currentPanelIdentity}). Found ${listRes.liveClientByUuid.size} live client UUIDs across ${listRes.inbounds.length} inbounds (unparsed=${listRes.unparsedInboundIds.length}).`
+  );
+
+  let deletedCount = 0;
+  let restoredCount = 0;
+  let skippedCount = 0;
+  let manualReviewCount = 0;
+  let reconciliationFlaggedCount = 0;
+  const details: Array<{ clientUuid: string; outcome: string; reason: string }> = [];
+
+  try {
+    // Load all non-deleted vpn_accounts and vpn_configs (including active, disabled, expired)
+    const [accRes, cfgRes] = await Promise.all([
+      dbClient.from('vpn_accounts').select('*'),
+      dbClient.from('vpn_configs').select('*'),
+    ]);
+
+    const accounts: any[] = Array.isArray(accRes?.data) ? accRes.data : [];
+    const configs: any[] = Array.isArray(cfgRes?.data) ? cfgRes.data : [];
+
+    // Also load grant inbound_ids as authoritative inbound fallback when vpn_configs.inbound_id is missing
+    const grantInboundByUuid = new Map<string, number>();
+    try {
+      const { data: grants } = await dbClient
+        .from('vpn_entitlement_grants')
+        .select('client_uuid, inbound_id')
+        .not('inbound_id', 'is', null);
+      if (Array.isArray(grants)) {
+        for (const g of grants) {
+          const gu = String(g?.client_uuid || '').trim().toLowerCase();
+          const gib = Number(g?.inbound_id);
+          if (gu && Number.isInteger(gib) && gib > 0 && !grantInboundByUuid.has(gu)) {
+            grantInboundByUuid.set(gu, gib);
+          }
+        }
+      }
+    } catch {
+      // Optional table
+    }
+
+    // Group accounts and configs by normalized client UUID
+    interface ClientRecordGroup {
+      clientUuid: string;
+      accounts: any[];
+      configs: any[];
+      inboundId: number | null;
+      userId: string | null;
+      distinctOwners: Set<string>;
+      hasConflictingOwnership: boolean;
+      hasMissingOwnership: boolean;
+      userEmail: string | null;
+      orderId: string | null;
+      panelIdentity: string | null;
+      serverId: string | null;
+      createdAt: string | null;
+      anyNonDeleted: boolean;
+      allDeleted: boolean;
+    }
+
+    const groups = new Map<string, ClientRecordGroup>();
+    const ensureGroup = (rawUuid: string): ClientRecordGroup | null => {
+      const norm = String(rawUuid || '').trim().toLowerCase();
+      if (!norm) return null;
+      let g = groups.get(norm);
+      if (!g) {
+        g = {
+          clientUuid: norm,
+          accounts: [],
+          configs: [],
+          inboundId: grantInboundByUuid.get(norm) ?? null,
+          userId: null,
+          distinctOwners: new Set<string>(),
+          hasConflictingOwnership: false,
+          hasMissingOwnership: false,
+          userEmail: null,
+          orderId: null,
+          panelIdentity: null,
+          serverId: null,
+          createdAt: null,
+          anyNonDeleted: false,
+          allDeleted: true,
+        };
+        groups.set(norm, g);
+      }
+      return g;
+    };
+
+    for (const acc of accounts) {
+      const g = ensureGroup(acc.uuid);
+      if (!g) continue;
+      g.accounts.push(acc);
+      const accOwner = String(acc.user_id || '').trim();
+      if (accOwner) {
+        g.distinctOwners.add(accOwner.toLowerCase());
+        if (!g.userId) g.userId = accOwner;
+      } else {
+        g.hasMissingOwnership = true;
+      }
+      if (!g.userEmail && acc.email) g.userEmail = String(acc.email).trim().toLowerCase();
+      if (!g.orderId && acc.order_id) g.orderId = String(acc.order_id).trim();
+      if (!g.panelIdentity && acc.panel_identity) g.panelIdentity = String(acc.panel_identity).trim();
+      if (!g.serverId && acc.server_id) g.serverId = String(acc.server_id).trim();
+      if (acc.created_at && (!g.createdAt || new Date(acc.created_at).getTime() > new Date(g.createdAt).getTime())) {
+        g.createdAt = acc.created_at;
+      }
+      const st = String(acc.status || '').trim().toLowerCase();
+      if (st !== 'deleted' && !acc.deleted_from_panel_at) {
+        g.anyNonDeleted = true;
+        g.allDeleted = false;
+      }
+    }
+
+    for (const cfg of configs) {
+      const g = ensureGroup(cfg.uuid);
+      if (!g) continue;
+      g.configs.push(cfg);
+      const ibId = Number(cfg.inbound_id);
+      if (Number.isInteger(ibId) && ibId > 0) g.inboundId = ibId;
+      const cfgCustUid = String(cfg.customer_uid || '').trim();
+      const cfgUserId = String(cfg.user_id || '').trim();
+      if (cfgCustUid && cfgUserId && cfgCustUid.toLowerCase() !== cfgUserId.toLowerCase()) {
+        g.hasConflictingOwnership = true;
+      }
+      if (cfgCustUid) {
+        g.distinctOwners.add(cfgCustUid.toLowerCase());
+        if (!g.userId) g.userId = cfgCustUid;
+      }
+      if (cfgUserId) {
+        g.distinctOwners.add(cfgUserId.toLowerCase());
+        if (!g.userId) g.userId = cfgUserId;
+      }
+      if (!cfgCustUid && !cfgUserId) {
+        g.hasMissingOwnership = true;
+      }
+      if (!g.userEmail && (cfg.customer_email || cfg.email)) {
+        g.userEmail = String(cfg.customer_email || cfg.email).trim().toLowerCase();
+      }
+      if (!g.orderId && cfg.order_id) g.orderId = String(cfg.order_id).trim();
+      if (!g.panelIdentity && cfg.panel_identity) g.panelIdentity = String(cfg.panel_identity).trim();
+      if (!g.serverId && cfg.server_id) g.serverId = String(cfg.server_id).trim();
+      if (cfg.created_at && (!g.createdAt || new Date(cfg.created_at).getTime() > new Date(g.createdAt).getTime())) {
+        g.createdAt = cfg.created_at;
+      }
+      const st = String(cfg.status || '').trim().toLowerCase();
+      if (st !== 'deleted' && !cfg.deleted_from_panel_at) {
+        g.anyNonDeleted = true;
+        g.allDeleted = false;
+      }
+    }
+
+    const nowIso = new Date(nowMs).toISOString();
+
+    for (const group of groups.values()) {
+      // Never auto-resurrect a configuration that is already confirmed deleted
+      if (!group.anyNonDeleted || group.allDeleted) {
+        continue;
+      }
+
+      const liveMatch = listRes.liveClientByUuid.get(group.clientUuid);
+      if (liveMatch) {
+        // Client positively observed in live 3X-UI settings.clients[]!
+        // 1. Safely backfill panel_identity (and missing inbound_id on vpn_configs) for non-deleted rows
+        for (const acc of group.accounts) {
+          const st = String(acc.status || '').trim().toLowerCase();
+          if (st === 'deleted' || acc.deleted_from_panel_at) continue;
+          const updates: Record<string, any> = {};
+          if (!acc.panel_identity && currentPanelIdentity) {
+            updates.panel_identity = currentPanelIdentity;
+          }
+          if (
+            (st === 'disabled' || st === 'expired') &&
+            (await isSafeToRestoreActiveStatus({
+              dbClient,
+              clientUuid: group.clientUuid,
+              orderId: acc.order_id || group.orderId,
+              currentDbStatus: st,
+              deletedFromPanelAt: acc.deleted_from_panel_at,
+              liveInbound: liveMatch.inbound,
+              liveClient: liveMatch.client,
+              liveStat: liveMatch.stat,
+              nowMs,
+            }))
+          ) {
+            updates.status = 'active';
+            updates.enable = true;
+            updates.updated_at = nowIso;
+            restoredCount += 1;
+          }
+          if (Object.keys(updates).length > 0) {
+            try {
+              const { error } = await dbClient.from('vpn_accounts').update(updates).eq('id', acc.id);
+              if (error && isMissingSchemaOrRpcError(error) && 'panel_identity' in updates) {
+                delete updates.panel_identity;
+                if (Object.keys(updates).length > 0) {
+                  await dbClient.from('vpn_accounts').update(updates).eq('id', acc.id);
+                }
+              }
+            } catch {}
+          }
+        }
+
+        for (const cfg of group.configs) {
+          const st = String(cfg.status || '').trim().toLowerCase();
+          if (st === 'deleted' || cfg.deleted_from_panel_at) continue;
+          const updates: Record<string, any> = {};
+          if (!cfg.panel_identity && currentPanelIdentity) {
+            updates.panel_identity = currentPanelIdentity;
+          }
+          if ((!cfg.inbound_id || Number(cfg.inbound_id) <= 0) && liveMatch.inbound?.id) {
+            updates.inbound_id = Number(liveMatch.inbound.id);
+          }
+          if (
+            (st === 'disabled' || st === 'expired') &&
+            (await isSafeToRestoreActiveStatus({
+              dbClient,
+              clientUuid: group.clientUuid,
+              orderId: cfg.order_id || group.orderId,
+              currentDbStatus: st,
+              deletedFromPanelAt: cfg.deleted_from_panel_at,
+              liveInbound: liveMatch.inbound,
+              liveClient: liveMatch.client,
+              liveStat: liveMatch.stat,
+              nowMs,
+            }))
+          ) {
+            updates.status = 'active';
+            updates.enabled = true;
+            // NEVER write updated_at to vpn_configs
+          }
+          if (Object.keys(updates).length > 0) {
+            try {
+              const { error } = await dbClient.from('vpn_configs').update(updates).eq('id', cfg.id);
+              if (error && isMissingSchemaOrRpcError(error) && 'panel_identity' in updates) {
+                delete updates.panel_identity;
+                if (Object.keys(updates).length > 0) {
+                  await dbClient.from('vpn_configs').update(updates).eq('id', cfg.id);
+                }
+              }
+            } catch {}
+          }
+        }
+
+        continue;
+      }
+
+      // Client was NOT present in live list read 1.
+      // If any inbound in the list failed strict JSON parsing AND matches (or we don't know) this record's inbound, skip safely.
+      if (
+        !listRes.allInboundsCleanlyParsed &&
+        (!group.inboundId || listRes.unparsedInboundIds.includes(group.inboundId) || listRes.unparsedInboundIds.includes(-1))
+      ) {
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'skipped',
+          reason: 'malformed_inbound_settings_in_list',
+        });
+        continue;
+      }
+
+      if (group.hasConflictingOwnership || group.distinctOwners.size > 1 || group.hasMissingOwnership || !group.userId) {
+        const ownershipCode =
+          group.hasConflictingOwnership || group.distinctOwners.size > 1
+            ? 'conflicting_or_duplicate_ownership'
+            : 'missing_customer_ownership';
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: group.distinctOwners.size === 1 ? group.userId : null,
+          action: 'panel_deletion_ambiguous_identity',
+          targetType: 'vpn_client',
+          targetId: group.clientUuid,
+          details: {
+            client_uuid: group.clientUuid,
+            inbound_id: group.inboundId ?? null,
+            distinct_owners: Array.from(group.distinctOwners),
+            has_conflicting_ownership: group.hasConflictingOwnership,
+            has_missing_ownership: group.hasMissingOwnership,
+            code: ownershipCode,
+            source: 'background_sync',
+          },
+        });
+        manualReviewCount += 1;
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'manual_review',
+          reason: ownershipCode,
+        });
+        continue;
+      }
+
+      // Run full authoritative verification (panel identity + ownership + durable client+inbound locks + 2 fresh uncached reads + atomic RPC)
+      const verifyRes = await verifyAndMarkClientDeletedIfConfirmed({
+        clientUuid: group.clientUuid,
+        inboundId: group.inboundId,
+        userId: group.userId,
+        userEmail: group.userEmail,
+        recordPanelIdentity: group.panelIdentity,
+        recordServerId: group.serverId,
+        createdAt: group.createdAt,
+        existingStatus: null,
+        deletedFromPanelAt: null,
+        source: 'background_sync',
+        dbClient,
+        currentPanelIdentity,
+        configuredServers,
+        fetchUncachedInbound: readInbound,
+        fetchUncachedInboundsList: readList,
+        reReadDelayMs: options?.reReadDelayMs,
+        nowMs,
+      });
+
+      if (verifyRes.confirmedDeleted) {
+        if (verifyRes.applied) deletedCount += 1;
+        if (verifyRes.reconciliationRequired) reconciliationFlaggedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'deleted',
+          reason: verifyRes.reason,
+        });
+      } else if (verifyRes.manualReviewFlagged) {
+        manualReviewCount += 1;
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'manual_review',
+          reason: verifyRes.reason,
+        });
+      } else {
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'skipped',
+          reason: verifyRes.reason,
+        });
+      }
+    }
+
+    console.log(
+      `[3X-UI Sync] Completed. confirmedDeleted=${deletedCount}, restoredActive=${restoredCount}, skipped=${skippedCount}, manualReview=${manualReviewCount}, reconciliationFlagged=${reconciliationFlaggedCount}.`
+    );
+
+    return {
+      synced: true,
+      deletedCount,
+      restoredCount,
+      skippedCount,
+      manualReviewCount,
+      reconciliationFlaggedCount,
+      details,
+    };
+  } catch (err: any) {
+    console.error('[3X-UI Sync] Unexpected error during synchronization cycle:', err?.message || err);
+    return {
+      synced: false,
+      deletedCount: 0,
+      restoredCount: 0,
+      skippedCount: 0,
+      manualReviewCount: 0,
+      reconciliationFlaggedCount: 0,
+    };
   }
 };
 
