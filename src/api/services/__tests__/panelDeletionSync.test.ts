@@ -8,6 +8,13 @@ import {
   syncDeleted3XUiClients,
   isSafeToRestoreActiveStatus,
   setCachedInbounds,
+  resetPanelDeletionSyncSchedulerStateForTests,
+  acquireCrossInstanceDeletionSyncLease,
+  renewCrossInstanceDeletionSyncLease,
+  verifyCrossInstanceDeletionSyncLeaseOwnership,
+  releaseCrossInstanceDeletionSyncLease,
+  fetchAllTableRowsByPrimaryKeyCursor,
+  evaluateSnapshotMassAbsenceCircuitBreaker,
   XuiInbound,
   UncachedInboundReadResult,
   UncachedInboundsListReadResult,
@@ -27,8 +34,10 @@ let prevDeletionSyncEnv: string | undefined;
 test.beforeEach(() => {
   prevDeletionSyncEnv = process.env.PANEL_DELETION_SYNC_ENABLED;
   process.env.PANEL_DELETION_SYNC_ENABLED = 'true';
+  resetPanelDeletionSyncSchedulerStateForTests();
 });
 test.afterEach(() => {
+  resetPanelDeletionSyncSchedulerStateForTests();
   if (prevDeletionSyncEnv === undefined) {
     delete process.env.PANEL_DELETION_SYNC_ENABLED;
   } else {
@@ -45,12 +54,16 @@ interface MockDbState {
   profiles: any[];
   audit_logs: any[];
   xui_servers: any[];
+  settings: any[];
   locks: Map<string, { ownerId: string; status: 'in_progress' | 'completed' | 'failed' | 'uncertain'; operationType: string }>;
   rpcCalls: Array<{ fn: string; args: Record<string, any> }>;
   writeLog: Array<{ table: string; op: 'update' | 'insert'; payload: Record<string, any> }>;
 }
 
-function createMockDb(initial?: Partial<MockDbState>) {
+function createMockDb(initial?: Partial<MockDbState> & { serverMaxRows?: number; freezeSettingsTriggerTimestamp?: string }) {
+  let settingsVersionCounter = 1;
+  const serverMaxRows = initial?.serverMaxRows ?? null;
+  const freezeTriggerTs = initial?.freezeSettingsTriggerTimestamp ?? null;
   const state: MockDbState = {
     vpn_accounts: initial?.vpn_accounts ? structuredClone(initial.vpn_accounts) : [],
     vpn_configs: initial?.vpn_configs ? structuredClone(initial.vpn_configs) : [],
@@ -60,18 +73,33 @@ function createMockDb(initial?: Partial<MockDbState>) {
     profiles: initial?.profiles ? structuredClone(initial.profiles) : [],
     audit_logs: initial?.audit_logs ? structuredClone(initial.audit_logs) : [],
     xui_servers: initial?.xui_servers ? structuredClone(initial.xui_servers) : [],
+    settings: initial?.settings ? structuredClone(initial.settings) : [],
     locks: initial?.locks ? new Map(initial.locks) : new Map(),
     rpcCalls: [],
     writeLog: [],
   };
 
+  const getColumnValue = (row: any, col: string): any => {
+    if (!row || typeof row !== 'object') return undefined;
+    if (col.includes('->>')) {
+      const [jsonCol, jsonKey] = col.split('->>').map((s) => s.trim());
+      const jsonObj = row?.[jsonCol];
+      if (!jsonObj || typeof jsonObj !== 'object') return null;
+      const val = jsonObj[jsonKey];
+      return val === undefined || val === null ? null : String(val);
+    }
+    return row?.[col];
+  };
+
   const matchFilters = (row: any, filters: Array<{ op: string; col: string; val: any }>) => {
     for (const f of filters) {
-      const rv = row?.[f.col];
+      const rv = getColumnValue(row, f.col);
       if (f.op === 'eq' && rv !== f.val) return false;
+      if (f.op === 'is' && (f.val === null ? rv !== null && rv !== undefined : rv !== f.val)) return false;
       if (f.op === 'ilike' && String(rv || '').toLowerCase() !== String(f.val || '').toLowerCase()) return false;
       if (f.op === 'in' && !(Array.isArray(f.val) && f.val.includes(rv))) return false;
-      if (f.op === 'gte' && !(rv && String(rv) >= String(f.val))) return false;
+      if (f.op === 'gte' && !(rv !== null && rv !== undefined && String(rv) >= String(f.val))) return false;
+      if (f.op === 'gt' && !(rv !== null && rv !== undefined && String(rv) > String(f.val))) return false;
       if (f.op === 'not_null' && (rv === null || rv === undefined)) return false;
     }
     return true;
@@ -82,20 +110,33 @@ function createMockDb(initial?: Partial<MockDbState>) {
     let updatePayload: Record<string, any> | null = null;
     let insertPayload: Record<string, any> | null = null;
     let limitCount: number | null = null;
+    let orderCol: string | null = null;
+    let orderAsc = true;
     let singleMode = false;
 
     const execute = async () => {
       const rows = (state[table] as any[]) || [];
 
       if (insertPayload) {
+        if (table === 'settings' && insertPayload.id && rows.some((r) => r.id === insertPayload!.id)) {
+          return { data: null, error: { code: '23505', message: 'duplicate key value violates unique constraint "settings_pkey"' } };
+        }
         const rec = {
           id: `${String(table)}-${rows.length + 1}`,
           created_at: new Date().toISOString(),
-          ...insertPayload,
+          ...(table === 'settings'
+            ? {
+                updated_at:
+                  freezeTriggerTs ||
+                  `2026-11-26T00:00:${String(settingsVersionCounter++).padStart(2, '0')}.000Z`,
+              }
+            : {}),
+          ...structuredClone(insertPayload),
+          ...(table === 'settings' && freezeTriggerTs ? { updated_at: freezeTriggerTs } : {}),
         };
         rows.push(rec);
-        state.writeLog.push({ table: String(table), op: 'insert', payload: insertPayload });
-        return { data: singleMode ? rec : [rec], error: null };
+        state.writeLog.push({ table: String(table), op: 'insert', payload: structuredClone(insertPayload) });
+        return { data: singleMode ? structuredClone(rec) : [structuredClone(rec)], error: null };
       }
 
       if (updatePayload) {
@@ -108,26 +149,56 @@ function createMockDb(initial?: Partial<MockDbState>) {
         }
         const matched = rows.filter((r) => matchFilters(r, filters));
         for (const r of matched) {
-          Object.assign(r, updatePayload);
+          Object.assign(r, structuredClone(updatePayload));
+          if (table === 'settings') {
+            // Simulate PostgreSQL BEFORE UPDATE trigger `NEW.updated_at = NOW()` (which may override explicit updated_at)
+            r.updated_at =
+              freezeTriggerTs ||
+              `2026-11-26T00:00:${String(settingsVersionCounter++).padStart(2, '0')}.000Z`;
+          }
         }
         if (matched.length > 0) {
-          state.writeLog.push({ table: String(table), op: 'update', payload: { ...updatePayload } });
+          state.writeLog.push({ table: String(table), op: 'update', payload: structuredClone(updatePayload) });
         }
-        return { data: singleMode ? matched[0] || null : matched, error: null };
+        return { data: singleMode ? (matched[0] ? structuredClone(matched[0]) : null) : structuredClone(matched), error: null };
       }
 
       let matched = rows.filter((r) => matchFilters(r, filters));
-      if (limitCount !== null) matched = matched.slice(0, limitCount);
-      return { data: singleMode ? matched[0] || null : matched, error: null };
+      if (orderCol) {
+        const col = orderCol;
+        const asc = orderAsc;
+        matched = [...matched].sort((a, b) => {
+          const av = String(a?.[col] ?? '');
+          const bv = String(b?.[col] ?? '');
+          if (av === bv) return 0;
+          return asc ? (av < bv ? -1 : 1) : (av > bv ? -1 : 1);
+        });
+      }
+      const effectiveLimit =
+        limitCount !== null && serverMaxRows !== null
+          ? Math.min(limitCount, serverMaxRows)
+          : limitCount !== null
+            ? limitCount
+            : serverMaxRows;
+      if (effectiveLimit !== null) matched = matched.slice(0, effectiveLimit);
+      return { data: singleMode ? (matched[0] ? structuredClone(matched[0]) : null) : structuredClone(matched), error: null };
     };
 
     const builder: any = {
       select() { return builder; },
-      order() { return builder; },
+      order(col?: string, opts?: { ascending?: boolean }) {
+        if (col) {
+          orderCol = col;
+          orderAsc = opts?.ascending !== false;
+        }
+        return builder;
+      },
       eq(col: string, val: any) { filters.push({ op: 'eq', col, val }); return builder; },
+      is(col: string, val: any) { filters.push({ op: 'is', col, val }); return builder; },
       ilike(col: string, val: any) { filters.push({ op: 'ilike', col, val }); return builder; },
       in(col: string, val: any[]) { filters.push({ op: 'in', col, val }); return builder; },
       gte(col: string, val: any) { filters.push({ op: 'gte', col, val }); return builder; },
+      gt(col: string, val: any) { filters.push({ op: 'gt', col, val }); return builder; },
       not(col: string, op: string, val: any) {
         if (op === 'is' && val === null) filters.push({ op: 'not_null', col, val: null });
         return builder;
@@ -135,7 +206,7 @@ function createMockDb(initial?: Partial<MockDbState>) {
       limit(n: number) { limitCount = n; return builder; },
       maybeSingle() { singleMode = true; return execute(); },
       update(payload: Record<string, any>) { updatePayload = payload; return builder; },
-      insert(payload: Record<string, any>) { insertPayload = payload; return execute(); },
+      insert(payload: Record<string, any>) { insertPayload = payload; return builder; },
       then(resolve: any, reject: any) { return execute().then(resolve, reject); },
     };
     return builder;
@@ -711,7 +782,7 @@ test('5. Panel timeout, stale cache, malformed JSON, and missing/incomplete inbo
   assert.equal(emptyListCheck.dbWrites, 0);
   assert.equal(dbEmptyList.state.vpn_accounts[0].status, 'active');
 
-  // 5e. Two-read verification: absent on Read 1, reappears on Read 2 -> ZERO writes
+  // 5e. Two-read panel-wide verification: absent on Read 1, reappears on Read 2 -> ZERO writes
   const dbFlap = makeState();
   let readCallCount = 0;
   const flapCheck = await verifyAndMarkClientDeletedIfConfirmed({
@@ -724,13 +795,13 @@ test('5. Panel timeout, stale cache, malformed JSON, and missing/incomplete inbo
     dbClient: dbFlap,
     currentPanelIdentity: PANEL_A_ID,
     configuredServers: [],
-    fetchUncachedInbound: async () => {
+    fetchUncachedInboundsList: async () => {
       readCallCount++;
       if (readCallCount === 1) {
-        return { status: 'found', inbound: makeInbound(10, []), clients: [], clientUuidSet: new Set() };
+        return buildListResult([makeInbound(10, [])]);
       }
       const c = { id: 'uuid-safe', email, enable: true, limitIp: 0, totalGB: 0, expiryTime: FUTURE_EXPIRY_MS, subId: '', reset: 0 };
-      return { status: 'found', inbound: makeInbound(10, [c]), clients: [c], clientUuidSet: new Set(['uuid-safe']) };
+      return buildListResult([makeInbound(10, [c])]);
     },
     reReadDelayMs: 0,
   });
@@ -1223,4 +1294,964 @@ test('11. Conflicting customer_uid/user_id, duplicate UUID multi-owner, and miss
   assert.equal(idResNoUid.code, 'missing_customer_ownership');
 });
 
+// ---------------------------------------------------------------------------
+// 12. Client moved to another inbound -> NEVER deleted, NEVER auto-rewritten, manual review logged
+// ---------------------------------------------------------------------------
+test('12. Client moved to another inbound is NEVER marked deleted, inbound_id is NOT auto-rewritten, and mismatch is logged for manual review', async () => {
+  const uid = 'user-moved';
+  const email = 'moved@example.com';
 
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-mv', user_id: uid, email, uuid: 'uuid-moved', status: 'active', enable: true, order_id: 'ord-mv', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-mv', user_id: uid, customer_uid: uid, uuid: 'uuid-moved', inbound_id: 10, status: 'active', enabled: true, order_id: 'ord-mv', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+  });
+
+  // Client is absent from original inbound 10, but ACTIVE on inbound 20!
+  const ib10 = makeInbound(10, []);
+  const ib20 = makeInbound(20, [
+    { id: 'uuid-moved', email: 'moved_cli', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+  ]);
+
+  // 12a. Direct verifyAndMarkClientDeletedIfConfirmed MUST check panel-wide list and refuse deletion
+  const directRes = await verifyAndMarkClientDeletedIfConfirmed({
+    clientUuid: 'uuid-moved',
+    inboundId: 10,
+    userId: uid,
+    userEmail: email,
+    recordPanelIdentity: PANEL_A_ID,
+    createdAt: PAST_CREATED_AT,
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([ib10, ib20]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(directRes.confirmedDeleted, false);
+  assert.equal(directRes.manualReviewFlagged, true);
+  assert.equal(directRes.reason, 'read1_client_moved_to_another_inbound');
+  assert.equal(directRes.dbWrites, 0);
+  assert.equal(db.state.vpn_accounts[0].status, 'active');
+  assert.equal(db.state.vpn_configs[0].status, 'active');
+  assert.equal(db.state.vpn_configs[0].inbound_id, 10, 'Conflicting inbound_id MUST NOT be rewritten automatically');
+  assert.ok(db.state.audit_logs.some((a) => a.action === 'panel_deletion_inbound_mismatch'));
+
+  // 12b. Full background sweep also preserves client, does NOT rewrite inbound_id=10 to 20, and flags manual review
+  const syncRes = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([ib10, ib20]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(syncRes.synced, true);
+  assert.equal(syncRes.deletedCount, 0);
+  assert.equal(syncRes.manualReviewCount, 1);
+  assert.equal(db.state.vpn_accounts[0].status, 'active');
+  assert.equal(db.state.vpn_configs[0].inbound_id, 10, 'Background sweep MUST NOT rewrite conflicting inbound_id');
+});
+
+// ---------------------------------------------------------------------------
+// 13. Offline customers & non-selected VPNs swept + exact panel request budget (1 vs 2+K)
+// ---------------------------------------------------------------------------
+test('13. Background sweep covers offline customers and uses 1 panel call for 0 deletions and 2+K panel calls for K deletions', async () => {
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-1', user_id: 'cust-online', email: 'c1@example.com', uuid: 'uuid-c1-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-2', user_id: 'cust-offline-a', email: 'c2@example.com', uuid: 'uuid-c2-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-3', user_id: 'cust-offline-b', email: 'c3@example.com', uuid: 'uuid-c3-del', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-4', user_id: 'cust-offline-c', email: 'c4@example.com', uuid: 'uuid-c4-del', status: 'disabled', enable: false, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-5', user_id: 'cust-offline-d', email: 'c5@example.com', uuid: 'uuid-c5-live', status: 'expired', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-6', user_id: 'cust-offline-e', email: 'c6@example.com', uuid: 'uuid-c6-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-7', user_id: 'cust-offline-f', email: 'c7@example.com', uuid: 'uuid-c7-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-8', user_id: 'cust-offline-g', email: 'c8@example.com', uuid: 'uuid-c8-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-9', user_id: 'cust-offline-h', email: 'c9@example.com', uuid: 'uuid-c9-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-10', user_id: 'cust-offline-i', email: 'c10@example.com', uuid: 'uuid-c10-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-1', customer_uid: 'cust-online', uuid: 'uuid-c1-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-2', customer_uid: 'cust-offline-a', uuid: 'uuid-c2-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-3', customer_uid: 'cust-offline-b', uuid: 'uuid-c3-del', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-4', customer_uid: 'cust-offline-c', uuid: 'uuid-c4-del', inbound_id: 3, status: 'disabled', enabled: false, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-5', customer_uid: 'cust-offline-d', uuid: 'uuid-c5-live', inbound_id: 3, status: 'expired', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-6', customer_uid: 'cust-offline-e', uuid: 'uuid-c6-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-7', customer_uid: 'cust-offline-f', uuid: 'uuid-c7-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-8', customer_uid: 'cust-offline-g', uuid: 'uuid-c8-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-9', customer_uid: 'cust-offline-h', uuid: 'uuid-c9-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-10', customer_uid: 'cust-offline-i', uuid: 'uuid-c10-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+  });
+
+  // 13a. All 10 present -> 0 deletions, EXACTLY 1 panel request!
+  let listCalls0 = 0;
+  const allLiveIb2 = makeInbound(2, [
+    { id: 'uuid-c1-live', email: 'c1', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c2-live', email: 'c2', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c3-del', email: 'c3', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c6-live', email: 'c6', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c7-live', email: 'c7', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c8-live', email: 'c8', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c9-live', email: 'c9', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c10-live', email: 'c10', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+  ]);
+  const allLiveIb3 = makeInbound(3, [
+    { id: 'uuid-c4-del', email: 'c4', enable: false, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c5-live', email: 'c5', enable: true, expiryTime: EXPIRED_EXPIRY_MS, totalGB: 0 },
+  ]);
+
+  const resZero = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => {
+      listCalls0++;
+      return buildListResult([allLiveIb2, allLiveIb3]);
+    },
+    reReadDelayMs: 0,
+  });
+  assert.equal(resZero.synced, true);
+  assert.equal(resZero.deletedCount, 0);
+  assert.equal(resZero.panelRequestCount, 1);
+  assert.equal(listCalls0, 1, '0 deletion candidates MUST perform exactly 1 panel request');
+
+  // 13b. K=2 offline customers deleted (20% <= 25%) -> EXACTLY 2 + 2 = 4 panel requests!
+  let listCallsK = 0;
+  const ib2After = makeInbound(2, [
+    { id: 'uuid-c1-live', email: 'c1', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c2-live', email: 'c2', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c6-live', email: 'c6', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c7-live', email: 'c7', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c8-live', email: 'c8', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c9-live', email: 'c9', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+    { id: 'uuid-c10-live', email: 'c10', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 },
+  ]);
+  const ib3After = makeInbound(3, [
+    { id: 'uuid-c5-live', email: 'c5', enable: true, expiryTime: EXPIRED_EXPIRY_MS, totalGB: 0 },
+  ]);
+
+  const resTwo = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => {
+      listCallsK++;
+      return buildListResult([ib2After, ib3After]);
+    },
+    reReadDelayMs: 0,
+  });
+  assert.equal(resTwo.synced, true);
+  assert.equal(resTwo.deletedCount, 2);
+  assert.equal(resTwo.panelRequestCount, 4, 'K=2 deletions MUST perform exactly 2 + K = 4 panel requests');
+  assert.equal(listCallsK, 4);
+  assert.equal(db.state.vpn_accounts.find((a) => a.uuid === 'uuid-c3-del')?.status, 'deleted');
+  assert.equal(db.state.vpn_accounts.find((a) => a.uuid === 'uuid-c4-del')?.status, 'deleted');
+  assert.equal(db.state.vpn_accounts.find((a) => a.uuid === 'uuid-c5-live')?.status, 'expired');
+});
+
+// ---------------------------------------------------------------------------
+// 14. Mass-Deletion Circuit Breaker (even when panel_identity matches!)
+// ---------------------------------------------------------------------------
+test('14. Mass-deletion circuit breaker stops ALL automatic deletions with zero locks even when panel_identity matches', async () => {
+  const makePopulatedDb = (count: number) => {
+    const accounts: any[] = [];
+    const configs: any[] = [];
+    for (let i = 1; i <= count; i++) {
+      accounts.push({ id: `acc-${i}`, user_id: `u-${i}`, email: `u${i}@example.com`, uuid: `uuid-cb-${i}`, status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+      configs.push({ id: `cfg-${i}`, customer_uid: `u-${i}`, uuid: `uuid-cb-${i}`, inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+    }
+    return createMockDb({ vpn_accounts: accounts, vpn_configs: configs });
+  };
+
+  // 14a. Unexpected zero live clients when >= 3 tracked (e.g. wiped/reset panel with same panel_identity)
+  const dbZeroLive = makePopulatedDb(5);
+  const resZeroLive = await syncDeleted3XUiClients({
+    dbClient: dbZeroLive,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, [])]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(resZeroLive.synced, false);
+  assert.equal(resZeroLive.circuitBreakerTriggered, true);
+  assert.equal(resZeroLive.circuitBreakerReason, 'unexpected_zero_live_clients');
+  assert.equal(resZeroLive.deletedCount, 0);
+  assert.equal(dbZeroLive.state.rpcCalls.length, 0, 'Circuit breaker MUST stop before acquiring any locks or calling deletion RPC');
+  assert.ok(dbZeroLive.state.vpn_accounts.every((a) => a.status === 'active'));
+  assert.ok(dbZeroLive.state.audit_logs.some((a) => a.action === 'panel_deletion_circuit_breaker_triggered'));
+
+  // 14b. Missing ratio > 25% on 10 tracked clients (4 missing = 40%, 6 still live)
+  const dbRatio = makePopulatedDb(10);
+  const sixLiveClients = [5, 6, 7, 8, 9, 10].map((i) => ({
+    id: `uuid-cb-${i}`,
+    email: `u${i}`,
+    enable: true,
+    expiryTime: FUTURE_EXPIRY_MS,
+    totalGB: 0,
+  }));
+  const resRatio = await syncDeleted3XUiClients({
+    dbClient: dbRatio,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, sixLiveClients)]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(resRatio.synced, false);
+  assert.equal(resRatio.circuitBreakerTriggered, true);
+  assert.equal(resRatio.circuitBreakerReason, 'max_missing_ratio_exceeded');
+  assert.equal(resRatio.deletedCount, 0);
+  assert.equal(dbRatio.state.rpcCalls.length, 0);
+  assert.ok(dbRatio.state.vpn_accounts.every((a) => a.status === 'active'));
+
+  // 14c. Absolute cap exceeded (> maxDeletesPerCycle = 2 on 20 tracked clients -> 3 missing = 15% <= 25% but 3 > 2!)
+  const dbCap = makePopulatedDb(20);
+  const seventeenLiveClients = Array.from({ length: 17 }, (_, idx) => ({
+    id: `uuid-cb-${idx + 4}`,
+    email: `u${idx + 4}`,
+    enable: true,
+    expiryTime: FUTURE_EXPIRY_MS,
+    totalGB: 0,
+  }));
+  const resCap = await syncDeleted3XUiClients({
+    dbClient: dbCap,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, seventeenLiveClients)]),
+    maxDeletesPerCycle: 2,
+    reReadDelayMs: 0,
+  });
+  assert.equal(resCap.synced, false);
+  assert.equal(resCap.circuitBreakerTriggered, true);
+  assert.equal(resCap.circuitBreakerReason, 'max_deletes_per_cycle_exceeded');
+  assert.equal(resCap.deletedCount, 0);
+  assert.equal(dbCap.state.rpcCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 15. Cross-Instance CAS Scheduler Lease Anti-Overlap (public.settings)
+// ---------------------------------------------------------------------------
+test('15. Cross-instance CAS lease prevents overlapping sweeps, enforces 2-minute interval across instances, recovers expired leases, and fails closed on DB error', async () => {
+  const baseNow = Date.now();
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-l1', user_id: 'u-1', email: 'u1@example.com', uuid: 'uuid-lease-live', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-l1', customer_uid: 'u-1', uuid: 'uuid-lease-live', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+  });
+  const liveIb = makeInbound(2, [{ id: 'uuid-lease-live', email: 'u1', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 }]);
+
+  // 15a. Instance A runs and releases lease; Instance B within 2 minutes is skipped with 0 panel calls
+  let callsA = 0;
+  const resA = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    enforceCrossInstanceLease: true,
+    leaseOwnerId: 'instance-A',
+    intervalMs: 120000,
+    nowMs: baseNow,
+    fetchUncachedInboundsList: async () => {
+      callsA++;
+      return buildListResult([liveIb]);
+    },
+    reReadDelayMs: 0,
+  });
+  assert.equal(resA.synced, true);
+  assert.equal(callsA, 1);
+
+  let callsB = 0;
+  const resB = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    enforceCrossInstanceLease: true,
+    leaseOwnerId: 'instance-B',
+    intervalMs: 120000,
+    nowMs: baseNow + 60000, // Only 60s later (< 120s interval)
+    fetchUncachedInboundsList: async () => {
+      callsB++;
+      return buildListResult([liveIb]);
+    },
+    reReadDelayMs: 0,
+  });
+  assert.equal(resB.synced, false);
+  assert.equal(resB.skippedLease, true);
+  assert.equal(resB.leaseSkipReason, 'cross_instance_interval_cooldown');
+  assert.equal(callsB, 0);
+
+  // 15b. Active unexpired lease held by another instance blocks acquisition; expired lease is lawfully taken over
+  const leaseRow = db.state.settings.find((s) => s.id === 'panel_deletion_sync_lease');
+  assert.ok(leaseRow);
+  leaseRow.data = {
+    ownerId: 'instance-C',
+    status: 'running',
+    startedAt: new Date(baseNow + 200000).toISOString(),
+    leaseExpiresAt: new Date(baseNow + 400000).toISOString(),
+    lastCompletedAt: null,
+  };
+  const activeBlock = await acquireCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    intervalMs: 120000,
+    nowMs: baseNow + 250000,
+    ownerId: 'instance-D',
+  });
+  assert.equal(activeBlock.acquired, false);
+  assert.match(String(activeBlock.reason), /^lease_held_by_active_instance:/);
+
+  // After TTL expires (crashed worker), Instance D acquires cleanly via CAS
+  const afterExpiry = await acquireCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    intervalMs: 120000,
+    nowMs: baseNow + 500000,
+    ownerId: 'instance-D',
+  });
+  assert.equal(afterExpiry.acquired, true);
+  assert.equal(afterExpiry.ownerId, 'instance-D');
+
+  // Releasing with wrong ownerId MUST NOT release Instance D's lease
+  const wrongRelease = await releaseCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'instance-C',
+    completed: true,
+    nowMs: baseNow + 501000,
+  });
+  assert.equal(wrongRelease, false);
+  assert.equal(db.state.settings.find((s) => s.id === 'panel_deletion_sync_lease')?.data?.status, 'running');
+
+  // Releasing with matching ownerId succeeds
+  const rightRelease = await releaseCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'instance-D',
+    completed: true,
+    nowMs: baseNow + 502000,
+  });
+  assert.equal(rightRelease, true);
+  assert.equal(db.state.settings.find((s) => s.id === 'panel_deletion_sync_lease')?.data?.status, 'idle');
+
+  // 15c. DB error reading lease fails closed with 0 panel calls
+  let errCalls = 0;
+  const brokenDb = {
+    from() {
+      return {
+        select() { return this; },
+        eq() { return this; },
+        async maybeSingle() { return { data: null, error: { message: 'connection refused' } }; },
+      };
+    },
+  };
+  const errRes = await syncDeleted3XUiClients({
+    dbClient: brokenDb,
+    currentPanelIdentity: PANEL_A_ID,
+    enforceCrossInstanceLease: true,
+    fetchUncachedInboundsList: async () => {
+      errCalls++;
+      return buildListResult([liveIb]);
+    },
+  });
+  assert.equal(errRes.synced, false);
+  assert.equal(errRes.skippedLease, true);
+  assert.match(String(errRes.leaseSkipReason), /^lease_read_error:/);
+  assert.equal(errCalls, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 16. Conflicting inbound_id, conflicting panel_identity, and missing inbound_id fail closed
+// ---------------------------------------------------------------------------
+test('16. Conflicting positive inbound_id, conflicting panel_identity, and legacy NULL inbound_id fail closed with zero deletion writes', async () => {
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-cib', user_id: 'u-1', email: 'u1@example.com', uuid: 'uuid-conflict-ib', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-cpid', user_id: 'u-2', email: 'u2@example.com', uuid: 'uuid-conflict-pid', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-null-ib', user_id: 'u-3', email: 'u3@example.com', uuid: 'uuid-null-ib', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-cib', customer_uid: 'u-1', uuid: 'uuid-conflict-ib', inbound_id: 10, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-cpid', customer_uid: 'u-2', uuid: 'uuid-conflict-pid', inbound_id: 10, status: 'active', enabled: true, panel_identity: PANEL_B_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-null-ib', customer_uid: 'u-3', uuid: 'uuid-null-ib', inbound_id: null, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_entitlement_grants: [
+      { id: 'g-cib', client_uuid: 'uuid-conflict-ib', inbound_id: 20, status: 'verified' },
+    ],
+  });
+
+  const emptyIb = makeInbound(10, []);
+  const syncRes = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(syncRes.deletedCount, 0);
+  assert.equal(syncRes.manualReviewCount, 3);
+  assert.equal(syncRes.panelRequestCount, 1, 'No eligible candidates -> finishes in 1 panel request with 0 locks');
+  assert.equal(db.state.rpcCalls.length, 0);
+  assert.ok(db.state.vpn_accounts.every((a) => a.status === 'active'));
+  assert.ok(db.state.audit_logs.some((a) => a.action === 'panel_deletion_inbound_mismatch' && a.target_id === 'uuid-conflict-ib'));
+});
+
+// ---------------------------------------------------------------------------
+// 17. Customer HTTP getMyConfigs NEVER triggers deletion sync or acquires deletion locks
+// ---------------------------------------------------------------------------
+test('17. Customer HTTP getMyConfigs makes ZERO deletion verification calls and ZERO deletion lock acquisitions even when PANEL_DELETION_SYNC_ENABLED=true', async () => {
+  const uid = 'cust-http';
+  const email = 'http@example.com';
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-miss', user_id: uid, email, uuid: 'uuid-missing-not-yet-swept', status: 'active', enable: true, order_id: 'ord-1', vless_url: 'vless://uuid-missing-not-yet-swept@sg.example.com:443#A', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'acc-del', user_id: uid, email, uuid: 'uuid-already-deleted-by-bg', status: 'deleted', enable: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'ord-2', vless_url: 'vless://uuid-already-deleted-by-bg@sg.example.com:443#B', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-miss', customer_uid: uid, uuid: 'uuid-missing-not-yet-swept', inbound_id: 2, status: 'active', enabled: true, order_id: 'ord-1', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'cfg-del', customer_uid: uid, uuid: 'uuid-already-deleted-by-bg', inbound_id: 2, status: 'deleted', enabled: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'ord-2', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    orders: [
+      { id: 'ord-1', order_id: 'ORD-1', customer_id: uid, email, status: 'completed', payment_status: 'Paid', client_uuid: 'uuid-missing-not-yet-swept', vless_url: 'vless://uuid-missing-not-yet-swept@sg.example.com:443#A' },
+      { id: 'ord-2', order_id: 'ORD-2', customer_id: uid, email, status: 'completed', payment_status: 'Paid', client_uuid: 'uuid-already-deleted-by-bg', vless_url: 'vless://uuid-already-deleted-by-bg@sg.example.com:443#B' },
+    ],
+  });
+
+  let verifyCalls = 0;
+  const emptyIb = makeInbound(2, []);
+  const res = await getMyConfigs(uid, email, undefined, {
+    dbClient: db,
+    adminDbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    getCachedInboundsFn: async () => [emptyIb],
+    getLiveInboundFn: async () => emptyIb,
+    getInboundsFn: async () => [emptyIb],
+    verifyDeletedFn: async () => {
+      verifyCalls++;
+      return { confirmedDeleted: true, dbWrites: 1, reason: 'must_never_be_called' };
+    },
+  });
+
+  assert.equal(verifyCalls, 0, 'getMyConfigs MUST NOT call verifyDeletedFn synchronously');
+  assert.equal(db.state.rpcCalls.length, 0, 'getMyConfigs MUST acquire ZERO deletion locks');
+  assert.equal(res.configs.length, 1);
+  assert.equal(res.configs[0].uuid, 'uuid-missing-not-yet-swept');
+  assert.deepEqual(res.deletedUuids, ['uuid-already-deleted-by-bg']);
+});
+
+// ---------------------------------------------------------------------------
+// 18. Partial malformed inbound list (1 of 2 inbounds broken) -> ZERO deletions panel-wide
+// ---------------------------------------------------------------------------
+test('18. Partial malformed inbound list (1 malformed inbound alongside 1 valid inbound) performs ZERO deletions across all customers', async () => {
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'acc-1', user_id: 'u-1', email: 'u1@example.com', uuid: 'uuid-on-ib10', status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'cfg-1', customer_uid: 'u-1', uuid: 'uuid-on-ib10', inbound_id: 10, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+  });
+
+  // Inbound 10 is cleanly parsed & empty, BUT inbound 20 has malformed JSON -> cannot prove panel-wide absence!
+  const cleanEmptyIb10 = makeInbound(10, []);
+  const brokenIb20 = makeInbound(20, [], { rawSettings: '{malformed-json' });
+
+  const syncRes = await syncDeleted3XUiClients({
+    dbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => buildListResult([cleanEmptyIb10, brokenIb20]),
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(syncRes.deletedCount, 0);
+  assert.equal(db.state.rpcCalls.length, 0);
+  assert.equal(db.state.vpn_accounts[0].status, 'active');
+  assert.equal(syncRes.details?.[0]?.reason, 'malformed_inbound_settings_in_list');
+});
+
+// ---------------------------------------------------------------------------
+// 19. Customer-scoped deletedUuids isolation: customer A never receives customer B's deleted UUIDs
+// ---------------------------------------------------------------------------
+test('19. Customer-scoped deletedUuids never leak across customers', async () => {
+  const db = createMockDb({
+    vpn_accounts: [
+      { id: 'a1', user_id: 'cust-A', email: 'a@example.com', uuid: 'uuid-a-live', status: 'active', enable: true, order_id: 'oa-1', vless_url: 'vless://uuid-a-live@sg.example.com:443#A1', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'a2', user_id: 'cust-A', email: 'a@example.com', uuid: 'uuid-a-deleted', status: 'deleted', enable: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'oa-2', vless_url: 'vless://uuid-a-deleted@sg.example.com:443#A2', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'b1', user_id: 'cust-B', email: 'b@example.com', uuid: 'uuid-b-deleted', status: 'deleted', enable: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'ob-1', vless_url: 'vless://uuid-b-deleted@sg.example.com:443#B1', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    vpn_configs: [
+      { id: 'c1', customer_uid: 'cust-A', uuid: 'uuid-a-live', inbound_id: 2, status: 'active', enabled: true, order_id: 'oa-1', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'c2', customer_uid: 'cust-A', uuid: 'uuid-a-deleted', inbound_id: 2, status: 'deleted', enabled: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'oa-2', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+      { id: 'c3', customer_uid: 'cust-B', uuid: 'uuid-b-deleted', inbound_id: 2, status: 'deleted', enabled: false, deleted_from_panel_at: PAST_CREATED_AT, order_id: 'ob-1', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT },
+    ],
+    orders: [
+      { id: 'oa-1', order_id: 'OA-1', customer_id: 'cust-A', email: 'a@example.com', status: 'completed', payment_status: 'Paid', client_uuid: 'uuid-a-live', vless_url: 'vless://uuid-a-live@sg.example.com:443#A1' },
+      { id: 'oa-2', order_id: 'OA-2', customer_id: 'cust-A', email: 'a@example.com', status: 'completed', payment_status: 'Paid', client_uuid: 'uuid-a-deleted', vless_url: 'vless://uuid-a-deleted@sg.example.com:443#A2' },
+      { id: 'ob-1', order_id: 'OB-1', customer_id: 'cust-B', email: 'b@example.com', status: 'completed', payment_status: 'Paid', client_uuid: 'uuid-b-deleted', vless_url: 'vless://uuid-b-deleted@sg.example.com:443#B1' },
+    ],
+  });
+
+  const liveIb = makeInbound(2, [{ id: 'uuid-a-live', email: 'a@example.com', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 }]);
+  const resA = await getMyConfigs('cust-A', 'a@example.com', undefined, {
+    dbClient: db,
+    adminDbClient: db,
+    currentPanelIdentity: PANEL_A_ID,
+    getCachedInboundsFn: async () => [liveIb],
+    getLiveInboundFn: async () => liveIb,
+    getInboundsFn: async () => [liveIb],
+  });
+
+  assert.equal(resA.configs.length, 1);
+  assert.equal(resA.configs[0].uuid, 'uuid-a-live');
+  assert.deepEqual(resA.deletedUuids, ['uuid-a-deleted']);
+  assert.equal(resA.deletedUuids.includes('uuid-b-deleted'), false, 'Customer A MUST NEVER receive Customer B deleted UUIDs');
+});
+
+// ---------------------------------------------------------------------------
+// 20. Distributed Lease Renewal & Ownership Verification Before Every Deletion RPC
+// ---------------------------------------------------------------------------
+test('20. Distributed lease renews before each candidate, verifies ownership before every deletion RPC, aborts remaining sweep if lease expires or is stolen, and prevents old worker from overwriting new lease', async () => {
+  const baseNow = Date.now();
+  // Create 12 tracked clients (10 live, 2 deleted candidates: uuid-del-1 and uuid-del-2)
+  const accounts: any[] = [];
+  const configs: any[] = [];
+  for (let i = 1; i <= 10; i++) {
+    const u = `uuid-live-${i}`;
+    accounts.push({ id: `acc-l-${i}`, user_id: `u-${i}`, email: `u${i}@example.com`, uuid: u, status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+    configs.push({ id: `cfg-l-${i}`, customer_uid: `u-${i}`, uuid: u, inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+  }
+  for (let i = 1; i <= 2; i++) {
+    const u = `uuid-del-${i}`;
+    accounts.push({ id: `acc-d-${i}`, user_id: `ud-${i}`, email: `ud${i}@example.com`, uuid: u, status: 'active', enable: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+    configs.push({ id: `cfg-d-${i}`, customer_uid: `ud-${i}`, uuid: u, inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+  }
+
+  const tenLiveClients = Array.from({ length: 10 }, (_, idx) => ({
+    id: `uuid-live-${idx + 1}`,
+    email: `u${idx + 1}`,
+    enable: true,
+    expiryTime: FUTURE_EXPIRY_MS,
+    totalGB: 0,
+  }));
+
+  // 20a. Normal sweep with 2 candidates renews leaseVersion before each candidate and completes both deletions
+  const dbNormal = createMockDb({ vpn_accounts: accounts, vpn_configs: configs });
+  const observedLeaseVersions = new Set<string>();
+  const origFrom = dbNormal.from.bind(dbNormal);
+  dbNormal.from = (table: string) => {
+    const row = dbNormal.state.settings.find((s) => s.id === 'panel_deletion_sync_lease');
+    if (row?.data?.leaseVersion) observedLeaseVersions.add(row.data.leaseVersion);
+    return origFrom(table);
+  };
+
+  const resNormal = await syncDeleted3XUiClients({
+    dbClient: dbNormal,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    enforceCrossInstanceLease: true,
+    leaseOwnerId: 'worker-1',
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, tenLiveClients)]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(resNormal.synced, true);
+  assert.equal(resNormal.deletedCount, 2);
+  // Initial acquire version + 2 candidate renewals + 1 release version -> >= 3 distinct versions observed
+  assert.ok(observedLeaseVersions.size >= 3, `Expected >= 3 distinct leaseVersions, got ${observedLeaseVersions.size}`);
+
+  // 20b. Lease stolen/expired mid-sweep (right before candidate 1's locked RPC) aborts candidate 1 RPC AND candidate 2,
+  // and does NOT overwrite the newer worker's lease in the finally block!
+  const dbStolen = createMockDb({ vpn_accounts: accounts, vpn_configs: configs });
+  let listCallCount = 0;
+  const resStolen = await syncDeleted3XUiClients({
+    dbClient: dbStolen,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    enforceCrossInstanceLease: true,
+    leaseOwnerId: 'worker-old',
+    fetchUncachedInboundsList: async () => {
+      listCallCount++;
+      // Call 1 = Snapshot 1, Call 2 = Snapshot 2, Call 3 = Locked Read 2 for candidate 1.
+      // Right during Locked Read 2 (before mark_vpn_client_panel_deleted RPC!), simulate lease takeover by worker-new!
+      if (listCallCount === 3) {
+        const leaseRow = dbStolen.state.settings.find((s) => s.id === 'panel_deletion_sync_lease');
+        if (leaseRow) {
+          leaseRow.data = {
+            ...leaseRow.data,
+            ownerId: 'worker-new',
+            leaseVersion: 'ver-taken-over-by-new-worker',
+            status: 'running',
+            leaseExpiresAt: new Date(Date.now() + 180000).toISOString(),
+          };
+        }
+      }
+      return buildListResult([makeInbound(2, tenLiveClients)]);
+    },
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(resStolen.synced, false);
+  assert.equal(resStolen.leaseLostMidSweep, true);
+  assert.equal(resStolen.deletedCount, 0, 'Expired/stolen worker MUST NOT execute any deletion RPC');
+  assert.equal(
+    dbStolen.state.rpcCalls.filter((c) => c.fn === 'mark_vpn_client_panel_deleted').length,
+    0,
+    'mark_vpn_client_panel_deleted RPC must NEVER be called after lease ownership is lost'
+  );
+  assert.equal(listCallCount, 3, 'Candidate 2 must be aborted immediately without even running Locked Read 2');
+  // Verify worker-new's lease was NOT released or overwritten by worker-old's finally block
+  const survivingLease = dbStolen.state.settings.find((s) => s.id === 'panel_deletion_sync_lease');
+  assert.equal(survivingLease?.data?.ownerId, 'worker-new');
+  assert.equal(survivingLease?.data?.leaseVersion, 'ver-taken-over-by-new-worker');
+  assert.equal(survivingLease?.data?.status, 'running');
+});
+
+// ---------------------------------------------------------------------------
+// 21. Atomic Cryptographic leaseVersion CAS Protection (Even With Frozen updated_at Trigger)
+// ---------------------------------------------------------------------------
+test('21. Cryptographic leaseVersion CAS prevents race condition even when PostgreSQL updated_at trigger returns identical timestamp, and handles legacy rows without leaseVersion', async () => {
+  const fixedNow = Date.now();
+  // Freeze settings.updated_at to a constant timestamp to prove CAS does NOT rely solely on updated_at
+  const db = createMockDb({
+    freezeSettingsTriggerTimestamp: '2026-11-26T12:00:00.000Z',
+    settings: [
+      {
+        id: 'panel_deletion_sync_lease',
+        // Legacy row WITHOUT leaseVersion
+        data: {
+          ownerId: 'legacy-worker',
+          status: 'idle',
+          startedAt: new Date(fixedNow - 300000).toISOString(),
+          leaseExpiresAt: null,
+          lastCompletedAt: new Date(fixedNow - 300000).toISOString(),
+          intervalMs: 120000,
+        },
+        updated_at: '2026-11-26T12:00:00.000Z',
+      },
+    ],
+  });
+
+  // 21a. Legacy row without leaseVersion upgrades cleanly to a cryptographic leaseVersion
+  const acq1 = await acquireCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    intervalMs: 120000,
+    nowMs: fixedNow,
+    ownerId: 'worker-A',
+  });
+  assert.equal(acq1.acquired, true);
+  assert.ok(acq1.leaseVersion && acq1.leaseVersion.length >= 32, 'Must generate cryptographic leaseVersion');
+
+  // 21b. Never renew with stale leaseVersion or wrong ownerId even if updated_at is identical
+  const staleVersionRenew = await renewCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'worker-A',
+    expectedLeaseVersion: 'stale-version-000',
+    nowMs: fixedNow + 1000,
+  });
+  assert.equal(staleVersionRenew.renewed, false);
+  assert.equal(staleVersionRenew.reason, 'lease_version_mismatch');
+
+  const wrongOwnerRenew = await renewCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'worker-B',
+    expectedLeaseVersion: acq1.leaseVersion,
+    nowMs: fixedNow + 1000,
+  });
+  assert.equal(wrongOwnerRenew.renewed, false);
+  assert.match(String(wrongOwnerRenew.reason), /^lease_owner_mismatch:/);
+
+  // 21c. Valid renewal rotates leaseVersion atomically
+  const validRenew = await renewCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'worker-A',
+    expectedLeaseVersion: acq1.leaseVersion,
+    nowMs: fixedNow + 5000,
+    leaseTtlMs: 180000,
+  });
+  assert.equal(validRenew.renewed, true);
+  assert.notEqual(validRenew.leaseVersion, acq1.leaseVersion, 'Renewal must rotate leaseVersion');
+
+  // 21d. Never renew an already-expired lease
+  const expiredRenew = await renewCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'worker-A',
+    expectedLeaseVersion: validRenew.leaseVersion,
+    nowMs: fixedNow + 250000, // Past 180s TTL
+  });
+  assert.equal(expiredRenew.renewed, false);
+  assert.equal(expiredRenew.reason, 'lease_already_expired');
+
+  // 21e. Expired lease is taken over by worker-B; stale worker-A cannot release or overwrite worker-B
+  const takeover = await acquireCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    intervalMs: 120000,
+    nowMs: fixedNow + 250000,
+    ownerId: 'worker-B',
+  });
+  assert.equal(takeover.acquired, true);
+  assert.equal(takeover.ownerId, 'worker-B');
+
+  const staleRelease = await releaseCrossInstanceDeletionSyncLease({
+    dbClient: db,
+    ownerId: 'worker-A',
+    expectedLeaseVersion: validRenew.leaseVersion,
+    completed: true,
+    nowMs: fixedNow + 251000,
+  });
+  assert.equal(staleRelease, false);
+
+  const staleVerify = await verifyCrossInstanceDeletionSyncLeaseOwnership({
+    dbClient: db,
+    ownerId: 'worker-A',
+    expectedLeaseVersion: validRenew.leaseVersion,
+    nowMs: fixedNow + 251000,
+  });
+  assert.equal(staleVerify.valid, false);
+});
+
+// ---------------------------------------------------------------------------
+// 22. Complete Deterministic Cursor Pagination (>1,000 and >2,500 Records + Short Server Cap)
+// ---------------------------------------------------------------------------
+test('22. Deterministic PK cursor pagination loads >1,000 and >2,500 records even when server enforces a 400-row cap, handles duplicates/conflicts, and aborts on page failure', async () => {
+  // Build 2,600 customer records (with serverMaxRows = 400, smaller than requested pageSize = 1000!)
+  // Include 2 permanently deleted clients at the very end (index 2599 and 2600, well past row 1,000 and 2,500),
+  // 1 duplicate UUID with conflicting inbound_id (index 2550), and 2,597 live clients.
+  const TOTAL_RECORDS = 2600;
+  const accounts: any[] = [];
+  const configs: any[] = [];
+  const grants: any[] = [];
+  const liveClients: any[] = [];
+
+  for (let i = 1; i <= TOTAL_RECORDS; i++) {
+    const padded = String(i).padStart(5, '0');
+    const uuid = `uuid-pag-${padded}`;
+    const uid = `user-pag-${padded}`;
+
+    accounts.push({
+      id: `acc-pag-${padded}`,
+      user_id: uid,
+      email: `${uid}@example.com`,
+      uuid,
+      status: 'active',
+      enable: true,
+      panel_identity: PANEL_A_ID,
+      created_at: PAST_CREATED_AT,
+    });
+    configs.push({
+      id: `cfg-pag-${padded}`,
+      customer_uid: uid,
+      uuid,
+      inbound_id: 2,
+      status: 'active',
+      enabled: true,
+      panel_identity: PANEL_A_ID,
+      created_at: PAST_CREATED_AT,
+    });
+    grants.push({
+      id: `grt-pag-${padded}`,
+      client_uuid: uuid,
+      inbound_id: i === 2550 ? 99 : 2, // Conflicting inbound_id on record #2550
+      status: 'verified',
+    });
+
+    // Keep all clients live EXCEPT #2550 (conflicting inbound_id, missing from panel), #2599, and #2600 (genuinely deleted)
+    if (i !== 2550 && i !== 2599 && i !== 2600) {
+      liveClients.push({
+        id: uuid,
+        email: `${uid}@example.com`,
+        enable: true,
+        expiryTime: FUTURE_EXPIRY_MS,
+        totalGB: 0,
+      });
+    }
+  }
+
+  // Add a duplicate vpn_configs row for #2599 with same owner & same inbound_id (valid duplicate)
+  configs.push({
+    id: 'cfg-pag-99999-dup',
+    customer_uid: 'user-pag-02599',
+    uuid: 'uuid-pag-02599',
+    inbound_id: 2,
+    status: 'active',
+    enabled: true,
+    panel_identity: PANEL_A_ID,
+    created_at: PAST_CREATED_AT,
+  });
+
+  // Enforce serverMaxRows: 400 while sync requests pageSize: 1000 -> proves short pages do NOT stop pagination early!
+  const dbPaginated = createMockDb({
+    serverMaxRows: 400,
+    vpn_accounts: accounts,
+    vpn_configs: configs,
+    vpn_entitlement_grants: grants,
+  });
+
+  const syncRes = await syncDeleted3XUiClients({
+    dbClient: dbPaginated,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    pageSize: 1000,
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, liveClients)]),
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(syncRes.synced, true);
+  assert.equal(syncRes.deletedCount, 2, 'Records #2599 and #2600 beyond row 2,500 must be detected and deleted');
+  assert.equal(syncRes.manualReviewCount, 1, 'Conflicting inbound_id record #2550 must be flagged for manual review');
+
+  const acc2550 = dbPaginated.state.vpn_accounts.find((a) => a.uuid === 'uuid-pag-02550');
+  const acc2599 = dbPaginated.state.vpn_accounts.find((a) => a.uuid === 'uuid-pag-02599');
+  const acc2600 = dbPaginated.state.vpn_accounts.find((a) => a.uuid === 'uuid-pag-02600');
+  assert.equal(acc2550?.status, 'active', 'Conflicting record #2550 must fail closed and stay active');
+  assert.equal(acc2599?.status, 'deleted', 'Record #2599 must be marked deleted');
+  assert.equal(acc2600?.status, 'deleted', 'Record #2600 must be marked deleted');
+
+  // 22b. Mid-pagination failure on page 3 aborts the entire sweep with zero deletions
+  let pageCallCount = 0;
+  const failingPageDb = {
+    from(table: string) {
+      const b = dbPaginated.from(table);
+      if (table === 'vpn_configs') {
+        const origThen = b.then.bind(b);
+        b.then = (resolve: any, reject: any) => {
+          pageCallCount++;
+          if (pageCallCount === 3) {
+            return Promise.resolve({ data: null, error: { message: 'page_3_connection_reset' } }).then(resolve, reject);
+          }
+          return origThen(resolve, reject);
+        };
+      }
+      return b;
+    },
+    rpc: dbPaginated.rpc.bind(dbPaginated),
+  };
+
+  const failRes = await syncDeleted3XUiClients({
+    dbClient: failingPageDb,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    pageSize: 1000,
+    fetchUncachedInboundsList: async () => buildListResult([makeInbound(2, liveClients)]),
+    reReadDelayMs: 0,
+  });
+  assert.equal(failRes.synced, false);
+  assert.equal(failRes.deletedCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 23. Final Locked Snapshot Mass-Absence Circuit Breaker Protection
+// ---------------------------------------------------------------------------
+test('23. Final locked full-panel snapshot enforces mass-absence circuit breaker (zero live clients, max count, max ratio) and aborts remaining sweep with zero RPC calls', async () => {
+  // Populate 10 tracked non-deleted clients (including active, disabled, and expired configs).
+  // Suppose 2 clients (uuid-m-1, uuid-m-2) are absent in Snapshot 1 and Snapshot 2 (2/10 = 20% <= 25%, passes outer check).
+  // Then during candidate 1's final locked Read 2, the panel suddenly drops all clients (or 5 clients = 50% > 25%)!
+  const makeTenClientsDb = () => {
+    const accs: any[] = [];
+    const cfgs: any[] = [];
+    const statuses = ['active', 'disabled', 'expired'];
+    for (let i = 1; i <= 10; i++) {
+      const u = `uuid-m-${i}`;
+      const st = statuses[i % statuses.length];
+      accs.push({ id: `am-${i}`, user_id: `um-${i}`, email: `um${i}@example.com`, uuid: u, status: st, enable: st === 'active', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+      cfgs.push({ id: `cm-${i}`, customer_uid: `um-${i}`, uuid: u, inbound_id: 2, status: st, enabled: st === 'active', panel_identity: PANEL_A_ID, created_at: PAST_CREATED_AT });
+    }
+    return createMockDb({ vpn_accounts: accs, vpn_configs: cfgs });
+  };
+
+  const eightLiveClients = Array.from({ length: 8 }, (_, idx) => ({
+    id: `uuid-m-${idx + 3}`,
+    email: `um${idx + 3}`,
+    enable: true,
+    expiryTime: FUTURE_EXPIRY_MS,
+    totalGB: 0,
+  }));
+
+  // 23a. Final locked snapshot returns 0 live clients (unexpected_zero_live_clients) -> aborts remaining sweep!
+  const dbZero = makeTenClientsDb();
+  let callNumZero = 0;
+  const resZero = await syncDeleted3XUiClients({
+    dbClient: dbZero,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => {
+      callNumZero++;
+      // Calls 1 & 2 (Snapshot 1 & 2): 8 live clients present (only uuid-m-1 & uuid-m-2 missing)
+      if (callNumZero <= 2) {
+        return buildListResult([makeInbound(2, eightLiveClients)]);
+      }
+      // Call 3 (Locked Read 2 for candidate 1): panel suddenly returns 0 live clients!
+      return buildListResult([makeInbound(2, [])]);
+    },
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(resZero.synced, false);
+  assert.equal(resZero.circuitBreakerTriggered, true);
+  assert.equal(resZero.circuitBreakerReason, 'unexpected_zero_live_clients');
+  assert.equal(resZero.deletedCount, 0);
+  assert.equal(callNumZero, 3, 'Must abort entire remaining sweep after candidate 1 locked read trips circuit breaker');
+  assert.equal(
+    dbZero.state.rpcCalls.filter((c) => c.fn === 'mark_vpn_client_panel_deleted').length,
+    0,
+    'Zero deletion RPCs may execute when locked Read 2 trips circuit breaker'
+  );
+  // Locks acquired for candidate 1 must be finalized cleanly as failed (never left in_progress or uncertain)
+  assert.equal(dbZero.state.locks.get('client:uuid-m-1')?.status, 'failed');
+  assert.equal(dbZero.state.locks.get('inbound:2')?.status, 'failed');
+
+  // 23b. Final locked snapshot exceeds maxMissingRatio (5 of 10 missing = 50% > 25%) -> aborts remaining sweep!
+  const dbRatio = makeTenClientsDb();
+  const fiveLiveClients = eightLiveClients.slice(0, 5);
+  let callNumRatio = 0;
+  const resRatio = await syncDeleted3XUiClients({
+    dbClient: dbRatio,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    fetchUncachedInboundsList: async () => {
+      callNumRatio++;
+      if (callNumRatio <= 2) {
+        return buildListResult([makeInbound(2, eightLiveClients)]);
+      }
+      return buildListResult([makeInbound(2, fiveLiveClients)]);
+    },
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(resRatio.synced, false);
+  assert.equal(resRatio.circuitBreakerTriggered, true);
+  assert.equal(resRatio.circuitBreakerReason, 'max_missing_ratio_exceeded');
+  assert.equal(resRatio.deletedCount, 0);
+  assert.equal(callNumRatio, 3);
+  assert.equal(dbRatio.state.rpcCalls.filter((c) => c.fn === 'mark_vpn_client_panel_deleted').length, 0);
+
+  // 23c. Final locked snapshot exceeds maxDeletesPerCycle (1 missing in Snapshots 1 & 2 with maxDeletesPerCycle=1, then 2 missing in locked Read 2) -> aborts!
+  const dbCount = makeTenClientsDb();
+  const nineLiveClients = Array.from({ length: 9 }, (_, idx) => ({
+    id: `uuid-m-${idx + 2}`,
+    email: `um${idx + 2}`,
+    enable: true,
+    expiryTime: FUTURE_EXPIRY_MS,
+    totalGB: 0,
+  }));
+  let callNumCount = 0;
+  const resCount = await syncDeleted3XUiClients({
+    dbClient: dbCount,
+    currentPanelIdentity: PANEL_A_ID,
+    configuredServers: [],
+    maxDeletesPerCycle: 1,
+    fetchUncachedInboundsList: async () => {
+      callNumCount++;
+      if (callNumCount <= 2) {
+        return buildListResult([makeInbound(2, nineLiveClients)]);
+      }
+      return buildListResult([makeInbound(2, eightLiveClients)]);
+    },
+    reReadDelayMs: 0,
+  });
+
+  assert.equal(resCount.synced, false);
+  assert.equal(resCount.circuitBreakerTriggered, true);
+  assert.equal(resCount.circuitBreakerReason, 'max_deletes_per_cycle_exceeded');
+  assert.equal(resCount.deletedCount, 0);
+  assert.equal(callNumCount, 3);
+  assert.equal(dbCount.state.rpcCalls.filter((c) => c.fn === 'mark_vpn_client_panel_deleted').length, 0);
+});

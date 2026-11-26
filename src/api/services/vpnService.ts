@@ -6,12 +6,724 @@ import {
   resetClientTraffic,
   parseInboundSettingsClientsStrict,
   verifyAndMarkClientDeletedIfConfirmed,
-  isPanelDeletionSyncFlagEnabled,
   isSafeToRestoreActiveStatus,
   getCurrentPanelIdentity,
+  ResetClientTrafficOptions,
 } from './xuiService.js';
 import { createCustomerNotification } from './notificationService.js';
 import crypto from 'crypto';
+
+export const TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE =
+  'Traffic reset is only available for eligible unlimited VPN packages.';
+
+export type QuotaClassification = 'unlimited' | 'finite' | 'unknown' | 'invalid';
+
+const FINITE_QUOTA_UNIT_REGEX =
+  /(?:^|\b)(\d+(?:\.\d+)?)\s*(?:kb|mb|gb|tb|gib|mib|tib|bytes?)\b/i;
+const FINITE_PACKAGE_SHORTHAND_REGEX =
+  /\b(?:sim|router)[_\s-]?(?:100|200|500|1000|1tb|50|20|10|5|1)\b|\b(?:100|200|500)\s*g\b/i;
+const NEGATIVE_NUMBER_TOKEN_REGEX = /(?:^|[\s:(])-\d/;
+
+export const parsePaymentMethodJsonSafe = (raw: any): Record<string, any> => {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {
+        return {};
+      }
+    }
+  }
+  return {};
+};
+
+export const classifyQuotaText = (raw: any): QuotaClassification => {
+  if (raw === null || raw === undefined) return 'unknown';
+  if (typeof raw === 'boolean') return 'invalid';
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0) return 'invalid';
+    if (raw > 0) return 'finite';
+    return 'unknown';
+  }
+  const trimmed = String(raw).trim();
+  if (!trimmed) return 'unknown';
+  const lower = trimmed.toLowerCase();
+
+  if (
+    lower === 'null' ||
+    lower === 'undefined' ||
+    lower === 'nan' ||
+    lower === 'none' ||
+    lower === 'n/a' ||
+    lower === '-' ||
+    lower.startsWith('-') ||
+    NEGATIVE_NUMBER_TOKEN_REGEX.test(lower)
+  ) {
+    return 'invalid';
+  }
+
+  const unitMatch = FINITE_QUOTA_UNIT_REGEX.exec(lower);
+  if (unitMatch) {
+    const numericVal = parseFloat(unitMatch[1]);
+    if (!Number.isFinite(numericVal) || numericVal <= 0) {
+      return 'invalid';
+    }
+    return 'finite';
+  }
+
+  if (FINITE_PACKAGE_SHORTHAND_REGEX.test(lower)) {
+    return 'finite';
+  }
+
+  if (/^-?\d+(?:\.\d+)?$/.test(lower)) {
+    const num = Number(lower);
+    if (!Number.isFinite(num) || num <= 0) {
+      return 'invalid';
+    }
+    return 'finite';
+  }
+
+  if (/\bunlimited\b/i.test(lower)) {
+    return 'unlimited';
+  }
+
+  return 'unknown';
+};
+
+export const classifyNumericQuotaBytes = (
+  raw: any,
+  options?: { allowZeroAsUnlimited?: boolean }
+): QuotaClassification => {
+  if (raw === null || raw === undefined || raw === '') return 'unknown';
+  if (typeof raw === 'boolean') return 'invalid';
+
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0) return 'invalid';
+    if (raw > 0) return 'finite';
+    return options?.allowZeroAsUnlimited ? 'unlimited' : 'unknown';
+  }
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return 'unknown';
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (!Number.isFinite(num) || num < 0) return 'invalid';
+      if (num > 0) return 'finite';
+      return options?.allowZeroAsUnlimited ? 'unlimited' : 'unknown';
+    }
+    return classifyQuotaText(trimmed);
+  }
+
+  return 'invalid';
+};
+
+const parseTimestampToMsSafe = (raw: any): number | null => {
+  if (raw === null || raw === undefined || raw === '' || raw === 0 || raw === '0') {
+    return null;
+  }
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw === 0) return null;
+    if (raw < 0) return raw;
+    return raw < 10000000000 ? raw * 1000 : raw;
+  }
+  if (raw instanceof Date) {
+    const ts = raw.getTime();
+    return Number.isNaN(ts) ? null : ts;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed === '0') return null;
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (!Number.isFinite(num) || num === 0) return null;
+      if (num < 0) return num;
+      return num < 10000000000 ? num * 1000 : num;
+    }
+    const parsed = new Date(trimmed).getTime();
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+};
+
+const getEntitlementRecordTimestampMs = (rec: any): number => {
+  if (!rec || typeof rec !== 'object') return 0;
+  const candidates = [rec.verified_at, rec.activated_at, rec.updated_at, rec.created_at];
+  for (const c of candidates) {
+    const ts = parseTimestampToMsSafe(c);
+    if (ts !== null && ts > 0) return ts;
+  }
+  return 0;
+};
+
+const isTrialEntitlementRecord = (rec: any, pmJson?: Record<string, any>): boolean => {
+  if (!rec || typeof rec !== 'object') return false;
+  const pm = pmJson || parsePaymentMethodJsonSafe(rec.payment_method);
+  const orderIdStr = String(rec.order_id || rec.orderId || '').trim().toUpperCase();
+  const pkgType = String(rec.package_type || rec.packageType || pm.package_type || pm.packageType || '').toLowerCase();
+  const pkgName = String(rec.package_name || rec.packageName || pm.package_name || pm.packageName || '').toLowerCase();
+  const payMethodName = String(pm.paymentMethod || pm.payment_method || '').toLowerCase();
+
+  return Boolean(
+    rec.is_trial === true ||
+      rec.isTrial === true ||
+      pm.is_trial === true ||
+      pm.isTrial === true ||
+      payMethodName.includes('trial') ||
+      orderIdStr.startsWith('TRIAL-') ||
+      pkgType.includes('trial') ||
+      /\bfree\s*trial\b/.test(pkgName)
+  );
+};
+
+export interface EvaluateCustomerTrafficResetEligibilityInput {
+  vpnAccount?: any | null;
+  vpnConfig?: any | null;
+  orders?: any[];
+  grants?: any[];
+  ownershipSource?: 'vpn_accounts' | 'orders' | 'vpn_configs' | '3xui' | null;
+  panelReachable: boolean;
+  liveInbound?: any | null;
+  liveClient?: any | null;
+  liveStat?: any | null;
+  nowMs?: number;
+}
+
+export interface CustomerTrafficResetEligibilityResult {
+  eligible: boolean;
+  isUnlimitedPlan: boolean;
+  reasonCode: string;
+  customerMessage: string;
+  httpStatus: number;
+  liveUpBytes: number;
+  liveDownBytes: number;
+  liveTotalLimitBytes: number | null;
+}
+
+/**
+ * Authoritative, fail-closed eligibility evaluator for customer self-service traffic reset.
+ * Enforces:
+ * - Verified Supabase DB record (never pure 3X-UI fallback)
+ * - Unconditional free-trial block (ignoring policy.allowTrialReset)
+ * - Active, enabled, unexpired, non-deleted, non-rejected, non-revoked, non-unresolved-renewal state
+ * - Live 3X-UI verification with strict numeric totalGB === 0 and stat.total === 0
+ * - Current effective entitlement agreement (distinguishing newer verified grants from superseded historical records)
+ * - Never treats missing, null, empty, negative, NaN, default-0-only, or package-name-only signals as unlimited.
+ */
+export const evaluateCustomerTrafficResetEligibility = (
+  input: EvaluateCustomerTrafficResetEligibilityInput
+): CustomerTrafficResetEligibilityResult => {
+  const nowMs = input.nowMs ?? Date.now();
+  const vpnAccount = input.vpnAccount && typeof input.vpnAccount === 'object' ? input.vpnAccount : null;
+  const vpnConfig = input.vpnConfig && typeof input.vpnConfig === 'object' ? input.vpnConfig : null;
+  const orders = Array.isArray(input.orders) ? input.orders.filter(Boolean) : [];
+  const grants = Array.isArray(input.grants) ? input.grants.filter(Boolean) : [];
+
+  const liveUpBytes = Math.max(
+    0,
+    Number(input.liveStat?.up ?? input.liveClient?.up ?? 0) || 0
+  );
+  const liveDownBytes = Math.max(
+    0,
+    Number(input.liveStat?.down ?? input.liveClient?.down ?? 0) || 0
+  );
+
+  const rawLiveLimit =
+    input.liveStat?.total !== undefined && input.liveStat?.total !== null && Number(input.liveStat.total) > 0
+      ? Number(input.liveStat.total)
+      : input.liveClient?.totalGB !== undefined && input.liveClient?.totalGB !== null && input.liveClient?.totalGB !== ''
+        ? Number(input.liveClient.totalGB)
+        : null;
+  const liveTotalLimitBytes =
+    rawLiveLimit !== null && Number.isFinite(rawLiveLimit) && rawLiveLimit >= 0 ? rawLiveLimit : null;
+
+  const deny = (
+    reasonCode: string,
+    httpStatus: number = 403,
+    customerMessage: string = TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE,
+    isUnlimitedPlan: boolean = false
+  ): CustomerTrafficResetEligibilityResult => ({
+    eligible: false,
+    isUnlimitedPlan,
+    reasonCode,
+    customerMessage,
+    httpStatus,
+    liveUpBytes,
+    liveDownBytes,
+    liveTotalLimitBytes,
+  });
+
+  // 1. Must be backed by an authoritative Supabase DB record (never pure 3X-UI fallback)
+  if (
+    input.ownershipSource === '3xui' ||
+    (!vpnAccount && !vpnConfig && orders.length === 0 && grants.length === 0)
+  ) {
+    return deny('unverified_db_record');
+  }
+
+  // 2. Analyze entitlement grants (distinguishing current effective grant from historical/superseded grants)
+  let hasRejectedNewOrderGrant = false;
+  let hasUnresolvedNewOrderGrant = false;
+  let hasUnresolvedRenewalGrant = false;
+  const effectiveGrants: any[] = [];
+
+  for (const g of grants) {
+    const gType = String(g.grant_type || 'new_order').toLowerCase().trim();
+    const gStatus = String(g.status || '').toLowerCase().trim();
+
+    if (gType === 'new_order') {
+      if (
+        gStatus === 'revoked' ||
+        gStatus === 'revoke_failed' ||
+        gStatus === 'rejected' ||
+        gStatus === 'cancelled' ||
+        gStatus === 'deleted'
+      ) {
+        hasRejectedNewOrderGrant = true;
+      } else if (gStatus === 'provisioning' || gStatus === 'uncertain') {
+        hasUnresolvedNewOrderGrant = true;
+      } else if (gStatus === 'verified' || gStatus === 'confirmed' || gStatus === 'provisional') {
+        effectiveGrants.push(g);
+      }
+    } else if (gType === 'renewal') {
+      if (
+        gStatus === 'provisioning' ||
+        gStatus === 'provisional' ||
+        gStatus === 'uncertain' ||
+        gStatus === 'revoke_failed'
+      ) {
+        hasUnresolvedRenewalGrant = true;
+      } else if (gStatus === 'verified' || gStatus === 'confirmed') {
+        effectiveGrants.push(g);
+      }
+      // Note: a revoked/rejected renewal grant restores the pre-renewal state and does NOT invalidate the parent VPN.
+    }
+  }
+
+  effectiveGrants.sort((a, b) => {
+    const diff = getEntitlementRecordTimestampMs(b) - getEntitlementRecordTimestampMs(a);
+    if (diff !== 0) return diff;
+    const aIsRenewal = String(a.grant_type || '').toLowerCase() === 'renewal' ? 1 : 0;
+    const bIsRenewal = String(b.grant_type || '').toLowerCase() === 'renewal' ? 1 : 0;
+    return bIsRenewal - aIsRenewal;
+  });
+
+  const currentGrant = effectiveGrants[0] || null;
+  const currentGrantTs = currentGrant ? getEntitlementRecordTimestampMs(currentGrant) : 0;
+  const currentGrantIsVerifiedRenewal = Boolean(
+    currentGrant && String(currentGrant.grant_type || '').toLowerCase().trim() === 'renewal'
+  );
+
+  // 3. Analyze orders (distinguishing base order rejections and newer/superseded orders)
+  let hasRejectedBaseOrder = false;
+  const nonRejectedOrders: any[] = [];
+  const preferredOrderIds = new Set<string>(
+    [
+      currentGrant?.order_id,
+      vpnAccount?.order_id,
+      vpnConfig?.order_id,
+    ]
+      .filter(Boolean)
+      .map((v) => String(v).trim())
+  );
+
+  for (const ord of orders) {
+    const pm = parsePaymentMethodJsonSafe(ord.payment_method);
+    const isRenewalOrder = Boolean(pm.is_renewal || pm.isRenewal || pm.extend_uuid);
+    const ordStatus = String(ord.status || '').toLowerCase().trim();
+    const ordPayStatus = String(ord.payment_status || '').toLowerCase().trim();
+    const ordProvStatus = String(ord.provisioning_status || '').toLowerCase().trim();
+
+    if (isOrderRejectedOrRevoked(ord)) {
+      if (!isRenewalOrder) {
+        hasRejectedBaseOrder = true;
+      }
+      continue;
+    }
+
+    if (
+      ordStatus === 'deleted' ||
+      ordStatus === 'cancelled' ||
+      ordStatus === 'pending' ||
+      ordStatus === 'provisioning' ||
+      ordPayStatus === 'cancelled' ||
+      ordProvStatus === 'provisioning' ||
+      ordProvStatus === 'uncertain'
+    ) {
+      if (!isRenewalOrder && (ordStatus === 'deleted' || ordStatus === 'cancelled')) {
+        hasRejectedBaseOrder = true;
+      }
+      continue;
+    }
+
+    nonRejectedOrders.push(ord);
+  }
+
+  nonRejectedOrders.sort((a, b) => {
+    const diff = getEntitlementRecordTimestampMs(b) - getEntitlementRecordTimestampMs(a);
+    if (diff !== 0) return diff;
+    const aPreferred = preferredOrderIds.has(String(a.id || '').trim()) || preferredOrderIds.has(String(a.order_id || '').trim()) ? 1 : 0;
+    const bPreferred = preferredOrderIds.has(String(b.id || '').trim()) || preferredOrderIds.has(String(b.order_id || '').trim()) ? 1 : 0;
+    return bPreferred - aPreferred;
+  });
+
+  const currentOrder = nonRejectedOrders[0] || null;
+  const currentOrderTs = currentOrder ? getEntitlementRecordTimestampMs(currentOrder) : 0;
+  const isOrderSupersededByCurrentGrant = Boolean(
+    currentGrantIsVerifiedRenewal &&
+      currentOrder &&
+      currentGrantTs >= currentOrderTs
+  );
+
+  // 4. Unconditional free trial block (ignores policy.allowTrialReset)
+  if (
+    isTrialEntitlementRecord(vpnAccount) ||
+    isTrialEntitlementRecord(vpnConfig) ||
+    isTrialEntitlementRecord(currentOrder) ||
+    isTrialEntitlementRecord(currentGrant)
+  ) {
+    return deny('free_trial_blocked');
+  }
+
+  // 5. Block deleted, rejected, revoked, unresolved provisioning/renewal, disabled, or expired DB states
+  if (hasRejectedNewOrderGrant || hasRejectedBaseOrder) {
+    return deny('rejected_or_revoked');
+  }
+  if (hasUnresolvedRenewalGrant || hasUnresolvedNewOrderGrant) {
+    return deny(
+      'unresolved_entitlement_grant',
+      409,
+      'A renewal or provisioning update is currently pending for this VPN configuration. Please try again shortly.'
+    );
+  }
+
+  const checkDbRowState = (row: any, rowName: string): CustomerTrafficResetEligibilityResult | null => {
+    if (!row) return null;
+    if (row.deleted_from_panel_at) {
+      return deny(`${rowName}_deleted`);
+    }
+    const st = String(row.status || '').toLowerCase().trim();
+    if (
+      st === 'deleted' ||
+      st === 'rejected' ||
+      st === 'revoked' ||
+      st === 'cancelled' ||
+      st === 'disabled' ||
+      st === 'expired' ||
+      st === 'pending' ||
+      st === 'provisioning'
+    ) {
+      return deny(`${rowName}_status_${st}`);
+    }
+    if (row.enable === false || row.enabled === false) {
+      return deny(`${rowName}_disabled`);
+    }
+    const expCandidates = [row.expiry_time, row.expiry_date, row.expires_at, row.expiryDate];
+    for (const expRaw of expCandidates) {
+      const expMs = parseTimestampToMsSafe(expRaw);
+      if (expMs !== null && (expMs < 0 || expMs <= nowMs)) {
+        return deny(`${rowName}_expired`);
+      }
+    }
+    return null;
+  };
+
+  const accStateBlock = checkDbRowState(vpnAccount, 'vpn_account');
+  if (accStateBlock) return accStateBlock;
+
+  const cfgStateBlock = checkDbRowState(vpnConfig, 'vpn_config');
+  if (cfgStateBlock) return cfgStateBlock;
+
+  // 6. Fresh Live 3X-UI Verification & Strict Live Quota Verification
+  if (!input.panelReachable || !input.liveInbound || !input.liveClient) {
+    return deny('panel_unverified');
+  }
+
+  if (
+    input.liveInbound.enable === false ||
+    input.liveClient.enable === false ||
+    input.liveStat?.enable === false
+  ) {
+    return deny('panel_disabled');
+  }
+
+  const liveClientExpMs = parseTimestampToMsSafe(input.liveClient.expiryTime);
+  const liveStatExpMs = parseTimestampToMsSafe(input.liveStat?.expiryTime);
+  if (
+    (liveClientExpMs !== null && (liveClientExpMs < 0 || liveClientExpMs <= nowMs)) ||
+    (liveStatExpMs !== null && (liveStatExpMs < 0 || liveStatExpMs <= nowMs))
+  ) {
+    return deny('panel_expired');
+  }
+
+  // Strict live 3X-UI quota check: client.totalGB MUST be explicitly present and strictly 0.
+  // Missing, null, empty, negative, NaN, or positive values MUST fail closed.
+  const liveTotalGbCls = classifyNumericQuotaBytes(input.liveClient.totalGB, {
+    allowZeroAsUnlimited: true,
+  });
+  if (liveTotalGbCls !== 'unlimited') {
+    return deny(`panel_totalgb_${liveTotalGbCls}`);
+  }
+
+  if (
+    input.liveClient.totalBytes !== undefined &&
+    input.liveClient.totalBytes !== null &&
+    input.liveClient.totalBytes !== ''
+  ) {
+    const cls = classifyNumericQuotaBytes(input.liveClient.totalBytes, {
+      allowZeroAsUnlimited: true,
+    });
+    if (cls !== 'unlimited') {
+      return deny(`panel_totalbytes_${cls}`);
+    }
+  }
+
+  if (
+    input.liveClient.total !== undefined &&
+    input.liveClient.total !== null &&
+    input.liveClient.total !== ''
+  ) {
+    const cls = classifyNumericQuotaBytes(input.liveClient.total, {
+      allowZeroAsUnlimited: true,
+    });
+    if (cls !== 'unlimited') {
+      return deny(`panel_client_total_${cls}`);
+    }
+  }
+
+  if (
+    input.liveStat &&
+    input.liveStat.total !== undefined &&
+    input.liveStat.total !== null &&
+    input.liveStat.total !== ''
+  ) {
+    const cls = classifyNumericQuotaBytes(input.liveStat.total, {
+      allowZeroAsUnlimited: true,
+    });
+    if (cls !== 'unlimited') {
+      return deny(`panel_stat_total_${cls}`);
+    }
+  }
+
+  // 7. Authoritative DB Entitlement Quota Agreement
+  // Never rely on package names alone, and never treat default numeric 0 (e.g., total_bytes = 0)
+  // without an explicit unlimited quota confirmation as unlimited.
+  const positiveUnlimitedSources: string[] = [];
+  const conflictReasons: string[] = [];
+
+  // Source A: Current effective entitlement grant
+  if (currentGrant) {
+    let grantHasConflict = false;
+    if (currentGrant.granted_unlimited === false) {
+      conflictReasons.push('grant_not_unlimited');
+      grantHasConflict = true;
+    }
+
+    if (
+      currentGrant.granted_total_bytes !== undefined &&
+      currentGrant.granted_total_bytes !== null &&
+      currentGrant.granted_total_bytes !== ''
+    ) {
+      const cls = classifyNumericQuotaBytes(currentGrant.granted_total_bytes, {
+        allowZeroAsUnlimited: true,
+      });
+      if (cls !== 'unlimited') {
+        conflictReasons.push(`grant_total_bytes_${cls}`);
+        grantHasConflict = true;
+      }
+    }
+
+    if (
+      currentGrant.added_quota_bytes !== undefined &&
+      currentGrant.added_quota_bytes !== null &&
+      currentGrant.added_quota_bytes !== ''
+    ) {
+      const cls = classifyNumericQuotaBytes(currentGrant.added_quota_bytes, {
+        allowZeroAsUnlimited: true,
+      });
+      if (cls !== 'unlimited') {
+        conflictReasons.push(`grant_added_quota_${cls}`);
+        grantHasConflict = true;
+      }
+    }
+
+    if (currentGrant.package_name && classifyQuotaText(currentGrant.package_name) === 'finite') {
+      conflictReasons.push('grant_package_finite');
+      grantHasConflict = true;
+    }
+
+    if (currentGrant.granted_unlimited === true && !grantHasConflict) {
+      positiveUnlimitedSources.push('current_grant');
+    }
+  }
+
+  // Source B: vpn_accounts row
+  if (vpnAccount) {
+    if (
+      vpnAccount.total_bytes !== undefined &&
+      vpnAccount.total_bytes !== null &&
+      vpnAccount.total_bytes !== ''
+    ) {
+      // allowZeroAsUnlimited: false -> default 0 alone is NEVER standalone proof of unlimited
+      const cls = classifyNumericQuotaBytes(vpnAccount.total_bytes, {
+        allowZeroAsUnlimited: false,
+      });
+      if (cls === 'finite' || cls === 'invalid') {
+        conflictReasons.push(`vpn_account_total_bytes_${cls}`);
+      }
+    }
+
+    if (
+      vpnAccount.data_limit !== undefined &&
+      vpnAccount.data_limit !== null &&
+      String(vpnAccount.data_limit).trim() !== ''
+    ) {
+      const cls = classifyQuotaText(vpnAccount.data_limit);
+      if (cls === 'finite' || cls === 'invalid') {
+        conflictReasons.push(`vpn_account_data_limit_${cls}`);
+      } else if (cls === 'unlimited') {
+        positiveUnlimitedSources.push('vpn_accounts.data_limit');
+      }
+    }
+
+    if (vpnAccount.package_name && classifyQuotaText(vpnAccount.package_name) === 'finite') {
+      conflictReasons.push('vpn_account_package_finite');
+    }
+  }
+
+  // Source C: vpn_configs row (skip superseded initial quota/name only if strictly older than a newer verified renewal grant)
+  if (vpnConfig) {
+    const cfgTs = getEntitlementRecordTimestampMs(vpnConfig);
+    const isVpnConfigSupersededByRenewalGrant = Boolean(
+      currentGrantIsVerifiedRenewal &&
+        currentGrant?.granted_unlimited === true &&
+        cfgTs > 0 &&
+        currentGrantTs > cfgTs
+    );
+
+    if (!isVpnConfigSupersededByRenewalGrant) {
+      const cfgQuotaFields = [
+        { name: 'data_limit', val: vpnConfig.data_limit },
+        { name: 'traffic_limit', val: vpnConfig.traffic_limit },
+      ];
+      for (const f of cfgQuotaFields) {
+        if (f.val === undefined || f.val === null || String(f.val).trim() === '') continue;
+        const cls =
+          typeof f.val === 'number'
+            ? classifyNumericQuotaBytes(f.val, { allowZeroAsUnlimited: false })
+            : classifyQuotaText(f.val);
+        if (cls === 'finite' || cls === 'invalid') {
+          conflictReasons.push(`vpn_config_${f.name}_${cls}`);
+        } else if (cls === 'unlimited') {
+          positiveUnlimitedSources.push(`vpn_configs.${f.name}`);
+        }
+      }
+
+      const cfgPkgFields = [vpnConfig.package_name, vpnConfig.package_type];
+      for (const pkg of cfgPkgFields) {
+        if (pkg && classifyQuotaText(pkg) === 'finite') {
+          conflictReasons.push('vpn_config_package_finite');
+        }
+      }
+    }
+  }
+
+  // Source D: Current effective order (skipped if superseded by a newer verified renewal grant)
+  if (currentOrder && !isOrderSupersededByCurrentGrant) {
+    const pm = parsePaymentMethodJsonSafe(currentOrder.payment_method);
+
+    const boolFlags = [
+      currentOrder.is_unlimited,
+      pm.is_unlimited,
+      pm.isUnlimited,
+      pm.unlimited,
+    ];
+    for (const flag of boolFlags) {
+      if (flag === false) {
+        conflictReasons.push('order_unlimited_flag_false');
+      } else if (flag === true) {
+        positiveUnlimitedSources.push('current_order.unlimited_flag');
+      }
+    }
+
+    const numericOrderFields = [
+      currentOrder.total_bytes,
+      pm.total_bytes,
+      pm.quota_bytes,
+      pm.limit_gb,
+      pm.limitGB,
+      pm.data_gb,
+      pm.dataGB,
+    ];
+    for (const val of numericOrderFields) {
+      if (val === undefined || val === null || val === '') continue;
+      const cls = classifyNumericQuotaBytes(val, { allowZeroAsUnlimited: false });
+      if (cls === 'finite' || cls === 'invalid') {
+        conflictReasons.push(`order_numeric_quota_${cls}`);
+      }
+    }
+
+    const textOrderQuotaFields = [
+      currentOrder.data_limit,
+      currentOrder.traffic_limit,
+      pm.data_limit,
+      pm.dataLimit,
+      pm.traffic_limit,
+      pm.trafficLimit,
+      pm.quota,
+    ];
+    for (const val of textOrderQuotaFields) {
+      if (val === undefined || val === null || String(val).trim() === '') continue;
+      const cls = classifyQuotaText(val);
+      if (cls === 'finite' || cls === 'invalid') {
+        conflictReasons.push(`order_text_quota_${cls}`);
+      } else if (cls === 'unlimited') {
+        positiveUnlimitedSources.push('current_order.quota_meta');
+      }
+    }
+
+    // Package names are checked ONLY as finite-conflict detectors; NEVER as standalone unlimited proof
+    const orderPkgFields = [
+      currentOrder.package_name,
+      currentOrder.plan,
+      pm.package_name,
+      pm.packageName,
+      pm.package_type,
+      pm.packageType,
+      pm.plan,
+    ];
+    for (const pkg of orderPkgFields) {
+      if (pkg && classifyQuotaText(pkg) === 'finite') {
+        conflictReasons.push('order_package_finite');
+      }
+    }
+  }
+
+  if (conflictReasons.length > 0) {
+    return deny(conflictReasons[0]);
+  }
+
+  if (positiveUnlimitedSources.length === 0) {
+    return deny('missing_authoritative_unlimited_confirmation');
+  }
+
+  return {
+    eligible: true,
+    isUnlimitedPlan: true,
+    reasonCode: 'eligible_unlimited',
+    customerMessage: '',
+    httpStatus: 200,
+    liveUpBytes,
+    liveDownBytes,
+    liveTotalLimitBytes: 0,
+  };
+};
 
 export type VpnObservedStatus =
   | 'Active'
@@ -245,6 +957,8 @@ export const buildRejectedVpnDisplayConfig = (ord: any, grant?: any): Record<str
     provisioningStatus: rawProv,
     rejectionMessage: REJECTED_VPN_CUSTOMER_MESSAGE,
     rejectionReason: safeReason,
+    trafficResetEligible: false,
+    isUnlimitedPlan: false,
   };
 };
 
@@ -399,57 +1113,70 @@ export const getMyConfigs = async (
   const nonApprovedOrderIds = new Set<string>();
   const nonApprovedOrderUuids = new Set<string>();
   const grantByOrderId = new Map<string, any>();
+  const grantsByUuid = new Map<string, any[]>();
+  const grantsByOrderIdList = new Map<string, any[]>();
+
+  const registerGrantRow = (g: any) => {
+    if (!g || typeof g !== 'object') return;
+    const gType = String(g.grant_type || 'new_order').toLowerCase().trim();
+    const gStatus = String(g.status || '').toLowerCase().trim();
+    const gUuid = String(g.client_uuid || '').trim().toLowerCase();
+    const gOrderId = String(g.order_id || '').trim();
+    const gIbId = Number(g.inbound_id);
+    if (!Number.isNaN(gIbId) && gIbId > 0) {
+      if (gOrderId && !inboundMap.has(gOrderId)) inboundMap.set(gOrderId, gIbId);
+      if (gUuid && !inboundMap.has(gUuid)) inboundMap.set(gUuid, gIbId);
+    }
+    if (gUuid) {
+      const existing = grantsByUuid.get(gUuid) || [];
+      if (!existing.some((x) => (x.id && g.id ? x.id === g.id : x === g))) {
+        existing.push(g);
+        grantsByUuid.set(gUuid, existing);
+      }
+    }
+    if (gOrderId) {
+      const existingOrd = grantsByOrderIdList.get(gOrderId) || [];
+      if (!existingOrd.some((x) => (x.id && g.id ? x.id === g.id : x === g))) {
+        existingOrd.push(g);
+        grantsByOrderIdList.set(gOrderId, existingOrd);
+      }
+    }
+    // CRITICAL: Only a 'new_order' entitlement grant represents the order's own base VPN creation.
+    // A rejected/revoked 'renewal' grant restores the existing paid VPN to its pre-renewal state
+    // and must NEVER mark the parent order or client_uuid as non-approved, deleted, or rejected!
+    if (gType === 'new_order') {
+      if (gOrderId) grantByOrderId.set(gOrderId, g);
+      if (
+        gStatus === 'revoked' ||
+        gStatus === 'revoke_failed' ||
+        gStatus === 'rejected' ||
+        gStatus === 'cancelled' ||
+        gStatus === 'deleted'
+      ) {
+        if (gOrderId) nonApprovedOrderIds.add(gOrderId);
+        if (gUuid) {
+          nonApprovedOrderUuids.add(gUuid);
+          blockedNonActiveUuids.add(gUuid);
+        }
+      }
+    }
+  };
 
   // Defense-in-depth: also inspect vpn_entitlement_grants for this customer's orders
   // so revoked / revoke_failed grants are strictly excluded from active configs and
-  // authoritative inbound_id / revoke_reason are available.
+  // authoritative inbound_id / revoke_reason / quota metadata are available.
   const customerOrderRowIds = allOrders
     .map(ord => (ord?.id ? String(ord.id).trim() : ''))
     .filter(Boolean);
   if (customerOrderRowIds.length > 0 && adminDb) {
     try {
-      let grantsRes = await adminDb
+      const grantsRes = await adminDb
         .from('vpn_entitlement_grants')
-        .select('grant_type, order_id, client_uuid, inbound_id, status, revoke_reason')
+        .select('*')
         .in('order_id', customerOrderRowIds);
-      if (grantsRes.error && String(grantsRes.error.message || '').includes('revoke_reason')) {
-        grantsRes = await adminDb
-          .from('vpn_entitlement_grants')
-          .select('grant_type, order_id, client_uuid, inbound_id, status')
-          .in('order_id', customerOrderRowIds) as any;
-      }
       const grants = grantsRes.data;
       if (Array.isArray(grants)) {
-        grants.forEach((g: any) => {
-          const gType = String(g.grant_type || 'new_order').toLowerCase().trim();
-          const gStatus = String(g.status || '').toLowerCase().trim();
-          const gUuid = String(g.client_uuid || '').trim().toLowerCase();
-          const gOrderId = String(g.order_id || '').trim();
-          const gIbId = Number(g.inbound_id);
-          if (!Number.isNaN(gIbId) && gIbId > 0) {
-            if (gOrderId && !inboundMap.has(gOrderId)) inboundMap.set(gOrderId, gIbId);
-            if (gUuid && !inboundMap.has(gUuid)) inboundMap.set(gUuid, gIbId);
-          }
-          // CRITICAL: Only a 'new_order' entitlement grant represents the order's own base VPN creation.
-          // A rejected/revoked 'renewal' grant restores the existing paid VPN to its pre-renewal state
-          // and must NEVER mark the parent order or client_uuid as non-approved, deleted, or rejected!
-          if (gType === 'new_order') {
-            if (gOrderId) grantByOrderId.set(gOrderId, g);
-            if (
-              gStatus === 'revoked' ||
-              gStatus === 'revoke_failed' ||
-              gStatus === 'rejected' ||
-              gStatus === 'cancelled' ||
-              gStatus === 'deleted'
-            ) {
-              if (gOrderId) nonApprovedOrderIds.add(gOrderId);
-              if (gUuid) {
-                nonApprovedOrderUuids.add(gUuid);
-                blockedNonActiveUuids.add(gUuid);
-              }
-            }
-          }
-        });
+        grants.forEach(registerGrantRow);
       }
     } catch (_grantErr) {
       // Non-blocking if table or rows are absent
@@ -655,6 +1382,59 @@ export const getMyConfigs = async (
     }
   });
 
+  // Also batch-fetch any renewal/client grants by client_uuid (e.g. renewal grants whose order_id is null)
+  const customerConfigUuids = Array.from(
+    new Set(
+      configs
+        .map((c) => String(c.uuid || '').trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+  if (customerConfigUuids.length > 0 && adminDb) {
+    try {
+      const { data: uuidGrants } = await adminDb
+        .from('vpn_entitlement_grants')
+        .select('*')
+        .in('client_uuid', customerConfigUuids);
+      if (Array.isArray(uuidGrants)) {
+        uuidGrants.forEach(registerGrantRow);
+      }
+    } catch (_uuidGrantErr) {
+      // Non-blocking
+    }
+  }
+
+  // Index already-fetched customer orders by UUID and order ID for zero-extra-query eligibility checks
+  const ordersByUuidMap = new Map<string, any[]>();
+  const ordersByAnyIdMap = new Map<string, any[]>();
+  allOrders.forEach((ord) => {
+    const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || '').trim().toLowerCase();
+    if (cUuid) {
+      const list = ordersByUuidMap.get(cUuid) || [];
+      list.push(ord);
+      ordersByUuidMap.set(cUuid, list);
+    }
+    const pm = parsePaymentMethodJsonSafe(ord.payment_method);
+    const extUuid = String(pm.extend_uuid || '').trim().toLowerCase();
+    if (extUuid && extUuid !== cUuid) {
+      const list = ordersByUuidMap.get(extUuid) || [];
+      list.push(ord);
+      ordersByUuidMap.set(extUuid, list);
+    }
+    const rowId = String(ord.id || '').trim();
+    const pubId = String(ord.order_id || '').trim();
+    if (rowId) {
+      const list = ordersByAnyIdMap.get(rowId) || [];
+      list.push(ord);
+      ordersByAnyIdMap.set(rowId, list);
+    }
+    if (pubId && pubId !== rowId) {
+      const list = ordersByAnyIdMap.get(pubId) || [];
+      list.push(ord);
+      ordersByAnyIdMap.set(pubId, list);
+    }
+  });
+
   // Use cached inbounds metadata ONLY to resolve missing inboundIds (never to claim Active status or deletion when 3X-UI is unreachable).
   const fetchCachedInbounds = options?.getCachedInboundsFn || getCachedInbounds;
   const fetchLiveInbound = options?.getLiveInboundFn || getLiveInbound;
@@ -778,7 +1558,9 @@ export const getMyConfigs = async (
     }
   }
 
-  const verifyDeleted = options?.verifyDeletedFn || verifyAndMarkClientDeletedIfConfirmed;
+  // Note: Deletion verification is intentionally decoupled from customer HTTP reads and executed
+  // exclusively by the background panel-wide 2-minute synchronizer so customer requests stay fast
+  // and never contend on durable deletion locks or judge deletion from single-inbound fetches.
   const finalConfigs: any[] = [];
 
   for (const config of configs) {
@@ -878,34 +1660,9 @@ export const getMyConfigs = async (
       (liveFullListFetched && liveFullListCleanlyParsed)
     );
 
-    // If panel deletion sync is explicitly enabled AND client was NOT found on a cleanly-parsed live inbound,
-    // perform authoritative two-read locked verification before excluding it from customer views.
-    // Never exclude on timeout, malformed JSON, wrong panel, or lock contention.
-    if (isPanelDeletionSyncFlagEnabled() && !matchedInbound && !foundClient && expectedInboundCleanlyFetched && normUuid && inboundId) {
-      const delCheck = await verifyDeleted({
-        clientUuid: normUuid,
-        inboundId,
-        userId: config._ownerUid || userUid || null,
-        userEmail: config._ownerEmail || userEmail || null,
-        recordPanelIdentity: config._recordPanelIdentity || null,
-        recordServerId: config._recordServerId || null,
-        createdAt: config._createdAt || null,
-        existingStatus: config._dbStatus || null,
-        deletedFromPanelAt: null,
-        source: 'customer_read',
-        dbClient: adminDb,
-        currentPanelIdentity: resolvedPanelIdentity || undefined,
-        nowMs,
-      });
-
-      if (delCheck.confirmedDeleted) {
-        confirmedDeletedUuids.add(normUuid);
-        console.log(
-          `[3X-UI Sync] Authoritatively confirmed permanently deleted UUID ${config.uuid} (${delCheck.reason}); removing from customer view.`
-        );
-        continue;
-      }
-    }
+    // Deletion verification runs asynchronously in the dedicated background panel-wide synchronizer
+    // (syncDeleted3XUiClients), never synchronously during customer HTTP reads.
+    // Already-confirmed deleted rows in Supabase are filtered above and returned in confirmedDeletedUuids.
 
     const evaluated = evaluateVpnClientStatus({
       panelReachable: expectedInboundCleanlyFetched || Boolean(matchedInbound),
@@ -995,6 +1752,31 @@ export const getMyConfigs = async (
       } catch(e) {}
     }
 
+    // Compute authoritative traffic reset eligibility using already-fetched DB + live 3X-UI state (zero extra panel calls)
+    const accForReset = normUuid ? vpnAccountByUuid.get(normUuid) || null : null;
+    const cfgForReset = normUuid ? vpnConfigByUuid.get(normUuid) || null : null;
+    const orderIdKey = String(config.orderId || '').trim();
+    const relatedOrdersSet = new Set<any>([
+      ...(normUuid ? ordersByUuidMap.get(normUuid) || [] : []),
+      ...(orderIdKey ? ordersByAnyIdMap.get(orderIdKey) || [] : []),
+    ]);
+    const relatedGrantsSet = new Set<any>([
+      ...(normUuid ? grantsByUuid.get(normUuid) || [] : []),
+      ...(orderIdKey ? grantsByOrderIdList.get(orderIdKey) || [] : []),
+    ]);
+    const resetEligibility = evaluateCustomerTrafficResetEligibility({
+      vpnAccount: accForReset,
+      vpnConfig: cfgForReset,
+      orders: Array.from(relatedOrdersSet),
+      grants: Array.from(relatedGrantsSet),
+      ownershipSource: accForReset ? 'vpn_accounts' : cfgForReset ? 'vpn_configs' : 'orders',
+      panelReachable: Boolean(matchedInbound && foundClient),
+      liveInbound: matchedInbound,
+      liveClient: foundClient,
+      liveStat: stat,
+      nowMs,
+    });
+
     finalConfigs.push({
       orderId: config.orderId,
       packageName: config.packageName,
@@ -1032,6 +1814,8 @@ export const getMyConfigs = async (
       templateId: config.templateId || null,
       paymentStatus: config.paymentStatus || null,
       provisioningStatus: config.provisioningStatus || null,
+      trafficResetEligible: resetEligibility.eligible,
+      isUnlimitedPlan: resetEligibility.isUnlimitedPlan,
     });
   }
 
@@ -1113,13 +1897,42 @@ export interface TrafficResetLog {
 
 export interface ResetTrafficStatus {
   canReset: boolean;
+  allowed?: boolean;
+  eligibleForTrafficReset?: boolean;
+  isUnlimitedPlan?: boolean;
   reason?: string;
   cooldownHours: number;
   cooldownRemainingHours: number;
   resetsUsedInPeriod: number;
   maxResetsPerPeriod: number;
   lastResetTimestamp: string | null;
+  lastResetAt?: string | null;
   nextAvailableReset: string | null;
+  nextAllowedAt?: string | null;
+  usedUpload?: number;
+  usedDownload?: number;
+  totalUsed?: number;
+  dataLimit?: number | null;
+}
+
+export interface ResetVpnTrafficOptions {
+  dbClient?: any;
+  getLiveInboundFn?: (id: number) => Promise<any | null>;
+  getInboundsFn?: (forceRefresh?: boolean) => Promise<any[]>;
+  resetClientTrafficFn?: (
+    email: string,
+    inboundId?: number,
+    clientUuid?: string,
+    options?: ResetClientTrafficOptions
+  ) => Promise<{ success: boolean; message: string }>;
+  getTrafficResetPolicyFn?: () => Promise<TrafficResetPolicy>;
+  getTrafficResetLogsFn?: () => Promise<TrafficResetLog[]>;
+  recordTrafficResetLogFn?: (log: TrafficResetLog) => Promise<void>;
+  nowMs?: number;
+  maxLockedVerificationMs?: number;
+  requireDurableLock?: boolean;
+  skipNotification?: boolean;
+  skipUsedBytesUpdate?: boolean;
 }
 
 let inMemoryTrafficResetPolicy: TrafficResetPolicy = { ...DEFAULT_RESET_POLICY };
@@ -1235,15 +2048,18 @@ export const recordTrafficResetLog = async (log: TrafficResetLog): Promise<void>
 export const verifyVpnOwnership = async (
   userId: string,
   userEmail: string,
-  configUuid: string
+  configUuid: string,
+  options?: { dbClient?: any; allowXuiFallback?: boolean }
 ): Promise<{
   owned: boolean;
-  source: 'vpn_accounts' | 'orders' | 'vpn_configs' | null;
+  source: 'vpn_accounts' | 'orders' | 'vpn_configs' | '3xui' | null;
   record: any;
 }> => {
   const normUuid = (configUuid || '').trim().toLowerCase();
   const normUid = (userId || '').trim();
   const normEmail = (userEmail || '').trim().toLowerCase();
+  const db = options?.dbClient || supabaseAdmin || supabase;
+  const allowXuiFallback = options?.allowXuiFallback !== false;
 
   if (!normUuid) return { owned: false, source: null, record: null };
 
@@ -1259,7 +2075,7 @@ export const verifyVpnOwnership = async (
 
   // 1. Check vpn_accounts table filtered directly by UUID
   try {
-    const { data: vpnAccs } = await supabase
+    const { data: vpnAccs } = await db
       .from('vpn_accounts')
       .select('*')
       .ilike('uuid', normUuid);
@@ -1279,7 +2095,7 @@ export const verifyVpnOwnership = async (
 
   // 2. Check orders table filtered directly by client_uuid
   try {
-    const { data: orders } = await supabase
+    const { data: orders } = await db
       .from('orders')
       .select('*')
       .ilike('client_uuid', normUuid);
@@ -1301,7 +2117,7 @@ export const verifyVpnOwnership = async (
 
   // 3. Check vpn_configs table filtered directly by UUID
   try {
-    const { data: vpnCfgs } = await supabase
+    const { data: vpnCfgs } = await db
       .from('vpn_configs')
       .select('*')
       .ilike('uuid', normUuid);
@@ -1320,6 +2136,10 @@ export const verifyVpnOwnership = async (
     }
   } catch (_e) {}
 
+  if (!allowXuiFallback) {
+    return { owned: false, source: null, record: null };
+  }
+
   // 4. Check 3X-UI panel clients directly as fallback (strict exact email match only; never substring)
   try {
     const cached = await getCachedInbounds();
@@ -1337,7 +2157,7 @@ export const verifyVpnOwnership = async (
             if (normEmail && cEmail === normEmail) {
               return {
                 owned: true,
-                source: '3xui' as any,
+                source: '3xui',
                 record: {
                   uuid: c.id,
                   email: c.email,
@@ -1349,7 +2169,7 @@ export const verifyVpnOwnership = async (
               };
             }
             // UUID exists in 3X-UI but does not belong to this user
-            return { owned: false, source: '3xui' as any, record: null };
+            return { owned: false, source: '3xui', record: null };
           }
         }
       }
@@ -1359,202 +2179,461 @@ export const verifyVpnOwnership = async (
   return { owned: false, source: null, record: null };
 };
 
+interface AuthoritativeResetDbContext {
+  vpnAccount: any | null;
+  vpnConfig: any | null;
+  orders: any[];
+  grants: any[];
+  preferredInboundId: number | null;
+  orderIdForLog: string;
+  displayName: string;
+}
+
+const fetchAuthoritativeResetDbContext = async (
+  db: any,
+  normUuid: string,
+  ownershipRecord: any
+): Promise<AuthoritativeResetDbContext> => {
+  const safeQueryRows = async (promise: Promise<any>): Promise<any[]> => {
+    try {
+      const res = await promise;
+      return Array.isArray(res?.data) ? res.data : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const [accRows, cfgRows, orderByUuidRows, grantByUuidRows] = await Promise.all([
+    safeQueryRows(db.from('vpn_accounts').select('*').ilike('uuid', normUuid)),
+    safeQueryRows(db.from('vpn_configs').select('*').ilike('uuid', normUuid)),
+    safeQueryRows(db.from('orders').select('*').ilike('client_uuid', normUuid)),
+    safeQueryRows(db.from('vpn_entitlement_grants').select('*').ilike('client_uuid', normUuid)),
+  ]);
+
+  const sortNewest = (rows: any[]) =>
+    [...rows].sort((a, b) => getEntitlementRecordTimestampMs(b) - getEntitlementRecordTimestampMs(a));
+
+  const vpnAccount = sortNewest(accRows)[0] || null;
+  const vpnConfig = sortNewest(cfgRows)[0] || null;
+
+  const ordersMap = new Map<string, any>();
+  const addOrder = (ord: any) => {
+    if (!ord || typeof ord !== 'object') return;
+    const key = String(ord.id || ord.order_id || Math.random());
+    if (!ordersMap.has(key)) ordersMap.set(key, ord);
+  };
+  orderByUuidRows.forEach(addOrder);
+
+  const linkedOrderIds = Array.from(
+    new Set(
+      [vpnAccount?.order_id, vpnConfig?.order_id, ownershipRecord?.order_id, ownershipRecord?.id]
+        .filter(Boolean)
+        .map((v) => String(v).trim())
+    )
+  );
+
+  // Fetch any order/grant linked via order_id that didn't match client_uuid directly
+  if (linkedOrderIds.length > 0) {
+    const [extraOrdersById, extraOrdersByPubId, extraGrantsByOrder] = await Promise.all([
+      safeQueryRows(db.from('orders').select('*').in('id', linkedOrderIds)),
+      safeQueryRows(db.from('orders').select('*').in('order_id', linkedOrderIds)),
+      safeQueryRows(db.from('vpn_entitlement_grants').select('*').in('order_id', linkedOrderIds)),
+    ]);
+    extraOrdersById.forEach(addOrder);
+    extraOrdersByPubId.forEach(addOrder);
+
+    const grantsMap = new Map<string, any>();
+    const addGrant = (g: any) => {
+      if (!g || typeof g !== 'object') return;
+      const key = String(g.id || `${g.grant_type || 'new_order'}:${g.order_id || ''}:${g.client_uuid || ''}:${g.created_at || ''}`);
+      if (!grantsMap.has(key)) grantsMap.set(key, g);
+    };
+    grantByUuidRows.forEach(addGrant);
+    extraGrantsByOrder.forEach(addGrant);
+
+    const grants = Array.from(grantsMap.values());
+    const orders = Array.from(ordersMap.values());
+    const preferredInboundCandidates = [
+      vpnConfig?.inbound_id,
+      ownershipRecord?.inbound_id,
+      ...grants.map((g) => g.inbound_id),
+    ];
+    let preferredInboundId: number | null = null;
+    for (const c of preferredInboundCandidates) {
+      const n = Number(c);
+      if (Number.isFinite(n) && n > 0) {
+        preferredInboundId = n;
+        break;
+      }
+    }
+
+    return {
+      vpnAccount,
+      vpnConfig,
+      orders,
+      grants,
+      preferredInboundId,
+      orderIdForLog: String(vpnAccount?.order_id || vpnConfig?.order_id || ownershipRecord?.order_id || ownershipRecord?.id || ''),
+      displayName: String(vpnAccount?.remark || vpnConfig?.package_name || ownershipRecord?.remark || ownershipRecord?.package_name || 'FIREVPN Package'),
+    };
+  }
+
+  const preferredInboundCandidates = [
+    vpnConfig?.inbound_id,
+    ownershipRecord?.inbound_id,
+    ...grantByUuidRows.map((g) => g.inbound_id),
+  ];
+  let preferredInboundId: number | null = null;
+  for (const c of preferredInboundCandidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) {
+      preferredInboundId = n;
+      break;
+    }
+  }
+
+  return {
+    vpnAccount,
+    vpnConfig,
+    orders: Array.from(ordersMap.values()),
+    grants: grantByUuidRows,
+    preferredInboundId,
+    orderIdForLog: String(vpnAccount?.order_id || vpnConfig?.order_id || ownershipRecord?.order_id || ownershipRecord?.id || ''),
+    displayName: String(vpnAccount?.remark || vpnConfig?.package_name || ownershipRecord?.remark || ownershipRecord?.package_name || 'FIREVPN Package'),
+  };
+};
+
+interface LiveClientSnapshotResult {
+  panelReachable: boolean;
+  liveInbound: any | null;
+  liveClient: any | null;
+  liveStat: any | null;
+}
+
+const findClientInLiveInbounds = (
+  inbounds: any[],
+  normUuid: string
+): { liveInbound: any; liveClient: any; liveStat: any | null } | null => {
+  for (const ib of inbounds) {
+    const parsed = parseInboundSettingsClientsStrict(ib);
+    if (!parsed.ok) continue;
+    const client = parsed.clients.find(
+      (c: any) => String(c?.id || '').trim().toLowerCase() === normUuid
+    );
+    if (client) {
+      const stats = Array.isArray(ib.clientStats) ? ib.clientStats : [];
+      const clientEmailLower = String(client.email || '').trim().toLowerCase();
+      const stat =
+        stats.find((s: any) => String(s?.id || '').trim().toLowerCase() === normUuid) ||
+        (clientEmailLower
+          ? stats.find((s: any) => String(s?.email || '').trim().toLowerCase() === clientEmailLower)
+          : null) ||
+        null;
+      return { liveInbound: ib, liveClient: client, liveStat: stat };
+    }
+  }
+  return null;
+};
+
+const fetchFreshLiveClientSnapshotForReset = async (
+  normUuid: string,
+  preferredInboundId: number | null,
+  getLiveInboundFn: (id: number) => Promise<any | null>,
+  getInboundsFn: (forceRefresh?: boolean) => Promise<any[]>
+): Promise<LiveClientSnapshotResult> => {
+  if (preferredInboundId && preferredInboundId > 0) {
+    try {
+      const directIb = await getLiveInboundFn(preferredInboundId);
+      if (directIb) {
+        const hit = findClientInLiveInbounds([directIb], normUuid);
+        if (hit) {
+          return {
+            panelReachable: true,
+            liveInbound: hit.liveInbound,
+            liveClient: hit.liveClient,
+            liveStat: hit.liveStat,
+          };
+        }
+      }
+    } catch {
+      // Fall through to full fresh inbound list attempt
+    }
+  }
+
+  try {
+    const freshInbounds = await getInboundsFn(true);
+    if (!Array.isArray(freshInbounds) || freshInbounds.length === 0) {
+      return { panelReachable: false, liveInbound: null, liveClient: null, liveStat: null };
+    }
+    const hit = findClientInLiveInbounds(freshInbounds, normUuid);
+    if (hit) {
+      return {
+        panelReachable: true,
+        liveInbound: hit.liveInbound,
+        liveClient: hit.liveClient,
+        liveStat: hit.liveStat,
+      };
+    }
+    return { panelReachable: true, liveInbound: null, liveClient: null, liveStat: null };
+  } catch {
+    return { panelReachable: false, liveInbound: null, liveClient: null, liveStat: null };
+  }
+};
+
+const evaluateResetCooldownWindow = (
+  allLogs: TrafficResetLog[],
+  userId: string,
+  userEmail: string,
+  normUuid: string,
+  policy: TrafficResetPolicy,
+  nowMs: number
+): {
+  allowed: boolean;
+  reason?: string;
+  cooldownRemainingHours: number;
+  resetsUsedInPeriod: number;
+  lastResetTimestamp: string | null;
+  nextAvailableReset: string | null;
+} => {
+  const normEmail = (userEmail || '').trim().toLowerCase();
+  const userLogs = allLogs
+    .filter(
+      (l) =>
+        (l.userId === userId ||
+          (normEmail && l.userEmail && l.userEmail.toLowerCase() === normEmail)) &&
+        l.configUuid.toLowerCase() === normUuid &&
+        l.status === 'success'
+    )
+    .sort((a, b) => b.resetTimestampMs - a.resetTimestampMs);
+
+  const lastLog = userLogs[0] || null;
+  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+  const periodWindowMs = 30 * 24 * 60 * 60 * 1000;
+  const resetsInPeriod = userLogs.filter((l) => nowMs - l.resetTimestampMs < periodWindowMs).length;
+
+  if (lastLog) {
+    const elapsedMs = nowMs - lastLog.resetTimestampMs;
+    if (elapsedMs < cooldownMs) {
+      const cooldownRemainingHours = Math.ceil((cooldownMs - elapsedMs) / (1000 * 60 * 60));
+      const nextAvailableReset = new Date(lastLog.resetTimestampMs + cooldownMs).toISOString();
+      return {
+        allowed: false,
+        reason: `Reset cooldown active. Please wait ${cooldownRemainingHours} hour(s) before resetting again.`,
+        cooldownRemainingHours,
+        resetsUsedInPeriod: resetsInPeriod,
+        lastResetTimestamp: lastLog.resetTimestamp,
+        nextAvailableReset,
+      };
+    }
+  }
+
+  if (resetsInPeriod >= policy.maxResetsPerBillingPeriod) {
+    const oldestInPeriod = userLogs[resetsInPeriod - 1];
+    const nextAvailableReset = oldestInPeriod
+      ? new Date(oldestInPeriod.resetTimestampMs + periodWindowMs).toISOString()
+      : null;
+    return {
+      allowed: false,
+      reason: `Maximum traffic resets (${policy.maxResetsPerBillingPeriod}) reached for this billing period.`,
+      cooldownRemainingHours: 0,
+      resetsUsedInPeriod: resetsInPeriod,
+      lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
+      nextAvailableReset,
+    };
+  }
+
+  return {
+    allowed: true,
+    cooldownRemainingHours: 0,
+    resetsUsedInPeriod: resetsInPeriod,
+    lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
+    nextAvailableReset: null,
+  };
+};
+
 /**
- * Check whether a customer can reset traffic right now, including cooldown and limit status
+ * Check whether a customer can reset traffic right now, including authoritative unlimited-only
+ * entitlement verification, live 3X-UI quota check, cooldown, and billing period limit status.
  */
 export const getResetTrafficStatus = async (
   userId: string,
   userEmail: string,
-  configUuid: string
+  configUuid: string,
+  options?: ResetVpnTrafficOptions
 ): Promise<ResetTrafficStatus> => {
-  const policy = await getTrafficResetPolicy();
+  const db = options?.dbClient || supabaseAdmin || supabase;
+  const getPolicyFn = options?.getTrafficResetPolicyFn || getTrafficResetPolicy;
+  const getLogsFn = options?.getTrafficResetLogsFn || getTrafficResetLogs;
+  const getLiveInboundFn = options?.getLiveInboundFn || getLiveInbound;
+  const getInboundsFn = options?.getInboundsFn || getInbounds;
+  const nowMs = options?.nowMs ?? Date.now();
+  const normUuid = (configUuid || '').trim().toLowerCase();
+
+  const policy = await getPolicyFn();
 
   if (!policy.enabled) {
     return {
       canReset: false,
+      allowed: false,
+      eligibleForTrafficReset: false,
+      isUnlimitedPlan: false,
       reason: 'Traffic reset feature is currently disabled by administrator',
       cooldownHours: policy.cooldownHours,
       cooldownRemainingHours: 0,
       resetsUsedInPeriod: 0,
       maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
       lastResetTimestamp: null,
-      nextAvailableReset: null
+      lastResetAt: null,
+      nextAvailableReset: null,
+      nextAllowedAt: null,
     };
   }
 
-  // 1. Verify ownership
-  const ownership = await verifyVpnOwnership(userId, userEmail, configUuid);
+  // 1. Verify strict Supabase DB ownership (never trust unlinked 3X-UI fallback)
+  const ownership = await verifyVpnOwnership(userId, userEmail, normUuid, {
+    dbClient: db,
+    allowXuiFallback: false,
+  });
   if (!ownership.owned) {
     return {
       canReset: false,
+      allowed: false,
+      eligibleForTrafficReset: false,
+      isUnlimitedPlan: false,
       reason: 'Forbidden: You do not have ownership of this VPN configuration',
       cooldownHours: policy.cooldownHours,
       cooldownRemainingHours: 0,
       resetsUsedInPeriod: 0,
       maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
       lastResetTimestamp: null,
-      nextAvailableReset: null
+      lastResetAt: null,
+      nextAvailableReset: null,
+      nextAllowedAt: null,
     };
   }
 
-  const rec = ownership.record;
-  const isTrial = !!(rec.is_trial || String(rec.order_id || '').startsWith('TRIAL-'));
-  if (isTrial && !policy.allowTrialReset) {
-    return {
-      canReset: false,
-      reason: 'Traffic reset is not allowed for free trial configurations',
-      cooldownHours: policy.cooldownHours,
-      cooldownRemainingHours: 0,
-      resetsUsedInPeriod: 0,
-      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-      lastResetTimestamp: null,
-      nextAvailableReset: null
-    };
-  }
-
-  const st = String(rec.status || '').toLowerCase().trim();
-  const recProvSt = String(rec.provisioning_status || '').toLowerCase().trim();
-  const recPaySt = String(rec.payment_status || '').toLowerCase().trim();
-  if (
-    st === 'expired' ||
-    st === 'disabled' ||
-    st === 'rejected' ||
-    st === 'revoked' ||
-    st === 'cancelled' ||
-    st === 'deleted' ||
-    recProvSt === 'revoked' ||
-    recProvSt === 'revoke_failed' ||
-    recProvSt === 'rejected' ||
-    recPaySt === 'rejected' ||
-    recPaySt === 'cancelled' ||
-    rec.enable === false
-  ) {
-    return {
-      canReset: false,
-      reason: 'Cannot reset traffic for an expired, disabled, or rejected configuration.',
-      cooldownHours: policy.cooldownHours,
-      cooldownRemainingHours: 0,
-      resetsUsedInPeriod: 0,
-      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-      lastResetTimestamp: null,
-      nextAvailableReset: null
-    };
-  }
-
-  // Defense-in-depth: verify no linked order or entitlement grant for this UUID is rejected/revoked
-  try {
-    const cleanUuid = configUuid.trim();
-    const [{ data: linkedOrders }, { data: linkedGrants }] = await Promise.all([
-      supabase.from('orders').select('status, payment_status, provisioning_status').ilike('client_uuid', cleanUuid),
-      supabase.from('vpn_entitlement_grants').select('status').ilike('client_uuid', cleanUuid),
-    ]);
-    const hasRejectedOrder = Array.isArray(linkedOrders) && linkedOrders.some((o: any) => isOrderRejectedOrRevoked(o));
-    const hasRevokedGrant = Array.isArray(linkedGrants) && linkedGrants.some((g: any) => {
-      const gs = String(g.status || '').toLowerCase().trim();
-      return gs === 'revoked' || gs === 'revoke_failed' || gs === 'rejected';
-    });
-    if (hasRejectedOrder || hasRevokedGrant) {
-      return {
-        canReset: false,
-        reason: 'Traffic reset is disabled because this VPN order was rejected.',
-        cooldownHours: policy.cooldownHours,
-        cooldownRemainingHours: 0,
-        resetsUsedInPeriod: 0,
-        maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-        lastResetTimestamp: null,
-        nextAvailableReset: null
-      };
-    }
-  } catch (_revCheckErr) {}
-
-  const expDate = rec.expiry_date || rec.expires_at || rec.expiryDate;
-  if (expDate && new Date(expDate).getTime() <= Date.now()) {
-    return {
-      canReset: false,
-      reason: 'Cannot reset traffic for an expired configuration',
-      cooldownHours: policy.cooldownHours,
-      cooldownRemainingHours: 0,
-      resetsUsedInPeriod: 0,
-      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-      lastResetTimestamp: null,
-      nextAvailableReset: null
-    };
-  }
-
-  // Check cooldown and frequency
-  const allLogs = await getTrafficResetLogs();
-  const normUuid = configUuid.trim().toLowerCase();
-  const userLogs = allLogs.filter(
-    l => (l.userId === userId || (userEmail && l.userEmail && l.userEmail.toLowerCase() === userEmail.toLowerCase())) &&
-         l.configUuid.toLowerCase() === normUuid &&
-         l.status === 'success'
+  // 2. Fetch fresh authoritative DB entitlement context + fresh uncached live 3X-UI client snapshot
+  const dbCtx = await fetchAuthoritativeResetDbContext(db, normUuid, ownership.record);
+  const liveSnap = await fetchFreshLiveClientSnapshotForReset(
+    normUuid,
+    dbCtx.preferredInboundId,
+    getLiveInboundFn,
+    getInboundsFn
   );
 
-  const lastLog = userLogs[0];
-  const now = Date.now();
-  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+  // 3. Evaluate authoritative unlimited-only eligibility
+  const eligibility = evaluateCustomerTrafficResetEligibility({
+    vpnAccount: dbCtx.vpnAccount,
+    vpnConfig: dbCtx.vpnConfig,
+    orders: dbCtx.orders,
+    grants: dbCtx.grants,
+    ownershipSource: ownership.source,
+    panelReachable: liveSnap.panelReachable,
+    liveInbound: liveSnap.liveInbound,
+    liveClient: liveSnap.liveClient,
+    liveStat: liveSnap.liveStat,
+    nowMs,
+  });
 
-  let cooldownRemainingHours = 0;
-  let nextAvailableReset: string | null = null;
+  const usedUpload = eligibility.liveUpBytes;
+  const usedDownload = eligibility.liveDownBytes;
+  const totalUsed = usedUpload + usedDownload;
+  const dataLimit = eligibility.liveTotalLimitBytes;
 
-  if (lastLog) {
-    const elapsedMs = now - lastLog.resetTimestampMs;
-    if (elapsedMs < cooldownMs) {
-      cooldownRemainingHours = Math.ceil((cooldownMs - elapsedMs) / (1000 * 60 * 60));
-      nextAvailableReset = new Date(lastLog.resetTimestampMs + cooldownMs).toISOString();
-      return {
-        canReset: false,
-        reason: `Cooldown active. Please wait ${cooldownRemainingHours} hour(s) before resetting again.`,
-        cooldownHours: policy.cooldownHours,
-        cooldownRemainingHours,
-        resetsUsedInPeriod: userLogs.length,
-        maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-        lastResetTimestamp: lastLog.resetTimestamp,
-        nextAvailableReset
-      };
-    }
-  }
-
-  // Check billing period resets (default 30-day window)
-  const periodWindowMs = 30 * 24 * 60 * 60 * 1000;
-  const resetsInPeriod = userLogs.filter(l => (now - l.resetTimestampMs) < periodWindowMs).length;
-
-  if (resetsInPeriod >= policy.maxResetsPerBillingPeriod) {
-    const oldestInPeriod = userLogs[resetsInPeriod - 1];
-    nextAvailableReset = oldestInPeriod ? new Date(oldestInPeriod.resetTimestampMs + periodWindowMs).toISOString() : null;
+  if (!eligibility.eligible) {
     return {
       canReset: false,
-      reason: `Maximum resets reached (${policy.maxResetsPerBillingPeriod}) for this billing period.`,
+      allowed: false,
+      eligibleForTrafficReset: false,
+      isUnlimitedPlan: eligibility.isUnlimitedPlan,
+      reason: eligibility.customerMessage || TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE,
       cooldownHours: policy.cooldownHours,
       cooldownRemainingHours: 0,
-      resetsUsedInPeriod: resetsInPeriod,
+      resetsUsedInPeriod: 0,
       maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-      lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
-      nextAvailableReset
+      lastResetTimestamp: null,
+      lastResetAt: null,
+      nextAvailableReset: null,
+      nextAllowedAt: null,
+      usedUpload,
+      usedDownload,
+      totalUsed,
+      dataLimit,
+    };
+  }
+
+  // 4. Check cooldown and frequency
+  const allLogs = await getLogsFn();
+  const cooldownStatus = evaluateResetCooldownWindow(
+    allLogs,
+    userId,
+    userEmail,
+    normUuid,
+    policy,
+    nowMs
+  );
+
+  if (!cooldownStatus.allowed) {
+    return {
+      canReset: false,
+      allowed: false,
+      eligibleForTrafficReset: true,
+      isUnlimitedPlan: true,
+      reason: cooldownStatus.reason,
+      cooldownHours: policy.cooldownHours,
+      cooldownRemainingHours: cooldownStatus.cooldownRemainingHours,
+      resetsUsedInPeriod: cooldownStatus.resetsUsedInPeriod,
+      maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
+      lastResetTimestamp: cooldownStatus.lastResetTimestamp,
+      lastResetAt: cooldownStatus.lastResetTimestamp,
+      nextAvailableReset: cooldownStatus.nextAvailableReset,
+      nextAllowedAt: cooldownStatus.nextAvailableReset,
+      usedUpload,
+      usedDownload,
+      totalUsed,
+      dataLimit: 0,
     };
   }
 
   return {
     canReset: true,
+    allowed: true,
+    eligibleForTrafficReset: true,
+    isUnlimitedPlan: true,
     cooldownHours: policy.cooldownHours,
     cooldownRemainingHours: 0,
-    resetsUsedInPeriod: resetsInPeriod,
+    resetsUsedInPeriod: cooldownStatus.resetsUsedInPeriod,
     maxResetsPerPeriod: policy.maxResetsPerBillingPeriod,
-    lastResetTimestamp: lastLog ? lastLog.resetTimestamp : null,
-    nextAvailableReset: null
+    lastResetTimestamp: cooldownStatus.lastResetTimestamp,
+    lastResetAt: cooldownStatus.lastResetTimestamp,
+    nextAvailableReset: null,
+    nextAllowedAt: null,
+    usedUpload,
+    usedDownload,
+    totalUsed,
+    dataLimit: 0,
   };
 };
 
 /**
- * Execute real customer self-service traffic reset in 3X-UI
+ * Execute real customer self-service traffic reset in 3X-UI.
+ * Hardened against direct API bypasses, stale quotas, free trials, finite-data plans,
+ * concurrent double resets, and lock lease expiry races:
+ * 1. Fast pre-lock authoritative check (rejects ineligible plans with HTTP 403 before acquiring locks).
+ * 2. Locked verification under client:<uuid> -> inbound:<id> locks (bounded within safe lease window)
+ *    re-verifying ownership, DB entitlements, live uncached 3X-UI quota, and fresh cooldown logs.
+ * 3. Immediate dual lease ownership recheck inside xuiService.resetClientTraffic before dispatching POST.
+ * 4. Atomic cooldown log recording while STILL holding client:<uuid> lock.
  */
 export const resetVpnTraffic = async (
   userId: string,
   userEmail: string,
-  configUuid: string
+  configUuid: string,
+  options?: ResetVpnTrafficOptions
 ): Promise<{
   success: boolean;
   message: string;
+  nextAllowedAt: string;
   data: {
     configUuid: string;
     clientEmail: string;
@@ -1567,6 +2646,15 @@ export const resetVpnTraffic = async (
   };
 }> => {
   const normUuid = (configUuid || '').trim().toLowerCase();
+  const db = options?.dbClient || supabaseAdmin || supabase;
+  const getPolicyFn = options?.getTrafficResetPolicyFn || getTrafficResetPolicy;
+  const getLogsFn = options?.getTrafficResetLogsFn || getTrafficResetLogs;
+  const recordLogFn = options?.recordTrafficResetLogFn || recordTrafficResetLog;
+  const getLiveInboundFn = options?.getLiveInboundFn || getLiveInbound;
+  const getInboundsFn = options?.getInboundsFn || getInbounds;
+  const resetClientTrafficFn = options?.resetClientTrafficFn || resetClientTraffic;
+  const nowMs = options?.nowMs ?? Date.now();
+
   console.log(`[vpnService] Processing customer traffic reset request - User UID: '${userId}', Email: '${userEmail}', Config UUID: '${normUuid}'`);
 
   if (!userId) {
@@ -1582,208 +2670,292 @@ export const resetVpnTraffic = async (
   }
 
   // 1. Check reset policy
-  const policy = await getTrafficResetPolicy();
+  const policy = await getPolicyFn();
   if (!policy.enabled) {
     const err: any = new Error('Traffic reset feature is currently disabled by administrator');
     err.status = 403;
     throw err;
   }
 
-  // 2. Strict ownership verification against Supabase
-  const ownership = await verifyVpnOwnership(userId, userEmail, normUuid);
-  if (!ownership.owned) {
-    console.warn(`[Security Alert] User '${userId}' attempted to reset configuration '${normUuid}' which they do not own!`);
+  // 2. Strict ownership verification against Supabase (never allow unlinked 3X-UI fallback)
+  const preOwnership = await verifyVpnOwnership(userId, userEmail, normUuid, {
+    dbClient: db,
+    allowXuiFallback: false,
+  });
+  if (!preOwnership.owned) {
+    console.warn(`[Security Alert] User '${userId}' attempted to reset configuration '${normUuid}' which they do not own or cannot verify in DB!`);
     const err: any = new Error('Forbidden: You do not own this VPN configuration');
     err.status = 403;
     throw err;
   }
 
-  const rec = ownership.record;
-  const isTrial = !!(rec.is_trial || String(rec.order_id || '').startsWith('TRIAL-'));
-  if (isTrial && !policy.allowTrialReset) {
-    const err: any = new Error('Traffic reset is not allowed for free trial configurations');
-    err.status = 400;
-    throw err;
-  }
-
-  // 3. Verify status: Must NOT be expired or disabled
-  const st = String(rec.status || '').toLowerCase();
-  if (st === 'expired' || st === 'disabled' || rec.enable === false) {
-    const err: any = new Error('Cannot reset traffic for an expired or disabled configuration. Please renew your plan.');
-    err.status = 400;
-    throw err;
-  }
-
-  const expDate = rec.expiry_date || rec.expires_at || rec.expiryDate;
-  if (expDate && new Date(expDate).getTime() <= Date.now()) {
-    const err: any = new Error('Cannot reset traffic for an expired configuration');
-    err.status = 400;
-    throw err;
-  }
-
-  // 4. Check cooldown & frequency rate limits
-  const allLogs = await getTrafficResetLogs();
-  const userLogs = allLogs.filter(
-    l => (l.userId === userId || (userEmail && l.userEmail && l.userEmail.toLowerCase() === userEmail.toLowerCase())) &&
-         l.configUuid.toLowerCase() === normUuid &&
-         l.status === 'success'
+  // 3. Fast pre-lock authoritative DB + fresh live 3X-UI eligibility check (rejects before acquiring any locks)
+  const preDbCtx = await fetchAuthoritativeResetDbContext(db, normUuid, preOwnership.record);
+  const preLiveSnap = await fetchFreshLiveClientSnapshotForReset(
+    normUuid,
+    preDbCtx.preferredInboundId,
+    getLiveInboundFn,
+    getInboundsFn
   );
 
-  const lastLog = userLogs[0];
-  const now = Date.now();
-  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+  const preEligibility = evaluateCustomerTrafficResetEligibility({
+    vpnAccount: preDbCtx.vpnAccount,
+    vpnConfig: preDbCtx.vpnConfig,
+    orders: preDbCtx.orders,
+    grants: preDbCtx.grants,
+    ownershipSource: preOwnership.source,
+    panelReachable: preLiveSnap.panelReachable,
+    liveInbound: preLiveSnap.liveInbound,
+    liveClient: preLiveSnap.liveClient,
+    liveStat: preLiveSnap.liveStat,
+    nowMs,
+  });
 
-  if (lastLog) {
-    const elapsedMs = now - lastLog.resetTimestampMs;
-    if (elapsedMs < cooldownMs) {
-      const hoursLeft = Math.ceil((cooldownMs - elapsedMs) / (1000 * 60 * 60));
-      const err: any = new Error(`Reset cooldown active. Please wait ${hoursLeft} hour(s) before resetting again.`);
-      err.status = 429;
-      throw err;
-    }
+  if (!preEligibility.eligible) {
+    console.warn(
+      `[Security Guard] Blocked customer traffic reset for UUID '${normUuid}' (user '${userId}'): ${preEligibility.reasonCode}`
+    );
+    const err: any = new Error(preEligibility.customerMessage || TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE);
+    err.status = preEligibility.httpStatus || 403;
+    err.code = preEligibility.reasonCode;
+    throw err;
   }
 
-  const periodWindowMs = 30 * 24 * 60 * 60 * 1000;
-  const resetsInPeriod = userLogs.filter(l => (now - l.resetTimestampMs) < periodWindowMs).length;
-  if (resetsInPeriod >= policy.maxResetsPerBillingPeriod) {
-    const err: any = new Error(`Maximum traffic resets (${policy.maxResetsPerBillingPeriod}) reached for this billing period.`);
+  // 4. Fast pre-lock cooldown & billing period check
+  const preLogs = await getLogsFn();
+  const preCooldown = evaluateResetCooldownWindow(
+    preLogs,
+    userId,
+    userEmail,
+    normUuid,
+    policy,
+    nowMs
+  );
+  if (!preCooldown.allowed) {
+    const err: any = new Error(preCooldown.reason || 'Reset cooldown active.');
     err.status = 429;
     throw err;
   }
 
-  // 5. Look up live client & inbound on 3X-UI server
-  const inbounds = await getInbounds(false);
-  let matchedInbound: any = null;
-  let matchedClient: any = null;
-  let matchedStat: any = null;
+  let verifiedInboundId = Number(preLiveSnap.liveInbound!.id);
+  let verifiedClientEmail = String(preLiveSnap.liveClient!.email || userEmail || '').trim();
+  let upBytes = preEligibility.liveUpBytes;
+  let downBytes = preEligibility.liveDownBytes;
+  let totalBefore = upBytes + downBytes;
+  let orderIdForLog = preDbCtx.orderIdForLog;
+  let displayName = preDbCtx.displayName;
+  let resetTimestampStr = new Date(nowMs).toISOString();
+  let successLogRecordedUnderLock = false;
 
-  for (const ib of inbounds) {
-    let settingsObj: any = {};
-    try {
-      if (ib.settings) {
-        settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
-      }
-    } catch (e) {}
-    const clients = settingsObj.clients || [];
-    for (const c of clients) {
-      if (String(c.id || '').trim().toLowerCase() === normUuid) {
-        matchedInbound = ib;
-        matchedClient = c;
-        break;
-      }
-    }
-    if (matchedInbound) {
-      const stats = ib.clientStats || [];
-      matchedStat = stats.find((s: any) => 
-        (s.id && String(s.id).toLowerCase() === normUuid) ||
-        (s.email && matchedClient.email && String(s.email).toLowerCase() === String(matchedClient.email).toLowerCase())
-      );
-      break;
-    }
-  }
+  console.log(`[vpnService] Executing locked 3X-UI traffic reset for client '${verifiedClientEmail}' in inbound ${verifiedInboundId}...`);
 
-  if (!matchedInbound || !matchedClient) {
-    const err: any = new Error('VPN configuration was not found on the active VPN server');
-    err.status = 404;
-    throw err;
-  }
-
-  if (matchedClient.enable === false) {
-    const err: any = new Error('Cannot reset traffic: Configuration is disabled on the VPN server');
-    err.status = 400;
-    throw err;
-  }
-
-  let clientExpMs = matchedClient.expiryTime || 0;
-  if (clientExpMs > 0 && clientExpMs < 10000000000) clientExpMs = clientExpMs * 1000;
-  if (clientExpMs > 0 && clientExpMs <= Date.now()) {
-    const err: any = new Error('Cannot reset traffic: Configuration has expired on the VPN server');
-    err.status = 400;
-    throw err;
-  }
-
-  const verifiedInboundId = Number(matchedInbound.id);
-  const verifiedClientEmail = String(matchedClient.email || userEmail || '').trim();
-  const upBytes = Number(matchedStat?.up || matchedClient.up || 0);
-  const downBytes = Number(matchedStat?.down || matchedClient.down || 0);
-  const totalBefore = upBytes + downBytes;
-
-  console.log(`[vpnService] Executing 3X-UI traffic reset for client '${verifiedClientEmail}' in inbound ${verifiedInboundId}...`);
-
-  // 6. Execute REAL reset in 3X-UI
+  // 5. Execute REAL reset in 3X-UI under durable client:<uuid> -> inbound:<id> locks,
+  // with bounded locked re-verification immediately before lease recheck + POST,
+  // and atomic cooldown logging while STILL holding client:<uuid> lock.
   try {
-    await resetClientTraffic(verifiedClientEmail, verifiedInboundId, normUuid);
+    await resetClientTrafficFn(verifiedClientEmail, verifiedInboundId, normUuid, {
+      dbClient: db,
+      maxLockedVerificationMs: options?.maxLockedVerificationMs,
+      requireDurableLock: options?.requireDurableLock,
+      beforeResetUnderLocks: async () => {
+        const lockedNowMs = options?.nowMs ?? Date.now();
+        // Re-verify strict DB ownership
+        const lockedOwnership = await verifyVpnOwnership(userId, userEmail, normUuid, {
+          dbClient: db,
+          allowXuiFallback: false,
+        });
+        if (!lockedOwnership.owned) {
+          const err: any = new Error('Forbidden: You do not own this VPN configuration');
+          err.status = 403;
+          err.beforeExternalWrite = true;
+          err.xuiUncertain = false;
+          throw err;
+        }
+
+        // Re-fetch authoritative DB records and fresh uncached live 3X-UI state under locks
+        const lockedDbCtx = await fetchAuthoritativeResetDbContext(db, normUuid, lockedOwnership.record);
+        const lockedLiveSnap = await fetchFreshLiveClientSnapshotForReset(
+          normUuid,
+          lockedDbCtx.preferredInboundId || verifiedInboundId,
+          getLiveInboundFn,
+          getInboundsFn
+        );
+
+        const lockedEligibility = evaluateCustomerTrafficResetEligibility({
+          vpnAccount: lockedDbCtx.vpnAccount,
+          vpnConfig: lockedDbCtx.vpnConfig,
+          orders: lockedDbCtx.orders,
+          grants: lockedDbCtx.grants,
+          ownershipSource: lockedOwnership.source,
+          panelReachable: lockedLiveSnap.panelReachable,
+          liveInbound: lockedLiveSnap.liveInbound,
+          liveClient: lockedLiveSnap.liveClient,
+          liveStat: lockedLiveSnap.liveStat,
+          nowMs: lockedNowMs,
+        });
+
+        if (!lockedEligibility.eligible) {
+          console.warn(
+            `[Security Guard] Locked re-verification blocked traffic reset for UUID '${normUuid}': ${lockedEligibility.reasonCode}`
+          );
+          const err: any = new Error(lockedEligibility.customerMessage || TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE);
+          err.status = lockedEligibility.httpStatus || 403;
+          err.code = lockedEligibility.reasonCode;
+          err.beforeExternalWrite = true;
+          err.xuiUncertain = false;
+          throw err;
+        }
+
+        // Re-check fresh cooldown & billing period logs under client lock (blocks concurrent double-resets)
+        const lockedLogs = await getLogsFn();
+        const lockedCooldown = evaluateResetCooldownWindow(
+          lockedLogs,
+          userId,
+          userEmail,
+          normUuid,
+          policy,
+          lockedNowMs
+        );
+        if (!lockedCooldown.allowed) {
+          const err: any = new Error(lockedCooldown.reason || 'Reset cooldown active.');
+          err.status = 429;
+          err.beforeExternalWrite = true;
+          err.xuiUncertain = false;
+          throw err;
+        }
+
+        // Update verified live coordinates from locked fresh read
+        verifiedInboundId = Number(lockedLiveSnap.liveInbound!.id);
+        verifiedClientEmail = String(lockedLiveSnap.liveClient!.email || userEmail || '').trim();
+        upBytes = lockedEligibility.liveUpBytes;
+        downBytes = lockedEligibility.liveDownBytes;
+        totalBefore = upBytes + downBytes;
+        orderIdForLog = lockedDbCtx.orderIdForLog;
+        displayName = lockedDbCtx.displayName;
+        resetTimestampStr = new Date(lockedNowMs).toISOString();
+
+        return {
+          email: verifiedClientEmail,
+          inboundId: verifiedInboundId,
+        };
+      },
+      afterResetUnderClientLock: async () => {
+        const logNowMs = options?.nowMs ?? Date.now();
+        resetTimestampStr = new Date(logNowMs).toISOString();
+        await recordLogFn({
+          id: crypto.randomUUID(),
+          userId,
+          userEmail,
+          configUuid: normUuid,
+          orderId: orderIdForLog,
+          inboundId: verifiedInboundId,
+          clientEmail: verifiedClientEmail,
+          resetTimestamp: resetTimestampStr,
+          resetTimestampMs: logNowMs,
+          upBytesBefore: upBytes,
+          downBytesBefore: downBytes,
+          totalBytesBefore: totalBefore,
+          status: 'success',
+        });
+        successLogRecordedUnderLock = true;
+      },
+    });
   } catch (xuiErr: any) {
-    console.error('[vpnService] 3X-UI reset failed:', xuiErr.message || xuiErr);
-    // Record failed reset attempt
-    await recordTrafficResetLog({
+    const explicitStatus = Number(xuiErr?.status || xuiErr?.statusCode || 0);
+    // Preserve clean authorization, policy, cooldown, lock contention, or pre-mutation abort statuses directly
+    if (
+      explicitStatus === 400 ||
+      explicitStatus === 401 ||
+      explicitStatus === 403 ||
+      explicitStatus === 404 ||
+      explicitStatus === 409 ||
+      explicitStatus === 429 ||
+      explicitStatus === 503
+    ) {
+      throw xuiErr;
+    }
+
+    console.error('[vpnService] 3X-UI reset failed:', xuiErr?.message || xuiErr);
+    // Record failed reset attempt only for actual 3X-UI mutation failures
+    try {
+      await recordLogFn({
+        id: crypto.randomUUID(),
+        userId,
+        userEmail,
+        configUuid: normUuid,
+        orderId: orderIdForLog,
+        inboundId: verifiedInboundId,
+        clientEmail: verifiedClientEmail,
+        resetTimestamp: new Date(nowMs).toISOString(),
+        resetTimestampMs: nowMs,
+        upBytesBefore: upBytes,
+        downBytesBefore: downBytes,
+        totalBytesBefore: totalBefore,
+        status: 'failed',
+      });
+    } catch {
+      // Non-fatal
+    }
+    const err: any = new Error(`Failed to reset traffic counter on 3X-UI server: ${xuiErr?.message || 'Server error'}`);
+    err.status = 502;
+    if (xuiErr?.xuiUncertain) err.xuiUncertain = true;
+    throw err;
+  }
+
+  // Fallback log recording only if an injected mock resetClientTrafficFn didn't invoke afterResetUnderClientLock
+  if (!successLogRecordedUnderLock) {
+    await recordLogFn({
       id: crypto.randomUUID(),
       userId,
       userEmail,
       configUuid: normUuid,
-      orderId: String(rec.order_id || rec.id || ''),
+      orderId: orderIdForLog,
       inboundId: verifiedInboundId,
       clientEmail: verifiedClientEmail,
-      resetTimestamp: new Date().toISOString(),
-      resetTimestampMs: now,
+      resetTimestamp: resetTimestampStr,
+      resetTimestampMs: nowMs,
       upBytesBefore: upBytes,
       downBytesBefore: downBytes,
       totalBytesBefore: totalBefore,
-      status: 'failed'
+      status: 'success',
     });
-    const err: any = new Error(`Failed to reset traffic counter on 3X-UI server: ${xuiErr.message || 'Server error'}`);
-    err.status = 502;
-    throw err;
   }
 
-  // 7. Record successful reset
-  const resetTimestampStr = new Date().toISOString();
-  await recordTrafficResetLog({
-    id: crypto.randomUUID(),
-    userId,
-    userEmail,
-    configUuid: normUuid,
-    orderId: String(rec.order_id || rec.id || ''),
-    inboundId: verifiedInboundId,
-    clientEmail: verifiedClientEmail,
-    resetTimestamp: resetTimestampStr,
-    resetTimestampMs: now,
-    upBytesBefore: upBytes,
-    downBytesBefore: downBytes,
-    totalBytesBefore: totalBefore,
-    status: 'success'
-  });
-
-  // 8. Update vpn_accounts used_bytes to 0 without touching expiry, package limit, or price
-  try {
-    await supabase.from('vpn_accounts')
-      .update({ used_bytes: 0, updated_at: resetTimestampStr })
-      .eq('uuid', normUuid);
-  } catch (dbErr) {
-    console.warn('[vpnService] vpn_accounts used_bytes update warning:', dbErr);
+  // 6. Update vpn_accounts used_bytes to 0 without touching expiry, package limit, or price
+  if (!options?.skipUsedBytesUpdate) {
+    try {
+      await db.from('vpn_accounts')
+        .update({ used_bytes: 0, updated_at: resetTimestampStr })
+        .eq('uuid', normUuid);
+    } catch (dbErr) {
+      console.warn('[vpnService] vpn_accounts used_bytes update warning:', dbErr);
+    }
   }
 
-  // 9. Send in-app notification
-  try {
-    const configName = rec.remark || rec.package_name || 'FIREVPN Package';
-    await createCustomerNotification({
-      userId,
-      userEmail: userEmail || rec.email || 'customer@firevpn.com',
-      title: 'VPN Traffic Reset Successful',
-      message: `Your VPN configuration "${configName}" traffic counter has been reset to 0 MB. Your full data allowance is restored.`,
-      type: 'traffic_reset',
-      vpnName: configName,
-      vpnUuid: normUuid
-    });
-  } catch (notifErr) {
-    console.warn('[vpnService] Customer notification warning:', notifErr);
+  // 7. Send in-app notification
+  if (!options?.skipNotification) {
+    try {
+      await createCustomerNotification({
+        userId,
+        userEmail: userEmail || preOwnership.record?.email || 'customer@firevpn.com',
+        title: 'VPN Traffic Reset Successful',
+        message: `Your VPN configuration "${displayName}" traffic counter has been reset to 0 MB. Your full data allowance is restored.`,
+        type: 'traffic_reset',
+        vpnName: displayName,
+        vpnUuid: normUuid,
+      });
+    } catch (notifErr) {
+      console.warn('[vpnService] Customer notification warning:', notifErr);
+    }
   }
 
-  const nextAvailableResetDate = new Date(now + cooldownMs).toISOString();
+  const cooldownMs = policy.cooldownHours * 60 * 60 * 1000;
+  const nextAvailableResetDate = new Date(nowMs + cooldownMs).toISOString();
 
   return {
     success: true,
     message: 'Traffic counter successfully reset in 3X-UI. Your full package data allowance has been restored.',
+    nextAllowedAt: nextAvailableResetDate,
     data: {
       configUuid: normUuid,
       clientEmail: verifiedClientEmail,
@@ -1792,8 +2964,9 @@ export const resetVpnTraffic = async (
       currentUsedGB: 0,
       resetTimestamp: resetTimestampStr,
       cooldownHours: policy.cooldownHours,
-      nextAvailableReset: nextAvailableResetDate
-    }
+      nextAvailableReset: nextAvailableResetDate,
+    },
   };
 };
+
 

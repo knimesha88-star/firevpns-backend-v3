@@ -138,11 +138,22 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
         status: selectedConfig.status,
         paymentStatus: selectedConfig.paymentStatus || null,
         provisioningStatus: selectedConfig.provisioningStatus || null,
+        isTrial: Boolean(selectedConfig.isTrial),
+        trafficResetEligible: selectedConfig.trafficResetEligible === true,
+        isUnlimitedPlan: selectedConfig.isUnlimitedPlan === true,
+        deletedUuids,
       };
     }
   }
 
-  // Do not fall back to unlinked 3X-UI email lookup; return null when customer has no real valid VPN configurations in Supabase
+  // Do not fall back to unlinked 3X-UI email lookup; return null (with customer-scoped deletedUuids if any)
+  // when customer has no real valid VPN configurations in Supabase.
+  if (deletedUuids.length > 0) {
+    return {
+      _noActiveConfig: true,
+      deletedUuids,
+    };
+  }
   return null;
 };
 

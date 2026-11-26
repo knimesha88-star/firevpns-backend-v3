@@ -76,13 +76,35 @@ export const approveOrder = async (req: AuthRequest, res: Response): Promise<voi
     const token = authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : undefined;
 
     const result = await executeOrderApproval(orderId, token, {
-      adminLabel: req.user?.email || 'Website Admin'
+      adminLabel: req.user?.email || 'Website Admin',
+      signal: (req as any).timeoutSignal,
     });
+    if (res.headersSent) return;
     res.json({ success: true, ...result });
   } catch (error: any) {
     console.error('[AdminController] Order approval provisioning error:', error?.message || error);
-    const status = error?.statusCode === 409 ? 409 : error?.statusCode === 404 ? 404 : 400;
-    res.status(status).json({ error: error?.message || 'Provisioning template not found.' });
+    if (res.headersSent) return;
+    const status =
+      error?.statusCode === 409
+        ? 409
+        : error?.statusCode === 404
+        ? 404
+        : error?.statusCode === 503
+        ? 503
+        : error?.statusCode === 504
+        ? 504
+        : error?.statusCode === 403
+        ? 403
+        : 400;
+    const message =
+      status === 409 || status === 404 || status === 503 || status === 504 || status === 403
+        ? String(error?.message || 'Unable to approve order.')
+        : safeServerError(error, error?.message || 'Provisioning template not found.');
+    res.status(status).json({
+      success: false,
+      error: message,
+      ...(error?.code ? { code: error.code } : {}),
+    });
   }
 };
 
@@ -132,7 +154,8 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
       operationType: 'verify_payment',
       targetId: String(existingOrder.id),
       clientUuid: existingOrder.client_uuid || null,
-      requireDurableLock: xuiService.isAutoActivateNewOrdersFlagEnabled(),
+      requireDurableLock: true,
+      allowUncertainRecovery: false,
       metadata: {
         orderId: existingOrder.order_id || existingOrder.id,
         adminLabel: req.user?.email || 'Website Admin',
@@ -140,10 +163,17 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     });
 
     if (!lockRes.acquired) {
-      const status = !lockRes.tableAvailable && xuiService.isAutoActivateNewOrdersFlagEnabled() ? 503 : 409;
-      res.status(status).json({
-        error: lockRes.error || 'Another admin action is currently in progress for this order. Please retry shortly.',
-      });
+      const lockErr = xuiService.buildDurableLockFailureError(
+        lockRes,
+        `Order '${existingOrder.order_id || existingOrder.id}'`
+      );
+      if (!res.headersSent) {
+        res.status(lockErr.statusCode).json({
+          success: false,
+          error: lockErr.message,
+          code: lockErr.code,
+        });
+      }
       return;
     }
 
@@ -172,8 +202,34 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
       provStatusLower === 'revoked'
     ) {
       finalLockError = 'Order has already been rejected and cannot be marked Paid.';
-      res.status(409).json({ error: 'Cannot verify payment on a rejected or revoked order.' });
+      if (!res.headersSent) {
+        res.status(409).json({ error: 'Cannot verify payment on a rejected or revoked order.' });
+      }
       return;
+    }
+
+    xuiService.assertRequestNotTimedOutBeforeExternalMutation(
+      (req as any).timeoutSignal,
+      `payment verification for order ${existingOrder.order_id || existingOrder.id}`
+    );
+
+    if (ownsDurableLock) {
+      const stillOwned = await xuiService.renewDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOrderLockKey,
+        lockOwnerId: durableOrderLockOwnerId,
+      });
+      if (!stillOwned) {
+        finalLockError = `Lost durable order lock '${durableOrderLockKey}' before payment verification update.`;
+        if (!res.headersSent) {
+          res.status(409).json({
+            success: false,
+            error: finalLockError,
+            code: 'ORDER_LOCK_LOST',
+          });
+        }
+        return;
+      }
     }
 
     const nowIso = new Date().toISOString();
@@ -204,7 +260,9 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     if (updateErr) {
       finalLockError = updateErr.message || 'Failed to verify payment.';
       console.error('[AdminController] Error verifying payment in DB:', updateErr);
-      res.status(500).json({ error: safeServerError(updateErr, 'Failed to verify payment.') });
+      if (!res.headersSent) {
+        res.status(500).json({ error: safeServerError(updateErr, 'Failed to verify payment.') });
+      }
       return;
     }
 
@@ -226,11 +284,32 @@ export const verifyPayment = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     finalLockStatus = 'completed';
-    res.json({ success: true, message: 'Payment verified successfully' });
+    if (!res.headersSent) {
+      res.json({
+        success: true,
+        completedProvisional: isProvisionalOrder,
+        status: isProvisionalOrder ? 'completed' : existingOrder.status,
+        payment_status: 'Paid',
+        provisioning_status: isProvisionalOrder ? 'completed' : existingOrder.provisioning_status,
+        message: isProvisionalOrder
+          ? 'Payment verified and provisional order completed successfully'
+          : 'Payment verified successfully',
+      });
+    }
   } catch (error: any) {
     finalLockError = error?.message || String(error);
     console.error('[AdminController] Payment verification error:', error?.message || error);
-    res.status(500).json({ error: safeServerError(error, 'Failed to verify payment.') });
+    if (!res.headersSent) {
+      const status = error?.statusCode === 504 ? 504 : error?.statusCode === 409 ? 409 : 500;
+      res.status(status).json({
+        success: false,
+        error:
+          status === 504 || status === 409
+            ? String(error?.message || 'Unable to verify payment.')
+            : safeServerError(error, 'Failed to verify payment.'),
+        ...(error?.code ? { code: error.code } : {}),
+      });
+    }
   } finally {
     if (ownsDurableLock && durableOrderLockKey && durableOrderLockOwnerId) {
       await xuiService.finalizeDurableProvisioningOperationLock({
@@ -254,6 +333,7 @@ export const executeOrderRejection = async (
     dbClient?: any;
     requestApiFn?: any;
     getInboundsFn?: any;
+    signal?: AbortSignal;
   }
 ): Promise<{ order: any; message: string; revocationResult?: any; alreadyRejected?: boolean }> => {
   const dbClient = options?.dbClient || supabaseAdmin;
@@ -275,6 +355,12 @@ export const executeOrderRejection = async (
     throw notFoundErr;
   }
 
+  const sanitizedReason =
+    String(reason || 'Rejected by Admin')
+      .replace(/[\u0000-\u001F\u007F]/g, ' ')
+      .trim()
+      .slice(0, 500) || 'Rejected by Admin';
+
   // Acquire durable order-level lock FIRST so rejection and approval/auto-provisioning/verify-payment
   // are strictly mutually exclusive across instances and processes.
   const durableOrderLockKey = `order:${order.id}`;
@@ -284,26 +370,25 @@ export const executeOrderRejection = async (
     operationType: 'reject_order',
     targetId: String(order.id),
     clientUuid: order.client_uuid || null,
-    requireDurableLock: xuiService.isAutoActivateNewOrdersFlagEnabled(),
+    requireDurableLock: true,
+    allowUncertainRecovery: false,
     metadata: {
       orderId: order.order_id || order.id,
       adminLabel: options?.adminLabel || 'Website Admin',
-      reason,
+      reason: sanitizedReason,
     },
   });
 
   if (!lockRes.acquired) {
-    const conflictErr: any = new Error(
-      lockRes.error ||
-        `Order '${order.order_id || order.id}' is currently locked by another operation (${lockRes.previousOperationType || 'in_progress'}).`
+    throw xuiService.buildDurableLockFailureError(
+      lockRes,
+      `Order '${order.order_id || order.id}'`
     );
-    conflictErr.statusCode = !lockRes.tableAvailable && xuiService.isAutoActivateNewOrdersFlagEnabled() ? 503 : 409;
-    throw conflictErr;
   }
 
   const ownsDurableLock = lockRes.tableAvailable;
   const lockOwnerId = lockRes.lockOwnerId;
-  let finalLockStatus: 'completed' | 'failed' = 'failed';
+  let finalLockStatus: 'completed' | 'failed' | 'uncertain' = 'failed';
   let finalLockError: string | null = null;
 
   let revocationResult: any = null;
@@ -332,6 +417,7 @@ export const executeOrderRejection = async (
       finalLockError = `Order '${order.order_id || order.id}' is already approved/paid and cannot be rejected.`;
       const conflictErr: any = new Error(finalLockError);
       conflictErr.statusCode = 409;
+      conflictErr.code = 'ALREADY_PAID_OR_APPROVED';
       throw conflictErr;
     }
 
@@ -350,39 +436,76 @@ export const executeOrderRejection = async (
     // Before rejecting the order, check if it has a provisionally activated VPN entitlement in public.vpn_entitlement_grants
     // and safely disable + read-back verify it on 3X-UI while holding the durable order lock.
     // If 3X-UI revocation or read-back verification fails, revokeProvisionalOrderClient retains 'revoke_failed' and throws.
-    revocationResult = await xuiService.revokeProvisionalOrderClient(order.id, reason, {
+    revocationResult = await xuiService.revokeProvisionalOrderClient(order.id, sanitizedReason, {
       adminLabel: options?.adminLabel || 'Website Admin',
       dbClient,
       requestApiFn: options?.requestApiFn,
       getInboundsFn: options?.getInboundsFn,
       heldOrderLockOwnerId: ownsDurableLock ? lockOwnerId : undefined,
+      heldOrderLockTableAvailable: ownsDurableLock,
+      signal: options?.signal,
     });
 
     vpnWasRevoked = Boolean(revocationResult?.revoked);
 
-    // Update order status to rejected and payment_status to Cancelled INSIDE the durable lock
+    // If no external revocation was performed, stop cleanly if HTTP deadline already elapsed
+    if (!vpnWasRevoked) {
+      xuiService.assertRequestNotTimedOutBeforeExternalMutation(
+        options?.signal,
+        `order rejection for order ${order.order_id || order.id}`
+      );
+    }
+
+    // Post-write lock fencing: verify durable order lock is STILL owned by this worker before mutating orders
+    if (ownsDurableLock) {
+      const orderLockStillOwned = await xuiService.renewDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOrderLockKey,
+        lockOwnerId,
+      });
+      if (!orderLockStillOwned) {
+        const fenceErr: any = new Error(
+          vpnWasRevoked
+            ? `Lost durable order lock '${durableOrderLockKey}' after provisional VPN revocation; refusing stale order rejection DB update. Manual reconciliation required.`
+            : `Lost durable order lock '${durableOrderLockKey}' before rejecting order in DB; aborting stale write.`
+        );
+        fenceErr.statusCode = 409;
+        fenceErr.code = vpnWasRevoked ? 'RECONCILIATION_REQUIRED' : 'ORDER_LOCK_LOST';
+        fenceErr.beforeExternalWrite = !vpnWasRevoked;
+        fenceErr.xuiUncertain = vpnWasRevoked;
+        fenceErr.markLockUncertain = vpnWasRevoked;
+        throw fenceErr;
+      }
+    }
+
+    // Update order status to rejected, payment_status to Cancelled, and persist sanitized reject_reason
+    // atomically inside the durable lock (orders.reject_reason verified in deployed schema).
     const nowIso = new Date().toISOString();
     rejectPayload = {
       status: 'rejected',
       payment_status: 'Cancelled',
+      reject_reason: sanitizedReason,
       ...(vpnWasRevoked ? { provisioning_status: 'revoked' } : {}),
       updated_at: nowIso,
     };
 
-    let { error: updateErr } = await dbClient.from('orders').update(rejectPayload).eq('id', order.id);
-    if (updateErr && String(updateErr.message || '').includes('provisioning_status')) {
-      const { provisioning_status: _omitted, ...fallbackRejectPayload } = rejectPayload;
-      const retryRes = await dbClient.from('orders').update(fallbackRejectPayload).eq('id', order.id);
-      updateErr = retryRes.error;
-    }
+    const { error: updateErr } = await dbClient.from('orders').update(rejectPayload).eq('id', order.id);
     if (updateErr) {
       finalLockError = `Failed to update order: ${updateErr.message}`;
       console.error('[AdminController] Error rejecting order in DB:', updateErr);
-      throw new Error(finalLockError);
+      const dbErr: any = new Error(finalLockError);
+      if (vpnWasRevoked) {
+        dbErr.statusCode = 409;
+        dbErr.code = 'RECONCILIATION_REQUIRED';
+        dbErr.xuiUncertain = true;
+        dbErr.markLockUncertain = true;
+      }
+      throw dbErr;
     }
 
     finalLockStatus = 'completed';
   } catch (err: any) {
+    finalLockStatus = err?.markLockUncertain || err?.xuiUncertain ? 'uncertain' : 'failed';
     finalLockError = err?.message || String(err);
     throw err;
   } finally {
@@ -510,13 +633,20 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    await executeOrderRejection(orderId, reason, {
-      adminLabel: req.user?.email || 'Website Admin'
+    const result = await executeOrderRejection(orderId, reason, {
+      adminLabel: req.user?.email || 'Website Admin',
+      signal: (req as any).timeoutSignal,
     });
 
-    res.json({ success: true, message: 'Order rejected successfully' });
+    if (res.headersSent) return;
+    res.json({
+      success: true,
+      message: result.message || 'Order rejected successfully',
+      order: result.order,
+    });
   } catch (error: any) {
     console.error('[AdminController] Order rejection error:', error?.message || error);
+    if (res.headersSent) return;
     const status =
       error?.statusCode === 404
         ? 404
@@ -524,12 +654,18 @@ export const rejectOrder = async (req: AuthRequest, res: Response): Promise<void
         ? 409
         : error?.statusCode === 503
         ? 503
+        : error?.statusCode === 504
+        ? 504
+        : error?.statusCode === 403
+        ? 403
         : 500;
     res.status(status).json({
+      success: false,
       error:
-        status === 404 || status === 409 || status === 503
+        status === 404 || status === 409 || status === 503 || status === 504 || status === 403
           ? (error?.message || 'Unable to reject order.')
-          : safeServerError(error, 'Failed to reject order.')
+          : safeServerError(error, 'Failed to reject order.'),
+      ...(error?.code ? { code: error.code } : {}),
     });
   }
 };

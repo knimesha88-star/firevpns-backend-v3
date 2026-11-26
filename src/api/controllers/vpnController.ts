@@ -493,7 +493,16 @@ export const resetTraffic = async (req: AuthRequest, res: Response): Promise<voi
     res.json(result);
   } catch (error: any) {
     const duration = Date.now() - reqStart;
-    const status = error.status || (error.message?.includes('Forbidden') ? 403 : error.message?.includes('cooldown') || error.message?.includes('maximum') ? 429 : error.message?.includes('not found') ? 404 : 400);
+    const status =
+      error.status ||
+      error.statusCode ||
+      (error.message?.includes('Forbidden') || error.message?.includes('eligible unlimited')
+        ? 403
+        : error.message?.includes('cooldown') || error.message?.includes('maximum')
+          ? 429
+          : error.message?.includes('not found')
+            ? 404
+            : 400);
     console.warn(`[POST /api/vpn/reset-traffic] Failed (${status}) after ${duration}ms:`, error.message);
     res.status(status).json({
       success: false,
@@ -519,9 +528,9 @@ export const getResetTrafficStatus = async (req: AuthRequest, res: Response): Pr
     }
 
     const status = await vpnService.getResetTrafficStatus(uid, email, String(configUuid));
-    res.json({ success: true, ...status });
+    res.json({ success: true, allowed: status.canReset, ...status });
   } catch (error: any) {
-    res.status(error.status || 500).json({
+    res.status(error.status || error.statusCode || 500).json({
       success: false,
       error: error.message || 'Failed to retrieve reset traffic status'
     });

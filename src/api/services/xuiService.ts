@@ -376,48 +376,207 @@ const getXuiAuthHeaders = async (
   return headers;
 };
 
+export interface RequestApiOptions {
+  timeoutMs?: number;
+  beforeSend?: () => Promise<void>;
+  signal?: AbortSignal;
+  configOverride?: XuiConfig;
+  authHeadersFn?: (config: XuiConfig, forceRefresh: boolean, timeoutMs: number) => Promise<Record<string, string>>;
+  httpRequestFn?: (reqConfig: { url: string; method: 'GET' | 'POST'; data?: any; headers: Record<string, string> }) => Promise<{ status: number; statusText?: string; data?: any }>;
+}
+
+/**
+ * Throws a clean pre-mutation timeout error if an HTTP deadline signal has already fired
+ * before any external 3X-UI mutation is dispatched. Never used to abort post-write read-back
+ * or database finalization once an external mutation has already been dispatched.
+ */
+export function assertRequestNotTimedOutBeforeExternalMutation(
+  signal?: AbortSignal,
+  operationLabel = 'external 3X-UI mutation'
+): void {
+  if (signal?.aborted) {
+    const err: any = new Error(
+      `HTTP request deadline elapsed before dispatching ${operationLabel}; aborted safely with zero external mutations.`
+    );
+    err.statusCode = 504;
+    err.code = 'REQUEST_TIMEOUT_BEFORE_MUTATION';
+    err.beforeExternalWrite = true;
+    err.xuiUncertain = false;
+    throw err;
+  }
+}
+
+/**
+ * Returns true ONLY when an error from a 3X-UI mutation endpoint definitively establishes
+ * that the panel did NOT apply the mutation before executing any state change (e.g., HTTP
+ * 404/405 unsupported route/method or pre-connection refusal/DNS failure before TCP accept).
+ *
+ * HTTP 400/422 and generic HTTP 200 `{ success: false }` responses (`xuiExplicitRejection === true`)
+ * are NOT blindly trusted as non-applied because panels/proxies can return 400/422 or
+ * `success: false` after partial/completed mutations. Callers MUST verify live panel state
+ * before attempting another mutation or classifying the attempt as non-applied.
+ *
+ * Returns false for ALL ambiguous outcomes (timeouts, ECONNRESET, socket hang up, 5xx gateway
+ * errors, 400/422 before panel verification, generic `success: false` before panel verification,
+ * or truncated responses).
+ */
+export function isHttp400Or422Error(err: any): boolean {
+  if (!err) return false;
+  const httpStatus = Number(err?.response?.status ?? err?.statusCode ?? err?.status ?? 0);
+  if (httpStatus === 400 || httpStatus === 422) {
+    return true;
+  }
+  const msg = String(err?.message || '');
+  return /3X-UI API Error:\s*(400|422)\b/i.test(msg);
+}
+
+export function isDefinitiveNonAppliedMutationError(err: any): boolean {
+  if (!err) return false;
+
+  const httpStatus = Number(err?.response?.status ?? err?.statusCode ?? err?.status ?? 0);
+  if (httpStatus === 404 || httpStatus === 405) {
+    return true;
+  }
+
+  const code = String(err?.code || '').toUpperCase();
+  if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') {
+    return true;
+  }
+  if (
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ERR_CANCELED'
+  ) {
+    return false;
+  }
+
+  const msg = String(err?.message || '');
+  if (/3X-UI API Error:\s*(404|405)\b/i.test(msg)) {
+    return true;
+  }
+  if (
+    /timeout|timed out|etimedout|econnreset|econnaborted|socket hang up|network error|500|502|503|504/i.test(msg)
+  ) {
+    return false;
+  }
+
+  return false;
+}
+
 export const requestApi = async <T>(
   endpoint: string,
   method: 'GET' | 'POST' = 'GET',
   data?: any,
-  options?: { timeoutMs?: number }
+  options?: RequestApiOptions
 ): Promise<T> => {
   const effectiveTimeoutMs =
     options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
       ? Math.max(1000, Math.min(Math.floor(options.timeoutMs), 30000))
       : 10000;
-  const config = await getXuiConfig();
-  let headers = await getXuiAuthHeaders(config, false, effectiveTimeoutMs);
+
+  if (method === 'POST') {
+    assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint}`);
+  }
+
+  const config = options?.configOverride || (await getXuiConfig());
+  const resolveAuthHeaders = options?.authHeadersFn || getXuiAuthHeaders;
+  let headers: Record<string, string>;
+  try {
+    headers = await resolveAuthHeaders(config, false, effectiveTimeoutMs);
+  } catch (authErr: any) {
+    if (method === 'POST' && authErr && typeof authErr === 'object') {
+      if (authErr.beforeExternalWrite === undefined) authErr.beforeExternalWrite = true;
+      if (authErr.xuiUncertain === undefined) authErr.xuiUncertain = false;
+    }
+    throw authErr;
+  }
+
+  // Revalidate HTTP deadline and all required locks AFTER potentially slow config/authentication steps
+  if (method === 'POST') {
+    assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint}`);
+  }
+  if (options?.beforeSend) {
+    await options.beforeSend();
+    // Final synchronous deadline check immediately AFTER async beforeSend completes and BEFORE HTTP dispatch
+    if (method === 'POST') {
+      assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint} (post-beforeSend)`);
+    }
+  }
 
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-  const client = createAxiosInstance(baseUrl, effectiveTimeoutMs);
+  const client = options?.httpRequestFn ? null : createAxiosInstance(baseUrl, effectiveTimeoutMs);
+  const executeHttp = (reqHeaders: Record<string, string>) =>
+    options?.httpRequestFn
+      ? options.httpRequestFn({ url: fullPath, method, data, headers: reqHeaders })
+      : client!.request({
+          url: fullPath,
+          method,
+          data,
+          headers: reqHeaders,
+          ...(method === 'POST' ? { maxRedirects: 0 } : {}),
+        });
 
   try {
-    let response = await client.request({
-      url: fullPath,
-      method,
-      data,
-      headers
-    });
+    let response = await executeHttp(headers);
+    let attemptedAuthenticatedRetry = false;
 
-    // If session cookie expired or returned 401/403/redirect, refresh auth once
-    if (response.status === 401 || response.status === 403 || response.status === 302 || response.status === 307) {
+    const locationHeader = String(
+      (response as any)?.headers?.location || (response as any)?.headers?.Location || ''
+    ).toLowerCase();
+    const isUnauthenticatedRejection =
+      response.status === 401 ||
+      response.status === 403 ||
+      ((response.status === 302 || response.status === 307) &&
+        (method !== 'POST' || /(?:^|\/)(?:login|auth)(?:[/?#]|$)|login|signin/i.test(locationHeader)));
+
+    // If session cookie expired or returned 401/403 (or explicit login redirect), refresh auth once
+    if (isUnauthenticatedRejection) {
       cachedXuiAuth = null;
-      headers = await getXuiAuthHeaders(config, true, effectiveTimeoutMs);
-      response = await client.request({
-        url: fullPath,
-        method,
-        data,
-        headers
-      });
+      try {
+        headers = await resolveAuthHeaders(config, true, effectiveTimeoutMs);
+      } catch (reauthErr: any) {
+        if (method === 'POST' && reauthErr && typeof reauthErr === 'object') {
+          if (reauthErr.beforeExternalWrite === undefined) reauthErr.beforeExternalWrite = true;
+          if (reauthErr.xuiUncertain === undefined) reauthErr.xuiUncertain = false;
+        }
+        throw reauthErr;
+      }
+      // Revalidate deadline and lock ownership again after re-authentication before sending mutation
+      if (method === 'POST') {
+        assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint} (post-reauth)`);
+      }
+      if (options?.beforeSend) {
+        await options.beforeSend();
+        // Final synchronous deadline check immediately AFTER async beforeSend completes on retry branch
+        if (method === 'POST') {
+          assertRequestNotTimedOutBeforeExternalMutation(
+            options?.signal,
+            `POST ${endpoint} (post-reauth-beforeSend)`
+          );
+        }
+      }
+      attemptedAuthenticatedRetry = true;
+      response = await executeHttp(headers);
     }
 
     if (response.status !== 200) {
-      throw new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
+      const statusErr: any = new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
+      statusErr.statusCode = response.status;
+      statusErr.response = response;
+      if (method === 'POST' && attemptedAuthenticatedRetry) {
+        // An authenticated POST retry was already dispatched; never misclassify any non-200
+        // (including 403/401) as a safe pre-write failure.
+        statusErr.beforeExternalWrite = false;
+      }
+      throw statusErr;
     }
 
     if (response.data && response.data.success === false) {
-      throw new Error(`3X-UI API Error: ${response.data.msg}`);
+      const rejectErr: any = new Error(`3X-UI API Error: ${response.data.msg}`);
+      rejectErr.xuiExplicitRejection = true;
+      throw rejectErr;
     }
 
     return response.data.obj;
@@ -760,9 +919,14 @@ export const addCalendarMonths = (baseTimeMs: number, durationMonths: number): n
 
 export interface UpdateClientExpiryDeps {
   getInboundsFn?: (forceRefresh?: boolean) => Promise<XuiInbound[]>;
-  requestApiFn?: <T>(endpoint: string, method?: 'GET' | 'POST', data?: any) => Promise<T>;
+  requestApiFn?: <T>(endpoint: string, method?: 'GET' | 'POST', data?: any, options?: RequestApiOptions) => Promise<T>;
   dbClient?: any;
   nowMs?: number;
+  requireDurableLock?: boolean;
+  allowUncertainRecovery?: boolean;
+  beforeExternalMutation?: () => Promise<void>;
+  afterExternalMutationCheck?: () => Promise<void>;
+  signal?: AbortSignal;
 }
 
 export const updateClientExpiry = async (
@@ -775,6 +939,8 @@ export const updateClientExpiry = async (
   const getInboundsFn = deps?.getInboundsFn || getInbounds;
   const requestApiFn = deps?.requestApiFn || requestApi;
   const lockDbClient = deps?.dbClient || supabaseAdmin;
+
+  assertRequestNotTimedOutBeforeExternalMutation(deps?.signal, 'manual renewal preparation');
 
   let inbounds = await getInboundsFn(true);
   if (!inbounds || inbounds.length === 0) {
@@ -806,13 +972,15 @@ export const updateClientExpiry = async (
     throw new Error(`Client with UUID ${uuid} not found in 3X-UI inbounds`);
   }
 
+  // Admin renewal mutations MUST remain protected by durable locks even when both auto-activation flags are disabled.
   return withInboundWriteLock(
     {
       dbClient: lockDbClient,
       inboundId: locatedInboundId,
       targetId: `renew:${normalizedTargetUuid}`,
       clientUuid: uuid,
-      requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+      requireDurableLock: deps?.requireDurableLock ?? true,
+      allowUncertainRecovery: deps?.allowUncertainRecovery ?? false,
     },
     async (assertInboundLockStillHeld) => {
       // Re-read fresh inbounds INSIDE the per-inbound lock so we never operate on a stale snapshot
@@ -970,17 +1138,191 @@ export const updateClientExpiry = async (
         { ep: `/panel/api/clients/update/${c.email}`, body: finalPayload }
       ];
 
+      const preMutationEnable = Boolean(c.enable);
+      const preMutationExpiryTime = Number(c.expiryTime || 0);
+      const preMutationTotalGB = Number(c.totalGB || 0);
+
+      // Fetch the client again from 3X-UI and verify that enable === true, expiryTime is in the future,
+      // and totalGB matches target. Also computes whether the client remains strictly unchanged.
+      // (Safe read-back continues even if HTTP timeout fired AFTER mutation dispatch)
+      const verifyClientState = async (): Promise<{
+        verified: boolean;
+        client: XuiClient | null;
+        stateStrictlyUnchanged: boolean;
+      }> => {
+        const freshInbounds = await getInboundsFn(true);
+        const targetInbound =
+          freshInbounds.find((ib) => Number(ib.id) === Number(inbound.id)) ||
+          freshInbounds.find((ib) => {
+            try {
+              const rawS: any = ib.settings;
+              const s = typeof rawS === 'string' ? JSON.parse(rawS) : rawS;
+              return (s?.clients || []).some(
+                (cl: any) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
+              );
+            } catch {
+              return false;
+            }
+          });
+
+        if (!targetInbound) {
+          return { verified: false, client: null, stateStrictlyUnchanged: false };
+        }
+
+        let freshSettings: { clients?: XuiClient[] } = {};
+        try {
+          const rawFreshS: any = targetInbound.settings;
+          freshSettings =
+            typeof rawFreshS === 'string'
+              ? JSON.parse(rawFreshS)
+              : rawFreshS || {};
+        } catch {
+          return { verified: false, client: null, stateStrictlyUnchanged: false };
+        }
+
+        const freshClient =
+          (freshSettings.clients || []).find(
+            (cl) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
+          ) || null;
+
+        if (!freshClient) {
+          return { verified: false, client: null, stateStrictlyUnchanged: false };
+        }
+
+        const freshExpiry = Number(freshClient.expiryTime || 0);
+        const freshEnable = Boolean(freshClient.enable);
+        const freshTotalGB = Number(freshClient.totalGB || 0);
+        const isEnabled = freshClient.enable === true;
+        const isFutureExpiry = freshExpiry > now && Math.abs(freshExpiry - expectedExpiryTime) <= 1000;
+        const matchesExpectedTotalGB = freshTotalGB === parsedTotalGB;
+        const stateStrictlyUnchanged =
+          freshEnable === preMutationEnable &&
+          freshExpiry === preMutationExpiryTime &&
+          freshTotalGB === preMutationTotalGB;
+
+        return {
+          verified: isEnabled && isFutureExpiry && matchesExpectedTotalGB,
+          client: freshClient,
+          stateStrictlyUnchanged,
+        };
+      };
+
+      const makeReconciliationError = (reason: string): any => {
+        const reconErr: any = new Error(reason);
+        reconErr.statusCode = 409;
+        reconErr.code = 'RECONCILIATION_REQUIRED';
+        reconErr.beforeExternalWrite = false;
+        reconErr.xuiUncertain = true;
+        reconErr.markLockUncertain = true;
+        return reconErr;
+      };
+
       let updated = false;
+      let externalMutationDispatched = false;
+      let priorExternalWriteUnverified = false;
+      let verifiedFromRejectionReadback: {
+        verified: boolean;
+        client: XuiClient | null;
+        stateStrictlyUnchanged: boolean;
+      } | null = null;
       let lastErr: any = null;
 
-      for (const { ep, body } of updateEndpoints) {
+      const verifyAllLocksBeforeExternalMutation = async (): Promise<void> => {
+        // Never dispatch an external mutation (or a second external mutation) after HTTP deadline
+        assertRequestNotTimedOutBeforeExternalMutation(deps?.signal, 'manual renewal 3X-UI update');
         await assertInboundLockStillHeld();
+        if (deps?.beforeExternalMutation) {
+          await deps.beforeExternalMutation();
+        }
+      };
+
+      for (const { ep, body } of updateEndpoints) {
         try {
-          await requestApiFn<any>(ep, 'POST', body);
+          await verifyAllLocksBeforeExternalMutation();
+        } catch (preLockErr: any) {
+          if (priorExternalWriteUnverified) {
+            throw makeReconciliationError(
+              `Lock or deadline check failed after an earlier 3X-UI write attempt for UUID ${uuid} (${preLockErr?.message || preLockErr}); manual reconciliation required.`
+            );
+          }
+          throw preLockErr;
+        }
+        try {
+          externalMutationDispatched = true;
+          await requestApiFn<any>(ep, 'POST', body, {
+            beforeSend: verifyAllLocksBeforeExternalMutation,
+            signal: deps?.signal,
+          });
+          priorExternalWriteUnverified = true;
           updated = true;
           break;
         } catch (e: any) {
-          console.warn(`[updateClientExpiry] Update endpoint ${ep} failed:`, e?.message || e);
+          // If pre-send fencing/timeout aborted BEFORE transmission on this call:
+          if (e?.beforeExternalWrite === true) {
+            if (priorExternalWriteUnverified) {
+              throw makeReconciliationError(
+                `Lock or deadline check failed before ${ep} after an earlier 3X-UI write attempt (${e?.message || e}); manual reconciliation required.`
+              );
+            }
+            throw e;
+          }
+          if (e?.statusCode === 409 || e?.statusCode === 504) {
+            throw e;
+          }
+
+          // Generic 3X-UI HTTP 200 { success: false } and HTTP 400/422 responses MUST verify live
+          // panel state before attempting another endpoint or marking non-applied!
+          if (e?.xuiExplicitRejection === true || isHttp400Or422Error(e)) {
+            let liveCheck: {
+              verified: boolean;
+              client: XuiClient | null;
+              stateStrictlyUnchanged: boolean;
+            } | null = null;
+            try {
+              liveCheck = await verifyClientState();
+            } catch {
+              liveCheck = null;
+            }
+
+            if (liveCheck?.verified) {
+              console.warn(
+                `[updateClientExpiry] ${ep} rejected (${e?.message || e}), but live 3X-UI read-back confirmed target expiry/enable/totalGB is applied; skipping remaining endpoints.`
+              );
+              updated = true;
+              verifiedFromRejectionReadback = liveCheck;
+              break;
+            }
+
+            if (liveCheck?.client && liveCheck.stateStrictlyUnchanged) {
+              console.warn(
+                `[updateClientExpiry] Rejection on ${ep} verified strictly unchanged on live 3X-UI read-back:`,
+                e?.message || e
+              );
+              lastErr = e;
+              if (deps?.signal?.aborted) {
+                assertRequestNotTimedOutBeforeExternalMutation(
+                  deps?.signal,
+                  `manual renewal next endpoint after verified unchanged ${ep}`
+                );
+              }
+              continue;
+            }
+
+            priorExternalWriteUnverified = true;
+            throw makeReconciliationError(
+              `3X-UI rejected ${ep} (${e?.message || e}) and live panel verification could not confirm unchanged state; refusing alternate write. Manual reconciliation required.`
+            );
+          }
+
+          // Only try alternate endpoints when the preceding response definitively establishes
+          // that the mutation was NOT applied before panel execution (e.g. 404/405/ECONNREFUSED/ENOTFOUND).
+          if (!isDefinitiveNonAppliedMutationError(e)) {
+            priorExternalWriteUnverified = true;
+            throw makeReconciliationError(
+              `Ambiguous 3X-UI response on ${ep} (${e?.message || e}); refusing duplicate write on alternate endpoint. Manual reconciliation required.`
+            );
+          }
+          console.warn(`[updateClientExpiry] Definitive non-applied rejection on ${ep}:`, e?.message || e);
           lastErr = e;
         }
       }
@@ -1010,8 +1352,79 @@ export const updateClientExpiry = async (
         delete updateInboundPayload.trafficReset;
         delete updateInboundPayload.lastTrafficResetTime;
 
-        await assertInboundLockStillHeld();
-        await requestApiFn<any>(`/panel/api/inbounds/update/${inbound.id}`, 'POST', updateInboundPayload);
+        // If an earlier external mutation outcome was NOT verified non-applied and the HTTP deadline
+        // has elapsed, NEVER dispatch a second external mutation; require reconciliation.
+        if (priorExternalWriteUnverified && deps?.signal?.aborted) {
+          throw makeReconciliationError(
+            `HTTP request deadline elapsed after initial 3X-UI renewal write; refusing second external mutation on inbound ${inbound.id}. Manual reconciliation required.`
+          );
+        }
+
+        try {
+          await verifyAllLocksBeforeExternalMutation();
+        } catch (fallbackLockErr: any) {
+          if (priorExternalWriteUnverified) {
+            throw makeReconciliationError(
+              `Lock or deadline check failed before inbound fallback on inbound ${inbound.id} after earlier 3X-UI write (${fallbackLockErr?.message || fallbackLockErr}); manual reconciliation required.`
+            );
+          }
+          throw fallbackLockErr;
+        }
+
+        externalMutationDispatched = true;
+        try {
+          await requestApiFn<any>(`/panel/api/inbounds/update/${inbound.id}`, 'POST', updateInboundPayload, {
+            beforeSend: verifyAllLocksBeforeExternalMutation,
+            signal: deps?.signal,
+          });
+          priorExternalWriteUnverified = true;
+        } catch (fallbackApiErr: any) {
+          if (fallbackApiErr?.beforeExternalWrite === true) {
+            if (priorExternalWriteUnverified) {
+              throw makeReconciliationError(
+                `Lock or deadline check failed during inbound fallback before POST after earlier 3X-UI write (${fallbackApiErr?.message || fallbackApiErr}); manual reconciliation required.`
+              );
+            }
+            throw fallbackApiErr;
+          }
+          if (fallbackApiErr?.statusCode === 409 || fallbackApiErr?.statusCode === 504) {
+            throw fallbackApiErr;
+          }
+          if (fallbackApiErr?.xuiExplicitRejection === true || isHttp400Or422Error(fallbackApiErr)) {
+            let fallbackLiveCheck: {
+              verified: boolean;
+              client: XuiClient | null;
+              stateStrictlyUnchanged: boolean;
+            } | null = null;
+            try {
+              fallbackLiveCheck = await verifyClientState();
+            } catch {
+              fallbackLiveCheck = null;
+            }
+            if (fallbackLiveCheck?.verified) {
+              console.warn(
+                `[updateClientExpiry] Inbound update fallback rejected (${fallbackApiErr?.message || fallbackApiErr}), but live 3X-UI read-back confirmed target state is applied.`
+              );
+              verifiedFromRejectionReadback = fallbackLiveCheck;
+              return;
+            }
+            if (
+              !priorExternalWriteUnverified &&
+              fallbackLiveCheck?.client &&
+              fallbackLiveCheck.stateStrictlyUnchanged
+            ) {
+              const confirmedUnchangedErr: any = lastErr || fallbackApiErr;
+              if (confirmedUnchangedErr && typeof confirmedUnchangedErr === 'object') {
+                confirmedUnchangedErr.xuiUncertain = false;
+              }
+              throw confirmedUnchangedErr;
+            }
+            throw makeReconciliationError(
+              `3X-UI rejected inbound update fallback on inbound ${inbound.id} (${fallbackApiErr?.message || fallbackApiErr}) and live panel verification could not confirm unchanged state; manual reconciliation required.`
+            );
+          }
+          throw fallbackApiErr;
+        }
       };
 
       if (!updated) {
@@ -1019,78 +1432,102 @@ export const updateClientExpiry = async (
           await applyInboundUpdateFallback();
           updated = true;
         } catch (fallbackErr: any) {
+          if (fallbackErr?.beforeExternalWrite === true || fallbackErr?.statusCode === 409 || fallbackErr?.statusCode === 504) {
+            throw fallbackErr;
+          }
+          if (!isDefinitiveNonAppliedMutationError(fallbackErr)) {
+            if (fallbackErr?.xuiUncertain === false && !priorExternalWriteUnverified) {
+              throw lastErr || fallbackErr;
+            }
+            throw makeReconciliationError(
+              `Ambiguous 3X-UI response on inbound update fallback for inbound ${inbound.id} (${fallbackErr?.message || fallbackErr}); manual reconciliation required.`
+            );
+          }
           console.error(`[updateClientExpiry] Inbound update fallback failed for inbound ${inbound.id}:`, fallbackErr?.message || fallbackErr);
-          throw lastErr || fallbackErr;
+          const cleanErr: any = lastErr || fallbackErr;
+          if (!priorExternalWriteUnverified && cleanErr && typeof cleanErr === 'object') {
+            cleanErr.xuiUncertain = false;
+          }
+          throw cleanErr;
         }
       }
 
-      // Fetch the client again from 3X-UI and verify that enable === true and expiryTime is in the future
-      const verifyClientState = async (): Promise<{ verified: boolean; client: XuiClient | null }> => {
-        const freshInbounds = await getInboundsFn(true);
-        const targetInbound =
-          freshInbounds.find((ib) => Number(ib.id) === Number(inbound.id)) ||
-          freshInbounds.find((ib) => {
-            try {
-              const rawS: any = ib.settings;
-              const s = typeof rawS === 'string' ? JSON.parse(rawS) : rawS;
-              return (s?.clients || []).some(
-                (cl: any) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
-              );
-            } catch {
-              return false;
-            }
-          });
-
-        if (!targetInbound) {
-          return { verified: false, client: null };
-        }
-
-        let freshSettings: { clients?: XuiClient[] } = {};
-        try {
-          const rawFreshS: any = targetInbound.settings;
-          freshSettings =
-            typeof rawFreshS === 'string'
-              ? JSON.parse(rawFreshS)
-              : rawFreshS || {};
-        } catch {
-          return { verified: false, client: null };
-        }
-
-        const freshClient =
-          (freshSettings.clients || []).find(
-            (cl) => cl.id && String(cl.id).trim().toLowerCase() === normalizedTargetUuid
-          ) || null;
-
-        if (!freshClient) {
-          return { verified: false, client: null };
-        }
-
-        const freshExpiry = Number(freshClient.expiryTime || 0);
-        const isEnabled = freshClient.enable === true;
-        const isFutureExpiry = freshExpiry > now && Math.abs(freshExpiry - expectedExpiryTime) <= 1000;
-
-        return {
-          verified: isEnabled && isFutureExpiry,
-          client: freshClient
-        };
+      let verification: {
+        verified: boolean;
+        client: XuiClient | null;
+        stateStrictlyUnchanged: boolean;
       };
+      if (verifiedFromRejectionReadback) {
+        verification = verifiedFromRejectionReadback;
+      } else {
+        try {
+          verification = await verifyClientState();
+        } catch (readErr: any) {
+          throw makeReconciliationError(
+            `3X-UI read-back failed after renewal write for UUID ${uuid} on inbound ${inbound.id} (${readErr?.message || readErr}); manual reconciliation required.`
+          );
+        }
+      }
 
-      let verification = await verifyClientState();
-
-      // If the initial endpoint returned 200 but did not persist enable: true or the new expiryTime,
-      // apply the full inbound update fallback and re-verify once.
+      // If the initial endpoint returned 200 and live read-back proves enable: true / expiryTime did NOT persist,
+      // apply the full inbound update fallback once (only if HTTP deadline has not elapsed and all locks remain valid).
       if (!verification.verified && !usedInboundUpdateFallback) {
         console.warn(
           `[updateClientExpiry] Initial update did not confirm enable=true & expiryTime=${expectedExpiryTime} (got enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}). Applying inbound update fallback...`
         );
-        await applyInboundUpdateFallback();
-        verification = await verifyClientState();
+        try {
+          await applyInboundUpdateFallback();
+        } catch (postFallbackErr: any) {
+          if (postFallbackErr?.statusCode === 409 || postFallbackErr?.statusCode === 504) {
+            throw postFallbackErr;
+          }
+          throw makeReconciliationError(
+            `3X-UI inbound update fallback failed after initial write for UUID ${uuid} (${postFallbackErr?.message || postFallbackErr}); manual reconciliation required.`
+          );
+        }
+        if (verifiedFromRejectionReadback) {
+          verification = verifiedFromRejectionReadback;
+        } else {
+          try {
+            verification = await verifyClientState();
+          } catch (readErr2: any) {
+            throw makeReconciliationError(
+              `3X-UI read-back failed after fallback write for UUID ${uuid} on inbound ${inbound.id} (${readErr2?.message || readErr2}); manual reconciliation required.`
+            );
+          }
+        }
       }
 
       if (!verification.verified) {
         const errMsg = `Failed to verify 3X-UI client reactivation for UUID ${uuid} on inbound ${inbound.id}: enable=${verification.client?.enable}, expiryTime=${verification.client?.expiryTime}, expectedExpiryTime=${expectedExpiryTime}`;
         console.error(`[updateClientExpiry] ${errMsg}`);
-        throw new Error(errMsg);
+        if (!verification.client || !verification.stateStrictlyUnchanged) {
+          throw makeReconciliationError(
+            `${errMsg}; live panel state differs from pre-mutation snapshot. Manual reconciliation required.`
+          );
+        }
+        const verifyFailErr: any = new Error(errMsg);
+        verifyFailErr.xuiUncertain = false;
+        throw verifyFailErr;
+      }
+
+      // Verify post-write lock ownership before returning so a stale worker cannot finalize DB state
+      try {
+        await assertInboundLockStillHeld();
+        if (deps?.afterExternalMutationCheck) {
+          await deps.afterExternalMutationCheck();
+        } else if (deps?.beforeExternalMutation) {
+          await deps.beforeExternalMutation();
+        }
+      } catch (postLockErr: any) {
+        const staleErr: any = new Error(
+          `Lock ownership lost after verified 3X-UI renewal write for UUID ${uuid} (${postLockErr?.message || postLockErr}); refusing stale DB finalization. Manual reconciliation required.`
+        );
+        staleErr.statusCode = 409;
+        staleErr.code = 'RECONCILIATION_REQUIRED';
+        staleErr.xuiUncertain = true;
+        staleErr.markLockUncertain = true;
+        throw staleErr;
       }
 
       console.log(
@@ -1420,6 +1857,7 @@ export function calculateOrderDurationAndExpiry(params: {
 
 const activeProvisionings = new Set<string>();
 const inboundProcessQueues = new Map<number, Promise<void>>();
+const clientProcessQueues = new Map<string, Promise<void>>();
 const DEFAULT_LOCK_LEASE_SECONDS = 120;
 const INBOUND_LOCK_LEASE_SECONDS = 45;
 
@@ -1431,6 +1869,24 @@ export const isAutoActivateRenewalsFlagEnabled = (): boolean =>
 
 export const isPanelDeletionSyncFlagEnabled = (): boolean =>
   String(process.env.PANEL_DELETION_SYNC_ENABLED || 'false').trim().toLowerCase() === 'true';
+
+export const getPanelDeletionSyncIntervalMs = (): number => {
+  const raw = Number(process.env.PANEL_DELETION_SYNC_INTERVAL_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return 120000; // Default 2 minutes
+  return Math.max(30000, Math.min(Math.floor(raw), 3600000));
+};
+
+export const getPanelDeletionSyncMaxDeletesPerCycle = (): number => {
+  const raw = Number(process.env.PANEL_DELETION_SYNC_MAX_DELETES_PER_CYCLE);
+  if (!Number.isFinite(raw) || raw <= 0) return 10;
+  return Math.max(1, Math.min(Math.floor(raw), 500));
+};
+
+export const getPanelDeletionSyncMaxMissingRatio = (): number => {
+  const raw = Number(process.env.PANEL_DELETION_SYNC_MAX_MISSING_RATIO);
+  if (!Number.isFinite(raw) || raw <= 0 || raw > 1) return 0.25;
+  return raw;
+};
 
 const isMissingSchemaOrRpcError = (err: any): boolean => {
   const code = String(err?.code || '');
@@ -1455,6 +1911,7 @@ export interface ProvisionOrderClientOptions {
   findProvisioningTemplateFn?: typeof findProvisioningTemplate;
   heldOrderLockOwnerId?: string;
   skipSideEffects?: boolean;
+  signal?: AbortSignal;
 }
 
 export type DurableOperationType =
@@ -1469,17 +1926,86 @@ export type DurableOperationType =
   | 'client_lock'
   | 'traffic_reset';
 
+export type DurableLockFailureKind =
+  | 'active_lock'
+  | 'uncertain_lock'
+  | 'permission_error'
+  | 'rpc_error'
+  | 'unavailable';
+
 export interface DurableLockAcquireResult {
   acquired: boolean;
   lockOwnerId: string;
   tableAvailable: boolean;
   staleRecovery: boolean;
+  failureKind?: DurableLockFailureKind;
   previousStatus?: string | null;
   previousOperationType?: string | null;
   previousClientUuid?: string | null;
   holderOwnerId?: string | null;
   leaseExpiresAt?: string | null;
   error?: string;
+}
+
+export function isPermissionOrAuthLockError(err: any): boolean {
+  const code = String(err?.code || '').trim();
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    code === '42501' ||
+    msg.includes('permission denied') ||
+    msg.includes('insufficient_privilege') ||
+    msg.includes('row-level security') ||
+    msg.includes('not authorized')
+  );
+}
+
+/**
+ * Builds a structured HTTP error from a failed durable lock acquisition without leaking
+ * credentials, SQL details, or internal secrets.
+ */
+export function buildDurableLockFailureError(
+  lockRes: DurableLockAcquireResult,
+  targetLabel: string
+): Error & { statusCode: number; code: string } {
+  const err: any = new Error();
+  if (lockRes.failureKind === 'permission_error') {
+    err.message =
+      'Backend provisioning lock permission error. Please verify server service-role configuration before retrying.';
+    err.statusCode = 503;
+    err.code = 'LOCK_PERMISSION_ERROR';
+    return err;
+  }
+
+  if (
+    lockRes.failureKind === 'rpc_error' ||
+    lockRes.failureKind === 'unavailable' ||
+    !lockRes.tableAvailable
+  ) {
+    err.message =
+      'Provisioning coordination service is temporarily unavailable. Please check status and retry shortly.';
+    err.statusCode = 503;
+    err.code = 'LOCK_SERVICE_UNAVAILABLE';
+    return err;
+  }
+
+  if (lockRes.failureKind === 'uncertain_lock' || lockRes.previousStatus === 'uncertain') {
+    err.message = `${targetLabel} has an uncertain prior external provisioning state and requires manual reconciliation before retrying.`;
+    err.statusCode = 409;
+    err.code = 'RECONCILIATION_REQUIRED';
+    return err;
+  }
+
+  if (lockRes.previousOperationType === 'reject_order') {
+    err.message = `${targetLabel} rejection is currently in progress. Please wait and check current status.`;
+    err.statusCode = 409;
+    err.code = 'OPERATION_IN_PROGRESS';
+    return err;
+  }
+
+  err.message = `${targetLabel} is already being processed by another operation. Please wait and check current status.`;
+  err.statusCode = 409;
+  err.code = 'OPERATION_IN_PROGRESS';
+  return err;
 }
 
 /**
@@ -1545,6 +2071,7 @@ export async function acquireDurableProvisioningOperationLock(params: {
       lockOwnerId,
       tableAvailable: false,
       staleRecovery: false,
+      failureKind: 'unavailable',
       error: 'Durable lock RPC client is unavailable.',
     };
   }
@@ -1569,13 +2096,20 @@ export async function acquireDurableProvisioningOperationLock(params: {
         );
         return { acquired: true, lockOwnerId, tableAvailable: false, staleRecovery: false };
       }
-      console.error(`[xuiService] Durable lock acquisition failed CLOSED for ${operationKey}:`, error.message || error);
+      const isPermErr = isPermissionOrAuthLockError(error);
+      console.error(
+        `[xuiService] Durable lock acquisition failed CLOSED (${isPermErr ? 'permission_error' : 'rpc_error'}) for ${operationKey}:`,
+        error.message || error
+      );
       return {
         acquired: false,
         lockOwnerId,
         tableAvailable: !isMissingSchemaOrRpcError(error),
         staleRecovery: false,
-        error: error.message || 'Failed to acquire durable operation lock.',
+        failureKind: isPermErr ? 'permission_error' : 'rpc_error',
+        error: isPermErr
+          ? 'Backend provisioning lock permission error.'
+          : 'Failed to acquire durable operation lock.',
       };
     }
 
@@ -1586,16 +2120,24 @@ export async function acquireDurableProvisioningOperationLock(params: {
         lockOwnerId,
         tableAvailable: true,
         staleRecovery: false,
+        failureKind: 'rpc_error',
         error: 'Unexpected response from acquire_provisioning_lock RPC.',
       };
     }
 
+    const acquired = Boolean(row.acquired);
+    const previousStatus = row.previous_status ?? null;
     return {
-      acquired: Boolean(row.acquired),
+      acquired,
       lockOwnerId,
       tableAvailable: true,
       staleRecovery: Boolean(row.stale_recovery),
-      previousStatus: row.previous_status ?? null,
+      failureKind: acquired
+        ? undefined
+        : previousStatus === 'uncertain'
+        ? 'uncertain_lock'
+        : 'active_lock',
+      previousStatus,
       previousOperationType: row.previous_operation_type ?? null,
       previousClientUuid: row.previous_client_uuid ?? null,
       holderOwnerId: row.holder_owner_id ?? null,
@@ -1605,13 +2147,17 @@ export async function acquireDurableProvisioningOperationLock(params: {
     if (isMissingSchemaOrRpcError(err) && !mustFailClosed) {
       return { acquired: true, lockOwnerId, tableAvailable: false, staleRecovery: false };
     }
+    const isPermErr = isPermissionOrAuthLockError(err);
     console.error(`[xuiService] Durable lock acquisition exception (fail CLOSED) for ${operationKey}:`, err?.message || err);
     return {
       acquired: false,
       lockOwnerId,
       tableAvailable: false,
       staleRecovery: false,
-      error: err?.message || 'Durable lock acquisition exception.',
+      failureKind: isPermErr ? 'permission_error' : 'rpc_error',
+      error: isPermErr
+        ? 'Backend provisioning lock permission error.'
+        : 'Durable lock acquisition failed.',
     };
   }
 }
@@ -1833,6 +2379,7 @@ export async function withInboundWriteLock<T>(
 
     while (true) {
       attempt++;
+      const effectiveAllowUncertainRecovery = params.allowUncertainRecovery === true;
       const res = await acquireDurableProvisioningOperationLock({
         dbClient: params.dbClient,
         operationKey: inboundKey,
@@ -1841,8 +2388,8 @@ export async function withInboundWriteLock<T>(
         clientUuid: params.clientUuid || null,
         leaseSeconds: INBOUND_LOCK_LEASE_SECONDS,
         metadata: { inboundId, targetId: params.targetId },
-        requireDurableLock: params.requireDurableLock ?? isAutoActivateNewOrdersFlagEnabled(),
-        allowUncertainRecovery: params.allowUncertainRecovery,
+        requireDurableLock: params.requireDurableLock ?? true,
+        allowUncertainRecovery: effectiveAllowUncertainRecovery,
       });
 
       if (res.acquired) {
@@ -1852,16 +2399,21 @@ export async function withInboundWriteLock<T>(
 
       // If table/RPC is missing or hard DB error occurred under fail-closed mode, fail immediately instead of spinning
       if (!res.tableAvailable) {
-        throw new Error(res.error || `Unable to acquire durable inbound lock for inbound ${inboundId}.`);
+        const lockErr: any = buildDurableLockFailureError(res, `Inbound ${inboundId}`);
+        lockErr.beforeExternalWrite = true;
+        lockErr.xuiUncertain = false;
+        throw lockErr;
       }
 
-      // Never spin or steal an uncertain inbound lock when allowUncertainRecovery is explicitly false
-      if (params.allowUncertainRecovery === false && res.previousStatus === 'uncertain') {
+      // Never spin or steal an uncertain inbound lock when allowUncertainRecovery is not explicitly true
+      if (!effectiveAllowUncertainRecovery && res.previousStatus === 'uncertain') {
         const uncertainErr: any = new Error(
           `Inbound ${inboundId} has an uncertain prior provisioning lock; skipping without forcing recovery.`
         );
         uncertainErr.statusCode = 409;
         uncertainErr.code = 'INBOUND_LOCK_UNCERTAIN';
+        uncertainErr.beforeExternalWrite = true;
+        uncertainErr.xuiUncertain = false;
         throw uncertainErr;
       }
 
@@ -1891,6 +2443,9 @@ export async function withInboundWriteLock<T>(
           `Lost durable inbound write lock '${inboundKey}' before 3X-UI mutation; aborting to prevent overlapping writes.`
         );
         fenceErr.statusCode = 409;
+        fenceErr.code = 'INBOUND_LOCK_LOST';
+        fenceErr.beforeExternalWrite = true;
+        fenceErr.xuiUncertain = false;
         throw fenceErr;
       }
     };
@@ -1900,10 +2455,17 @@ export async function withInboundWriteLock<T>(
     try {
       return await fn(assertInboundLockStillHeld);
     } catch (err: any) {
-      if (params.noExternalXuiWrite === true) {
-        // Caller performs zero 3X-UI inbound writes (e.g., read-only panel verification);
-        // never poison the shared inbound write lock into 'uncertain'.
+      if (
+        params.noExternalXuiWrite === true ||
+        err?.beforeExternalWrite === true ||
+        err?.xuiUncertain === false
+      ) {
+        // Caller performed zero external 3X-UI inbound writes (e.g., read-only panel verification
+        // or definitive pre-mutation eligibility/cooldown/lock rejection); never poison the shared
+        // inbound write lock into 'uncertain'.
         opOutcome = 'failed';
+      } else if (err?.xuiUncertain === true || err?.mutationUncertain === true) {
+        opOutcome = 'uncertain';
       } else {
         const msgLower = String(err?.message || '').toLowerCase();
         const isUncertainTransportErr =
@@ -1952,12 +2514,14 @@ export const provisionOrderClient = async (
   console.log(`[xuiService] [FUNCTION ENTERED] provisionOrderClient - orderId: ${orderId} | provisional: ${isProvisionalActivation}`);
   if (!options?.heldOrderLockOwnerId && activeProvisionings.has(orderId)) {
     console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] provisionOrderClient is already running for orderId: ${orderId}`);
-    return {
-      success: true,
-      deduplicated: true,
-      message: 'Provisioning is already in progress for this order. Skipping duplicate execution.'
-    };
+    const conflictErr: any = new Error(
+      'Provisioning is already in progress for this order. Please wait and check current status.'
+    );
+    conflictErr.statusCode = 409;
+    conflictErr.code = 'OPERATION_IN_PROGRESS';
+    throw conflictErr;
   }
+
   activeProvisionings.add(orderId);
   let canonicalOrderLockKey = '';
   let durableOperationKey = '';
@@ -1969,12 +2533,13 @@ export const provisionOrderClient = async (
 
   try {
     let { data: order, error: fetchErr } = await dbClient.from('orders').select('*').eq('id', orderId).maybeSingle();
-
     if (!order) {
       const { data: queryOrder } = await dbClient.from('orders').select('*').eq('order_id', orderId).maybeSingle();
       if (!queryOrder) {
         console.error(`[3X-UI Provisioning] Order '${orderId}' not found in database. Fetch error:`, fetchErr);
-        throw new Error(`Order '${orderId}' not found in database.`);
+        const notFoundErr: any = new Error(`Order '${orderId}' not found in database.`);
+        notFoundErr.statusCode = 404;
+        throw notFoundErr;
       }
       order = queryOrder;
     }
@@ -1984,11 +2549,12 @@ export const provisionOrderClient = async (
       canonicalOrderLockKey = String(order.id);
       if (activeProvisionings.has(canonicalOrderLockKey)) {
         console.warn(`[xuiService] [DUPLICATE EXECUTION DETECTED] Canonical order ${canonicalOrderLockKey} is already provisioning.`);
-        return {
-          success: true,
-          deduplicated: true,
-          message: 'Provisioning is already in progress for this order. Skipping duplicate assignment.'
-        };
+        const conflictErr: any = new Error(
+          'Provisioning is already in progress for this order. Please wait and check current status.'
+        );
+        conflictErr.statusCode = 409;
+        conflictErr.code = 'OPERATION_IN_PROGRESS';
+        throw conflictErr;
       }
       activeProvisionings.add(canonicalOrderLockKey);
     }
@@ -2006,31 +2572,18 @@ export const provisionOrderClient = async (
           orderId: order.order_id || order.id,
           provisional: isProvisionalActivation,
         },
-        requireDurableLock: isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled(),
+        requireDurableLock: true,
+        allowUncertainRecovery: false,
       });
 
       if (!lockRes.acquired) {
-        if (!lockRes.tableAvailable && (isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled())) {
-          throw new Error(lockRes.error || 'Durable order coordination lock is unavailable; refusing to provision.');
-        }
-        if (lockRes.previousStatus === 'uncertain') {
-          const uncErr: any = new Error(
-            `Order '${order.order_id || order.id}' has an uncertain prior external provisioning state; automatic takeover blocked until explicit reconciliation.`
-          );
-          uncErr.statusCode = 409;
-          throw uncErr;
-        }
-        console.warn(`[xuiService] Durable operation lock '${durableOperationKey}' is currently held by another active operation (${lockRes.previousOperationType || 'unknown'}).`);
-        if (lockRes.previousOperationType === 'reject_order') {
-          const conflictErr: any = new Error('Order rejection is currently in progress for this order.');
-          conflictErr.statusCode = 409;
-          throw conflictErr;
-        }
-        return {
-          success: true,
-          deduplicated: true,
-          message: 'Provisioning operation is already in progress for this order.',
-        };
+        console.warn(
+          `[xuiService] Durable operation lock '${durableOperationKey}' could not be acquired (kind=${lockRes.failureKind || 'unknown'}, prevStatus=${lockRes.previousStatus || 'none'}, prevOp=${lockRes.previousOperationType || 'none'}).`
+        );
+        throw buildDurableLockFailureError(
+          lockRes,
+          `Order '${order.order_id || order.id}'`
+        );
       }
 
       acquiredLockOwnerId = lockRes.lockOwnerId;
@@ -2049,6 +2602,44 @@ export const provisionOrderClient = async (
         );
       }
     }
+
+    const effectiveOrderLockOwnerId = options?.heldOrderLockOwnerId || acquiredLockOwnerId;
+    const shouldVerifyOrderLock = Boolean(ownsDurableLock || options?.heldOrderLockOwnerId);
+    const assertOrderLockStillHeld = async (
+      stage: 'before_external_write' | 'before_db_finalization'
+    ): Promise<void> => {
+      if (!shouldVerifyOrderLock) return;
+      if (!durableOperationKey || !effectiveOrderLockOwnerId) {
+        const missingErr: any = new Error(
+          `Missing durable order lock ownership for '${durableOperationKey || order.id}' (${stage}).`
+        );
+        missingErr.statusCode = 409;
+        missingErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'ORDER_LOCK_MISSING';
+        missingErr.beforeExternalWrite = stage === 'before_external_write';
+        missingErr.xuiUncertain = stage === 'before_db_finalization';
+        missingErr.markLockUncertain = stage === 'before_db_finalization';
+        throw missingErr;
+      }
+      const orderLockValid = await renewDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: durableOperationKey,
+        lockOwnerId: effectiveOrderLockOwnerId,
+        leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+      });
+      if (!orderLockValid) {
+        const fenceErr: any = new Error(
+          stage === 'before_db_finalization'
+            ? `Lost durable order lock '${durableOperationKey}' after 3X-UI mutation; refusing stale DB finalization. Manual reconciliation required.`
+            : `Lost durable order lock '${durableOperationKey}' before 3X-UI mutation; aborting to prevent overlapping mutation.`
+        );
+        fenceErr.statusCode = 409;
+        fenceErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'ORDER_LOCK_LOST';
+        fenceErr.beforeExternalWrite = stage === 'before_external_write';
+        fenceErr.xuiUncertain = stage === 'before_db_finalization';
+        fenceErr.markLockUncertain = stage === 'before_db_finalization';
+        throw fenceErr;
+      }
+    };
 
     // Parse read-only order metadata from payment_method (NEVER mutate payment_method for internal entitlement state)
     let extra: any = {};
@@ -2200,6 +2791,13 @@ export const provisionOrderClient = async (
           throw new Error(`Stale lock reconciliation detected provisional client ${order.client_uuid} is missing or disabled on 3X-UI. Manual review required.`);
         }
       }
+
+      // Verify request deadline & order lock ownership right before confirming provisional payment in DB
+      assertRequestNotTimedOutBeforeExternalMutation(
+        options?.signal,
+        `provisional payment confirmation for order ${order.order_id || order.id}`
+      );
+      await assertOrderLockStillHeld('before_external_write');
 
       // Mark authoritative entitlement grant as verified FIRST (fail closed if ledger update fails)
       if (existingGrantRow?.id) {
@@ -2720,7 +3318,8 @@ export const provisionOrderClient = async (
       inboundId,
       targetId: String(order.id),
       clientUuid: uuid,
-      requireDurableLock: isProvisionalActivation || isAutoActivateNewOrdersFlagEnabled(),
+      requireDurableLock: true,
+      allowUncertainRecovery: false,
     },
     async (assertInboundLockStillHeld) => {
       // Fetch fresh target inbound INSIDE the inbound lock
@@ -2850,6 +3449,8 @@ export const provisionOrderClient = async (
       console.log(JSON.stringify(redactClientSecrets(newClientRecord), null, 2));
       console.log('==============================================');
 
+      const preUpdateClientSnapshot = existingIndex >= 0 ? { ...existingClients[existingIndex] } : null;
+
       if (existingIndex >= 0) {
         skipMsg = 'Client already exists on this inbound. Updated existing client settings.';
         console.log(`[3X-UI Provisioning] Client found at index ${existingIndex}. Updating existing client record.`);
@@ -2887,45 +3488,111 @@ export const provisionOrderClient = async (
       console.log(`  - UUID added/updated: ${uuid}`);
       console.log(`  - Email added/updated: ${remark}`);
 
-      // Fencing verification immediately before external 3X-UI mutation:
-      // ensure BOTH the inbound write lock and the order lock are still actively owned by this worker.
-      await assertInboundLockStillHeld();
-      if (ownsDurableLock && durableOperationKey && acquiredLockOwnerId) {
-        const orderLockValid = await renewDurableProvisioningOperationLock({
-          dbClient,
-          operationKey: durableOperationKey,
-          lockOwnerId: acquiredLockOwnerId,
-        });
-        if (!orderLockValid) {
-          const fenceErr: any = new Error(
-            `Lost durable order lock '${durableOperationKey}' before 3X-UI update; aborting to prevent overlapping mutation.`
-          );
-          fenceErr.statusCode = 409;
-          throw fenceErr;
+      const readInboundStateAfterProvision = async (): Promise<any | null> => {
+        let ibObj: any = null;
+        try {
+          const getRes = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
+          ibObj = getRes?.obj || getRes;
+        } catch (getErr: any) {
+          console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
+        }
+        if (!ibObj || typeof ibObj !== 'object' || !ibObj.id) {
+          const allInboundsList = await getInboundsCall(true);
+          ibObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId)) || null;
+        }
+        return ibObj;
+      };
+
+      // Fencing verification immediately before external 3X-UI mutation (and re-run inside requestApi
+      // after potentially slow 3X-UI authentication / re-authentication):
+      // ensure HTTP deadline has not elapsed and BOTH the inbound write lock and order lock are actively owned.
+      const verifyLocksBeforeExternalMutation = async (): Promise<void> => {
+        assertRequestNotTimedOutBeforeExternalMutation(
+          options?.signal,
+          `order provisioning for order ${order.order_id || order.id}`
+        );
+        await assertInboundLockStillHeld();
+        await assertOrderLockStillHeld('before_external_write');
+      };
+
+      await verifyLocksBeforeExternalMutation();
+
+      xuiWriteAttempted = true;
+      let updateRes: any = null;
+      let explicitPanelErr: any = null;
+      try {
+        updateRes = await requestApiCall<any>(
+          `/panel/api/inbounds/update/${inboundId}`,
+          'POST',
+          updateInboundPayload,
+          {
+            beforeSend: verifyLocksBeforeExternalMutation,
+            signal: options?.signal,
+          }
+        );
+      } catch (apiErr: any) {
+        if (apiErr?.xuiExplicitRejection === true || isHttp400Or422Error(apiErr)) {
+          explicitPanelErr = apiErr;
+        } else {
+          throw apiErr;
         }
       }
 
-      xuiWriteAttempted = true;
-      const updateRes = await requestApiCall<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
+      if (explicitPanelErr || (updateRes && updateRes.success === false)) {
+        const panelMsg =
+          explicitPanelErr?.message ||
+          updateRes?.msg ||
+          updateRes?.message ||
+          '3X-UI panel rejected inbound update';
+        console.error(`[3X-UI Provisioning] Inbound update rejected on panel (${panelMsg}); verifying live panel state before classifying.`);
 
-      if (updateRes && updateRes.success === false) {
-        const panelMsg = updateRes.msg || updateRes.message || '3X-UI panel rejected inbound update';
-        console.error(`[3X-UI Provisioning] Inbound update failed on panel: ${panelMsg}`);
-        throw new Error(`3X-UI provisioning failed: ${panelMsg}`);
+        let checkIb: any = null;
+        try {
+          checkIb = await readInboundStateAfterProvision();
+        } catch {
+          checkIb = null;
+        }
+        if (checkIb) {
+          let checkSettings: any = {};
+          try {
+            checkSettings = typeof checkIb.settings === 'string' ? JSON.parse(checkIb.settings) : checkIb.settings || {};
+          } catch {
+            checkSettings = null;
+          }
+          if (checkSettings && Array.isArray(checkSettings.clients)) {
+            const liveMatched = checkSettings.clients.find(
+              (c: any) =>
+                (c.id && String(c.id).trim().toLowerCase() === String(uuid).trim().toLowerCase()) ||
+                (c.email && String(c.email).trim().toLowerCase() === String(remark).trim().toLowerCase())
+            );
+            const verifiedUnchanged =
+              (!preUpdateClientSnapshot && !liveMatched) ||
+              (preUpdateClientSnapshot &&
+                liveMatched &&
+                Boolean(liveMatched.enable) === Boolean(preUpdateClientSnapshot.enable) &&
+                Number(liveMatched.expiryTime || 0) === Number(preUpdateClientSnapshot.expiryTime || 0) &&
+                Number(liveMatched.totalGB || 0) === Number(preUpdateClientSnapshot.totalGB || 0));
+
+            if (verifiedUnchanged) {
+              const panelErr: any = new Error(`3X-UI provisioning failed: ${panelMsg}`);
+              panelErr.xuiUncertain = false;
+              throw panelErr;
+            }
+          }
+        }
+
+        const reconErr: any = new Error(
+          `3X-UI rejected provisioning (${panelMsg}) and live panel verification did not confirm unchanged state; manual reconciliation required.`
+        );
+        reconErr.statusCode = 409;
+        reconErr.code = 'RECONCILIATION_REQUIRED';
+        reconErr.beforeExternalWrite = false;
+        reconErr.xuiUncertain = true;
+        reconErr.markLockUncertain = true;
+        throw reconErr;
       }
 
-      let afterInboundObj: any = null;
-      try {
-        const getRes = await requestApiCall<any>(`/panel/api/inbounds/get/${inboundId}`, 'GET');
-        afterInboundObj = getRes?.obj || getRes;
-      } catch (getErr: any) {
-        console.warn(`[3X-UI Provisioning] GET /panel/api/inbounds/get/${inboundId} notice:`, getErr?.message || getErr);
-      }
-
-      if (!afterInboundObj || typeof afterInboundObj !== 'object' || !afterInboundObj.id) {
-        const allInboundsList = await getInboundsCall(true);
-        afterInboundObj = allInboundsList.find((ib: any) => Number(ib.id) === Number(inboundId));
-      }
+      const afterInboundObj = await readInboundStateAfterProvision();
 
       let afterSettingsObj: any = {};
       if (afterInboundObj) {
@@ -2961,6 +3628,10 @@ export const provisionOrderClient = async (
       invalidateInboundCache(Number(inboundId));
     }
   );
+
+  // Post-write lock fencing: ensure this worker STILL owns the order lock before finalizing DB rows
+  // so a stale worker can never overwrite database state owned by another worker.
+  await assertOrderLockStillHeld('before_db_finalization');
 
   // Step 3: Generate the VLESS URL and subscription URL
   const vlessUrl = buildVlessLink(inbound, address, sni, uuid, remark);
@@ -3311,11 +3982,19 @@ export const provisionOrderClient = async (
   };
   } catch (err: any) {
     if (ownsDurableLock && durableOperationKey && acquiredLockOwnerId) {
+      const isUncertainOutcome = Boolean(
+        err?.xuiUncertain === true ||
+        err?.markLockUncertain === true ||
+        (xuiWriteAttempted &&
+          !xuiWriteConfirmed &&
+          err?.beforeExternalWrite !== true &&
+          err?.xuiUncertain !== false)
+      );
       await finalizeDurableProvisioningOperationLock({
         dbClient,
         operationKey: durableOperationKey,
         lockOwnerId: acquiredLockOwnerId,
-        status: xuiWriteAttempted && !xuiWriteConfirmed ? 'uncertain' : 'failed',
+        status: isUncertainOutcome ? 'uncertain' : 'failed',
         errorMessage: err?.message || String(err),
       });
       ownsDurableLock = false;
@@ -3335,6 +4014,8 @@ export interface RevokeProvisionalOrderClientOptions {
   requestApiFn?: typeof requestApi;
   getInboundsFn?: typeof getInbounds;
   heldOrderLockOwnerId?: string;
+  heldOrderLockTableAvailable?: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -3343,9 +4024,11 @@ export interface RevokeProvisionalOrderClientOptions {
  * - ZERO payment_method fallback: public.vpn_entitlement_grants is the sole authoritative ledger.
  * - Handles partial/interrupted provisional states (`status IN ('provisioning', 'provisional', 'revoke_failed')`)
  *   by reconciling live 3X-UI state and disabling any unpaid client that already exists on 3X-UI.
- * - Serializes 3X-UI writes under per-inbound durable lock (`inbound:<id>`).
+ * - Serializes 3X-UI writes under per-inbound durable lock (`inbound:<id>`) with `allowUncertainRecovery: false`.
+ * - Verifies and renews BOTH outer `order:<id>` and nested `inbound:<id>` locks using original ownership
+ *   credentials immediately before every external mutation and before DB finalization.
  * - Performs mandatory read-back verification from 3X-UI after setting `enable: false` before marking 'revoked'.
- * - On failure, marks 'revoke_failed' in vpn_entitlement_grants & orders.provisioning_status and throws.
+ * - On explicit failure, marks 'revoke_failed'; on post-write ambiguity/lease loss, marks 'uncertain' / RECONCILIATION_REQUIRED.
  */
 export const revokeProvisionalOrderClient = async (
   orderId: string,
@@ -3374,6 +4057,9 @@ export const revokeProvisionalOrderClient = async (
   const durableOperationKey = `order:${order.id}`;
   let acquiredLockOwnerId = options?.heldOrderLockOwnerId || '';
   let ownsDurableLock = false;
+  let orderLockTableAvailable = Boolean(
+    options?.heldOrderLockOwnerId && options?.heldOrderLockTableAvailable !== false
+  );
 
   if (!options?.heldOrderLockOwnerId) {
     const lockRes = await acquireDurableProvisioningOperationLock({
@@ -3383,23 +4069,62 @@ export const revokeProvisionalOrderClient = async (
       targetId: String(order.id),
       clientUuid: order.client_uuid || null,
       metadata: { reason, adminLabel: options?.adminLabel || 'Admin' },
-      requireDurableLock: isAutoActivateNewOrdersFlagEnabled(),
+      requireDurableLock: true,
+      allowUncertainRecovery: false,
     });
 
     if (!lockRes.acquired) {
-      const conflictErr: any = new Error(
-        lockRes.error || 'Another provisioning, approval, or rejection operation is currently in progress for this order.'
+      throw buildDurableLockFailureError(
+        lockRes,
+        `Order '${order.order_id || order.id}'`
       );
-      conflictErr.statusCode = 409;
-      throw conflictErr;
     }
 
     acquiredLockOwnerId = lockRes.lockOwnerId;
     ownsDurableLock = lockRes.tableAvailable;
+    orderLockTableAvailable = lockRes.tableAvailable;
   }
 
   let dbGrant: any = null;
   let clientUuid = '';
+  let xuiWriteAttempted = false;
+  let xuiWriteConfirmed = false;
+
+  const assertOrderLockStillHeld = async (
+    stage: 'before_external_write' | 'before_db_finalization'
+  ): Promise<void> => {
+    if (!acquiredLockOwnerId || !orderLockTableAvailable) {
+      const missingErr: any = new Error(
+        `Missing verified durable order lock '${durableOperationKey}' (${stage}); refusing to proceed without required lock.`
+      );
+      missingErr.statusCode = 409;
+      missingErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'ORDER_LOCK_MISSING';
+      missingErr.beforeExternalWrite = stage === 'before_external_write';
+      missingErr.xuiUncertain = stage === 'before_db_finalization';
+      missingErr.markLockUncertain = stage === 'before_db_finalization';
+      throw missingErr;
+    }
+
+    const renewed = await renewDurableProvisioningOperationLock({
+      dbClient,
+      operationKey: durableOperationKey,
+      lockOwnerId: acquiredLockOwnerId,
+      leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+    });
+    if (!renewed) {
+      const fenceErr: any = new Error(
+        stage === 'before_db_finalization'
+          ? `Lost durable order lock '${durableOperationKey}' after 3X-UI revocation; refusing stale DB finalization. Manual reconciliation required.`
+          : `Lost durable order lock '${durableOperationKey}' before 3X-UI revocation; aborting before external mutation.`
+      );
+      fenceErr.statusCode = 409;
+      fenceErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'ORDER_LOCK_LOST';
+      fenceErr.beforeExternalWrite = stage === 'before_external_write';
+      fenceErr.xuiUncertain = stage === 'before_db_finalization';
+      fenceErr.markLockUncertain = stage === 'before_db_finalization';
+      throw fenceErr;
+    }
+  };
 
   const releaseOwnedLock = async (status: 'completed' | 'failed' | 'uncertain', errMsg?: string | null, metadata?: Record<string, any>) => {
     if (ownsDurableLock && acquiredLockOwnerId) {
@@ -3612,6 +4337,7 @@ export const revokeProvisionalOrderClient = async (
           targetId: String(order.id),
           clientUuid,
           requireDurableLock: true,
+          allowUncertainRecovery: false,
         },
         async (assertInboundLockStillHeld) => {
           const fetchFreshInbound = async (): Promise<any | null> => {
@@ -3644,6 +4370,7 @@ export const revokeProvisionalOrderClient = async (
           const clientIdx = clientsList.findIndex((c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase());
 
           if (clientIdx >= 0) {
+            const preWriteClientEnabled = clientsList[clientIdx].enable !== false;
             // Disable the client on 3X-UI while preserving its record and credentials
             clientsList[clientIdx] = {
               ...clientsList[clientIdx],
@@ -3662,16 +4389,58 @@ export const revokeProvisionalOrderClient = async (
             delete updateInboundPayload.trafficReset;
             delete updateInboundPayload.lastTrafficResetTime;
 
-            await assertInboundLockStillHeld();
-            const updateRes = await requestApiCall<any>(`/panel/api/inbounds/update/${inboundId}`, 'POST', updateInboundPayload);
-            if (updateRes && updateRes.success === false) {
-              throw new Error(updateRes.msg || updateRes.message || `3X-UI rejected disabling provisional client ${clientUuid}`);
+            const verifyLocksBeforeExternalMutation = async (): Promise<void> => {
+              assertRequestNotTimedOutBeforeExternalMutation(
+                options?.signal,
+                `provisional order revocation for order ${order.order_id || order.id}`
+              );
+              await assertInboundLockStillHeld();
+              await assertOrderLockStillHeld('before_external_write');
+            };
+
+            await verifyLocksBeforeExternalMutation();
+
+            xuiWriteAttempted = true;
+            let updateRes: any = null;
+            let explicitPanelErr: any = null;
+            try {
+              updateRes = await requestApiCall<any>(
+                `/panel/api/inbounds/update/${inboundId}`,
+                'POST',
+                updateInboundPayload,
+                {
+                  beforeSend: verifyLocksBeforeExternalMutation,
+                  signal: options?.signal,
+                }
+              );
+            } catch (apiErr: any) {
+              if (apiErr?.xuiExplicitRejection === true || isHttp400Or422Error(apiErr)) {
+                explicitPanelErr = apiErr;
+              } else {
+                throw apiErr;
+              }
             }
 
             // MANDATORY READ-BACK VERIFICATION: confirm enable === false persisted on 3X-UI
-            const verifiedInbound = await fetchFreshInbound();
+            // (runs both on success AND on generic success:false rejection, and even if deadline elapsed after dispatch)
+            let verifiedInbound: any = null;
+            let readbackFetchErr: any = null;
+            try {
+              verifiedInbound = await fetchFreshInbound();
+            } catch (rbErr: any) {
+              readbackFetchErr = rbErr;
+            }
             if (!verifiedInbound) {
-              throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after disabling client ${clientUuid}.`);
+              const reconErr: any = new Error(
+                explicitPanelErr || (updateRes && updateRes.success === false)
+                  ? `3X-UI rejected disabling provisional client ${clientUuid} (${explicitPanelErr?.message || updateRes?.msg || 'success:false'}) and read-back verification failed${readbackFetchErr ? `: ${readbackFetchErr?.message || String(readbackFetchErr)}` : ''}.`
+                  : `Read-back verification failed: unable to re-fetch inbound ${inboundId} after disabling client ${clientUuid}${readbackFetchErr ? `: ${readbackFetchErr?.message || String(readbackFetchErr)}` : ''}.`
+              );
+              reconErr.statusCode = 409;
+              reconErr.code = 'RECONCILIATION_REQUIRED';
+              reconErr.xuiUncertain = true;
+              reconErr.markLockUncertain = true;
+              throw reconErr;
             }
             let verifiedSettings: any = {};
             try {
@@ -3685,11 +4454,30 @@ export const revokeProvisionalOrderClient = async (
               (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
             );
 
-            if (!verifiedClient || verifiedClient.enable !== false) {
-              throw new Error(
-                `Read-back verification failed for provisional client ${clientUuid} on inbound ${inboundId}: expected enable=false, got ${String(verifiedClient?.enable)}.`
+            if (!verifiedClient) {
+              const missingErr: any = new Error(
+                `Read-back verification failed for provisional client ${clientUuid} on inbound ${inboundId}: client missing after update.`
               );
+              missingErr.statusCode = 409;
+              missingErr.code = 'RECONCILIATION_REQUIRED';
+              missingErr.xuiUncertain = true;
+              missingErr.markLockUncertain = true;
+              throw missingErr;
             }
+
+            if (verifiedClient.enable !== false) {
+              const panelMsg =
+                explicitPanelErr?.message ||
+                (updateRes && updateRes.success === false ? (updateRes.msg || updateRes.message) : null) ||
+                `Read-back verification failed for provisional client ${clientUuid} on inbound ${inboundId}: expected enable=false, got ${String(verifiedClient?.enable)}.`;
+              const readbackErr: any = new Error(panelMsg);
+              // Live panel read-back proved client state remained unchanged (still enabled)
+              readbackErr.xuiUncertain = !preWriteClientEnabled;
+              throw readbackErr;
+            }
+
+            // Live panel verified enable === false! (Even if panel returned generic { success: false }, disable persisted.)
+            xuiWriteConfirmed = true;
             invalidateInboundCache(inboundId);
           } else if (dbGrant.status !== 'provisioning') {
             // Client missing on expected inbound; double-check across all inbounds so we don't miss a moved client
@@ -3711,6 +4499,10 @@ export const revokeProvisionalOrderClient = async (
         }
       );
     }
+
+    // Re-verify durable order lock ownership immediately before DB finalization so a stale worker
+    // never overwrites vpn_accounts/vpn_configs/vpn_entitlement_grants/orders owned by another worker.
+    await assertOrderLockStillHeld(xuiWriteAttempted ? 'before_db_finalization' : 'before_external_write');
 
     const nowIso = new Date().toISOString();
 
@@ -3769,40 +4561,114 @@ export const revokeProvisionalOrderClient = async (
       inboundId,
     };
   } catch (err: any) {
-    // Do NOT overwrite 409 conflict (e.g., already paid order) with revoke_failed
-    if (err?.statusCode === 409) {
-      await releaseOwnedLock('failed', err?.message || String(err));
+    // Never overwrite 409 lock/state conflicts or pre-mutation deadline stops with revoke_failed
+    if (err?.statusCode === 409 || err?.beforeExternalWrite === true) {
+      const lockOutcome: 'failed' | 'uncertain' =
+        err?.xuiUncertain === true || err?.markLockUncertain === true ? 'uncertain' : 'failed';
+      if (
+        (err?.xuiUncertain === true || err?.markLockUncertain === true) &&
+        err?.code !== 'ORDER_LOCK_LOST' &&
+        err?.code !== 'ORDER_LOCK_MISSING' &&
+        orderLockTableAvailable &&
+        acquiredLockOwnerId
+      ) {
+        const stillOwnsOrderLock = await renewDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: durableOperationKey,
+          lockOwnerId: acquiredLockOwnerId,
+          leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+        });
+        if (stillOwnsOrderLock) {
+          const nowIso = new Date().toISOString();
+          const errText = err?.message || String(err);
+          if (dbGrant?.id) {
+            try {
+              await dbClient
+                .from('vpn_entitlement_grants')
+                .update({
+                  status: 'uncertain',
+                  last_error: errText,
+                  updated_at: nowIso,
+                })
+                .eq('id', dbGrant.id);
+            } catch (_e) {}
+          }
+          try {
+            await dbClient
+              .from('orders')
+              .update({
+                provisioning_status: 'uncertain',
+                updated_at: nowIso,
+              })
+              .eq('id', order.id);
+          } catch (_e) {}
+        }
+      }
+      await releaseOwnedLock(lockOutcome, err?.message || String(err));
       throw err;
     }
 
-    // Retain recoverable 'revoke_failed' state in vpn_entitlement_grants & orders.provisioning_status (NEVER mutate payment_method)
     const nowIso = new Date().toISOString();
     const errText = err?.message || String(err);
 
-    if (dbGrant?.id) {
+    // If an external 3X-UI revocation write was already dispatched and did not produce a verified
+    // unchanged read-back or confirmed disable, mark RECONCILIATION_REQUIRED / uncertain rather than definitive failure.
+    const isUncertainAfterWrite = Boolean(
+      xuiWriteAttempted &&
+      !xuiWriteConfirmed &&
+      err?.beforeExternalWrite !== true &&
+      err?.xuiUncertain !== false
+    );
+
+    const canSafelyUpdateOrderRows =
+      orderLockTableAvailable && acquiredLockOwnerId
+        ? await renewDurableProvisioningOperationLock({
+            dbClient,
+            operationKey: durableOperationKey,
+            lockOwnerId: acquiredLockOwnerId,
+            leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+          })
+        : false;
+
+    const targetStatus = isUncertainAfterWrite ? 'uncertain' : 'revoke_failed';
+
+    if (canSafelyUpdateOrderRows) {
+      if (dbGrant?.id) {
+        try {
+          await dbClient
+            .from('vpn_entitlement_grants')
+            .update({
+              status: targetStatus,
+              last_error: errText,
+              updated_at: nowIso,
+            })
+            .eq('id', dbGrant.id);
+        } catch (_e) {}
+      }
+
       try {
         await dbClient
-          .from('vpn_entitlement_grants')
+          .from('orders')
           .update({
-            status: 'revoke_failed',
-            last_error: errText,
+            provisioning_status: targetStatus,
             updated_at: nowIso,
           })
-          .eq('id', dbGrant.id);
+          .eq('id', order.id);
       } catch (_e) {}
     }
 
-    try {
-      await dbClient
-        .from('orders')
-        .update({
-          provisioning_status: 'revoke_failed',
-          updated_at: nowIso,
-        })
-        .eq('id', order.id);
-    } catch (_e) {}
+    await releaseOwnedLock(isUncertainAfterWrite ? 'uncertain' : 'failed', errText);
 
-    await releaseOwnedLock('failed', errText);
+    if (isUncertainAfterWrite) {
+      const reconErr: any = new Error(
+        `Provisional VPN client revocation outcome is uncertain after external 3X-UI dispatch (${errText}). Marked for reconciliation.`
+      );
+      reconErr.statusCode = 409;
+      reconErr.code = 'RECONCILIATION_REQUIRED';
+      reconErr.xuiUncertain = true;
+      reconErr.markLockUncertain = true;
+      throw reconErr;
+    }
 
     throw new Error(`Failed to disable provisional VPN client on 3X-UI (order retained in recoverable 'revoke_failed' state): ${errText}`);
   }
@@ -4190,6 +5056,583 @@ export const getCachedInbounds = async (): Promise<XuiInbound[]> => {
 let isSyncInProgress = false;
 let lastSyncAt = 0;
 
+let isPanelDeletionSyncInProgress = false;
+let lastPanelDeletionSyncAt = 0;
+const PANEL_DELETION_SYNC_LEASE_KEY = 'panel_deletion_sync_lease';
+const PANEL_DELETION_SYNC_INSTANCE_ID = `inst-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+
+export const resetPanelDeletionSyncSchedulerStateForTests = (): void => {
+  isPanelDeletionSyncInProgress = false;
+  lastPanelDeletionSyncAt = 0;
+};
+
+export interface CrossInstanceLeaseAcquireResult {
+  acquired: boolean;
+  ownerId: string;
+  leaseVersion?: string | null;
+  leaseExpiresAtMs?: number | null;
+  updatedAt?: string | null;
+  reason?: string;
+}
+
+export interface CrossInstanceLeaseRenewResult {
+  renewed: boolean;
+  ownerId: string;
+  leaseVersion?: string | null;
+  leaseExpiresAtMs?: number | null;
+  updatedAt?: string | null;
+  reason?: string;
+}
+
+export interface CrossInstanceLeaseVerifyResult {
+  valid: boolean;
+  ownerId: string;
+  leaseVersion?: string | null;
+  leaseExpiresAtMs?: number | null;
+  remainingMs?: number;
+  reason?: string;
+}
+
+/**
+ * Helper to apply PostgREST JSONB CAS filters on `public.settings` for `panel_deletion_sync_lease`.
+ * Matches `id = 'panel_deletion_sync_lease'` plus:
+ * - If the current row has `data.leaseVersion`, matches `.eq('data->>leaseVersion', prevLeaseVersion)`
+ *   (and `.eq('data->>ownerId', prevOwnerId)` when present).
+ * - If the current row is a legacy row without `data.leaseVersion`, matches `.is('data->>leaseVersion', null)`
+ *   plus `updated_at` (or `.is('updated_at', null)`).
+ * Notice: Because PostgreSQL's `trigger_settings_updated_at` sets `NEW.updated_at = NOW()` (which
+ * evaluates to transaction timestamp and can repeat within the same millisecond or override explicit
+ * `updated_at` values), relying on `data->>leaseVersion` (a fresh cryptographic UUID on every transition)
+ * guarantees atomic single-winner CAS even across same-millisecond updates.
+ * Note on fencing: Because the lease row lives in `public.settings` while deletion markers execute via
+ * a separate `mark_vpn_client_panel_deleted` RPC call, verifying lease ownership immediately before the
+ * RPC narrows any cross-request race window to a single network RTT (combined with per-client and
+ * per-inbound durable locks in `provisioning_operations`), rather than absolute single-transaction fencing.
+ */
+const applySettingsLeaseCasFilters = (
+  query: any,
+  existingRow: { updated_at?: string | null; data?: Record<string, any> | null }
+): any => {
+  let q = query.eq('id', PANEL_DELETION_SYNC_LEASE_KEY);
+  const existingData = existingRow?.data && typeof existingRow.data === 'object' ? existingRow.data : {};
+  const prevLeaseVersion =
+    typeof existingData.leaseVersion === 'string' && existingData.leaseVersion.trim()
+      ? existingData.leaseVersion.trim()
+      : null;
+  const prevOwnerId =
+    typeof existingData.ownerId === 'string' && existingData.ownerId.trim()
+      ? existingData.ownerId.trim()
+      : null;
+
+  if (prevLeaseVersion) {
+    q = q.eq('data->>leaseVersion', prevLeaseVersion);
+    if (prevOwnerId) {
+      q = q.eq('data->>ownerId', prevOwnerId);
+    }
+  } else {
+    q = q.is('data->>leaseVersion', null);
+    if (prevOwnerId) {
+      q = q.eq('data->>ownerId', prevOwnerId);
+    }
+    if (existingRow?.updated_at !== null && existingRow?.updated_at !== undefined) {
+      q = q.eq('updated_at', existingRow.updated_at);
+    } else {
+      q = q.is('updated_at', null);
+    }
+  }
+  return q;
+};
+
+/**
+ * Acquires an atomic compare-and-swap (CAS) distributed scheduler lease using the existing
+ * service-role-protected `public.settings` table (`id = 'panel_deletion_sync_lease'`).
+ * Uses a cryptographically generated `leaseVersion` on every transition and fails CLOSED
+ * on DB errors, active unexpired leases, cross-instance interval cooldowns, or CAS conflicts.
+ */
+export const acquireCrossInstanceDeletionSyncLease = async (params: {
+  dbClient: any;
+  intervalMs: number;
+  nowMs?: number;
+  force?: boolean;
+  ownerId?: string;
+  leaseTtlMs?: number;
+}): Promise<CrossInstanceLeaseAcquireResult> => {
+  const dbClient = params.dbClient;
+  const nowMs = params.nowMs ?? Date.now();
+  const ownerId = params.ownerId || `${PANEL_DELETION_SYNC_INSTANCE_ID}-${crypto.randomUUID().slice(0, 8)}`;
+  const intervalMs = Math.max(1000, Math.floor(params.intervalMs || getPanelDeletionSyncIntervalMs()));
+  const leaseTtlMs = Math.max(params.leaseTtlMs ?? Math.max(intervalMs + 60000, 180000), 30000);
+  const nextLeaseVersion = crypto.randomUUID();
+
+  if (!dbClient || typeof dbClient.from !== 'function') {
+    return { acquired: false, ownerId, reason: 'lease_db_client_unavailable' };
+  }
+
+  const nowIso = new Date(nowMs).toISOString();
+  const leaseExpiresAtMs = nowMs + leaseTtlMs;
+  const leaseExpiresAtIso = new Date(leaseExpiresAtMs).toISOString();
+
+  try {
+    const { data: existing, error: readErr } = await dbClient
+      .from('settings')
+      .select('id, data, updated_at')
+      .eq('id', PANEL_DELETION_SYNC_LEASE_KEY)
+      .maybeSingle();
+
+    if (readErr) {
+      return {
+        acquired: false,
+        ownerId,
+        reason: `lease_read_error:${readErr.message || readErr.code || 'unknown'}`,
+      };
+    }
+
+    if (!existing) {
+      const initialData = {
+        ownerId,
+        leaseVersion: nextLeaseVersion,
+        status: 'running',
+        startedAt: nowIso,
+        renewedAt: nowIso,
+        leaseExpiresAt: leaseExpiresAtIso,
+        lastCompletedAt: null,
+        intervalMs,
+      };
+      const { data: inserted, error: insertErr } = await dbClient
+        .from('settings')
+        .insert({ id: PANEL_DELETION_SYNC_LEASE_KEY, data: initialData, updated_at: nowIso })
+        .select('id, data, updated_at')
+        .maybeSingle();
+
+      if (insertErr) {
+        return {
+          acquired: false,
+          ownerId,
+          reason: `lease_insert_conflict:${insertErr.code || insertErr.message || 'conflict'}`,
+        };
+      }
+      if (
+        !inserted ||
+        inserted.data?.ownerId !== ownerId ||
+        inserted.data?.leaseVersion !== nextLeaseVersion
+      ) {
+        return { acquired: false, ownerId, reason: 'lease_insert_owner_mismatch' };
+      }
+      return {
+        acquired: true,
+        ownerId,
+        leaseVersion: nextLeaseVersion,
+        leaseExpiresAtMs,
+        updatedAt: inserted?.updated_at ?? nowIso,
+      };
+    }
+
+    const existingData = existing.data && typeof existing.data === 'object' ? existing.data : {};
+    const leaseExpMs = existingData.leaseExpiresAt ? new Date(existingData.leaseExpiresAt).getTime() : 0;
+    if (
+      String(existingData.status || '').toLowerCase() === 'running' &&
+      Number.isFinite(leaseExpMs) &&
+      leaseExpMs > nowMs
+    ) {
+      return {
+        acquired: false,
+        ownerId,
+        reason: `lease_held_by_active_instance:${existingData.ownerId || 'unknown'}`,
+      };
+    }
+
+    if (!params.force) {
+      const lastCompletedMs = existingData.lastCompletedAt ? new Date(existingData.lastCompletedAt).getTime() : 0;
+      const lastStartedMs = existingData.startedAt ? new Date(existingData.startedAt).getTime() : 0;
+      const lastActivityMs = Math.max(
+        Number.isFinite(lastCompletedMs) ? lastCompletedMs : 0,
+        Number.isFinite(lastStartedMs) ? lastStartedMs : 0
+      );
+      if (lastActivityMs > 0 && nowMs - lastActivityMs < intervalMs) {
+        return {
+          acquired: false,
+          ownerId,
+          reason: 'cross_instance_interval_cooldown',
+        };
+      }
+    }
+
+    const prevUpdatedMs = existing.updated_at ? new Date(existing.updated_at).getTime() : 0;
+    const monotonicUpdatedIso = new Date(
+      Math.max(nowMs, (Number.isFinite(prevUpdatedMs) ? prevUpdatedMs : 0) + 1)
+    ).toISOString();
+
+    const nextData = {
+      ...existingData,
+      ownerId,
+      leaseVersion: nextLeaseVersion,
+      status: 'running',
+      startedAt: nowIso,
+      renewedAt: nowIso,
+      leaseExpiresAt: leaseExpiresAtIso,
+      intervalMs,
+    };
+
+    const casQuery = applySettingsLeaseCasFilters(
+      dbClient.from('settings').update({ data: nextData, updated_at: monotonicUpdatedIso }),
+      existing
+    );
+
+    const { data: updatedRows, error: casErr } = await casQuery.select('id, data, updated_at');
+    if (casErr) {
+      return {
+        acquired: false,
+        ownerId,
+        reason: `lease_cas_error:${casErr.message || casErr.code || 'unknown'}`,
+      };
+    }
+
+    const rows = Array.isArray(updatedRows) ? updatedRows : updatedRows ? [updatedRows] : [];
+    if (
+      rows.length !== 1 ||
+      rows[0]?.data?.ownerId !== ownerId ||
+      rows[0]?.data?.leaseVersion !== nextLeaseVersion
+    ) {
+      return {
+        acquired: false,
+        ownerId,
+        reason: 'lease_cas_lost',
+      };
+    }
+
+    return {
+      acquired: true,
+      ownerId,
+      leaseVersion: nextLeaseVersion,
+      leaseExpiresAtMs,
+      updatedAt: rows[0]?.updated_at ?? monotonicUpdatedIso,
+    };
+  } catch (err: any) {
+    return {
+      acquired: false,
+      ownerId,
+      reason: `lease_exception:${err?.message || 'unknown'}`,
+    };
+  }
+};
+
+/**
+ * Safely renews an active, unexpired cross-instance deletion synchronization lease before processing
+ * each deletion candidate. NEVER renews an expired lease or a lease owned by another worker/version.
+ */
+export const renewCrossInstanceDeletionSyncLease = async (params: {
+  dbClient: any;
+  ownerId: string;
+  expectedLeaseVersion?: string | null;
+  leaseTtlMs?: number;
+  nowMs?: number;
+}): Promise<CrossInstanceLeaseRenewResult> => {
+  const { dbClient, ownerId, expectedLeaseVersion } = params;
+  const nowMs = params.nowMs ?? Date.now();
+  const leaseTtlMs = Math.max(params.leaseTtlMs ?? 180000, 30000);
+
+  if (!dbClient || typeof dbClient.from !== 'function' || !ownerId) {
+    return { renewed: false, ownerId: ownerId || '', reason: 'lease_db_client_or_owner_unavailable' };
+  }
+
+  try {
+    const { data: current, error: readErr } = await dbClient
+      .from('settings')
+      .select('id, data, updated_at')
+      .eq('id', PANEL_DELETION_SYNC_LEASE_KEY)
+      .maybeSingle();
+
+    if (readErr || !current) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: readErr ? `lease_renew_read_error:${readErr.message || 'unknown'}` : 'lease_row_missing',
+      };
+    }
+
+    const curData = current.data && typeof current.data === 'object' ? current.data : {};
+    if (curData.ownerId !== ownerId) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: `lease_owner_mismatch:${curData.ownerId || 'none'}`,
+      };
+    }
+
+    if (expectedLeaseVersion && curData.leaseVersion !== expectedLeaseVersion) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: 'lease_version_mismatch',
+      };
+    }
+
+    if (String(curData.status || '').toLowerCase() !== 'running') {
+      return {
+        renewed: false,
+        ownerId,
+        reason: `lease_not_running:${curData.status || 'unknown'}`,
+      };
+    }
+
+    const leaseExpMs = curData.leaseExpiresAt ? new Date(curData.leaseExpiresAt).getTime() : 0;
+    if (!Number.isFinite(leaseExpMs) || leaseExpMs <= nowMs) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: 'lease_already_expired',
+      };
+    }
+
+    const nextLeaseVersion = crypto.randomUUID();
+    const nowIso = new Date(nowMs).toISOString();
+    const nextExpiresAtMs = nowMs + leaseTtlMs;
+    const nextExpiresAtIso = new Date(nextExpiresAtMs).toISOString();
+    const prevUpdatedMs = current.updated_at ? new Date(current.updated_at).getTime() : 0;
+    const monotonicUpdatedIso = new Date(
+      Math.max(nowMs, (Number.isFinite(prevUpdatedMs) ? prevUpdatedMs : 0) + 1)
+    ).toISOString();
+
+    const nextData = {
+      ...curData,
+      ownerId,
+      leaseVersion: nextLeaseVersion,
+      status: 'running',
+      renewedAt: nowIso,
+      leaseExpiresAt: nextExpiresAtIso,
+    };
+
+    const casQuery = applySettingsLeaseCasFilters(
+      dbClient.from('settings').update({ data: nextData, updated_at: monotonicUpdatedIso }),
+      current
+    );
+
+    const { data: updatedRows, error: casErr } = await casQuery.select('id, data, updated_at');
+    if (casErr) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: `lease_renew_cas_error:${casErr.message || casErr.code || 'unknown'}`,
+      };
+    }
+
+    const rows = Array.isArray(updatedRows) ? updatedRows : updatedRows ? [updatedRows] : [];
+    if (
+      rows.length !== 1 ||
+      rows[0]?.data?.ownerId !== ownerId ||
+      rows[0]?.data?.leaseVersion !== nextLeaseVersion
+    ) {
+      return {
+        renewed: false,
+        ownerId,
+        reason: 'lease_renew_cas_lost',
+      };
+    }
+
+    return {
+      renewed: true,
+      ownerId,
+      leaseVersion: nextLeaseVersion,
+      leaseExpiresAtMs: nextExpiresAtMs,
+      updatedAt: rows[0]?.updated_at ?? monotonicUpdatedIso,
+    };
+  } catch (err: any) {
+    return {
+      renewed: false,
+      ownerId,
+      reason: `lease_renew_exception:${err?.message || 'unknown'}`,
+    };
+  }
+};
+
+/**
+ * Verifies that the current worker still holds an active, unexpired cross-instance sweep lease
+ * with sufficient remaining lease budget before executing a deletion mutation.
+ */
+export const verifyCrossInstanceDeletionSyncLeaseOwnership = async (params: {
+  dbClient: any;
+  ownerId: string;
+  expectedLeaseVersion?: string | null;
+  minRemainingBudgetMs?: number;
+  nowMs?: number;
+}): Promise<CrossInstanceLeaseVerifyResult> => {
+  const { dbClient, ownerId, expectedLeaseVersion } = params;
+  const nowMs = params.nowMs ?? Date.now();
+  const minRemainingBudgetMs = Math.max(0, params.minRemainingBudgetMs ?? 0);
+
+  if (!dbClient || typeof dbClient.from !== 'function' || !ownerId) {
+    return { valid: false, ownerId: ownerId || '', reason: 'lease_db_client_or_owner_unavailable' };
+  }
+
+  try {
+    const { data: current, error: readErr } = await dbClient
+      .from('settings')
+      .select('id, data, updated_at')
+      .eq('id', PANEL_DELETION_SYNC_LEASE_KEY)
+      .maybeSingle();
+
+    if (readErr || !current) {
+      return {
+        valid: false,
+        ownerId,
+        reason: readErr ? `lease_verify_read_error:${readErr.message || 'unknown'}` : 'lease_row_missing',
+      };
+    }
+
+    const curData = current.data && typeof current.data === 'object' ? current.data : {};
+    if (curData.ownerId !== ownerId) {
+      return {
+        valid: false,
+        ownerId,
+        reason: `lease_owner_mismatch:${curData.ownerId || 'none'}`,
+      };
+    }
+
+    if (expectedLeaseVersion && curData.leaseVersion !== expectedLeaseVersion) {
+      return {
+        valid: false,
+        ownerId,
+        reason: 'lease_version_mismatch',
+      };
+    }
+
+    if (String(curData.status || '').toLowerCase() !== 'running') {
+      return {
+        valid: false,
+        ownerId,
+        reason: `lease_not_running:${curData.status || 'unknown'}`,
+      };
+    }
+
+    const leaseExpMs = curData.leaseExpiresAt ? new Date(curData.leaseExpiresAt).getTime() : 0;
+    if (!Number.isFinite(leaseExpMs) || leaseExpMs <= nowMs) {
+      return {
+        valid: false,
+        ownerId,
+        reason: 'lease_expired',
+      };
+    }
+
+    const remainingMs = leaseExpMs - nowMs;
+    if (remainingMs < minRemainingBudgetMs) {
+      return {
+        valid: false,
+        ownerId,
+        leaseVersion: curData.leaseVersion ?? null,
+        leaseExpiresAtMs: leaseExpMs,
+        remainingMs,
+        reason: `lease_budget_exhausted:${remainingMs}ms`,
+      };
+    }
+
+    return {
+      valid: true,
+      ownerId,
+      leaseVersion: curData.leaseVersion ?? null,
+      leaseExpiresAtMs: leaseExpMs,
+      remainingMs,
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      ownerId,
+      reason: `lease_verify_exception:${err?.message || 'unknown'}`,
+    };
+  }
+};
+
+export const releaseCrossInstanceDeletionSyncLease = async (params: {
+  dbClient: any;
+  ownerId: string;
+  expectedLeaseVersion?: string | null;
+  completed: boolean;
+  nowMs?: number;
+  summary?: Record<string, any>;
+}): Promise<boolean> => {
+  const { dbClient, ownerId, expectedLeaseVersion, completed, summary } = params;
+  const nowMs = params.nowMs ?? Date.now();
+  if (!dbClient || typeof dbClient.from !== 'function' || !ownerId) return false;
+
+  try {
+    const { data: current, error: readErr } = await dbClient
+      .from('settings')
+      .select('id, data, updated_at')
+      .eq('id', PANEL_DELETION_SYNC_LEASE_KEY)
+      .maybeSingle();
+
+    if (readErr || !current || current.data?.ownerId !== ownerId) {
+      return false;
+    }
+
+    if (expectedLeaseVersion && current.data?.leaseVersion !== expectedLeaseVersion) {
+      return false;
+    }
+
+    const nextLeaseVersion = crypto.randomUUID();
+    const prevUpdatedMs = current.updated_at ? new Date(current.updated_at).getTime() : 0;
+    const monotonicUpdatedIso = new Date(
+      Math.max(nowMs, (Number.isFinite(prevUpdatedMs) ? prevUpdatedMs : 0) + 1)
+    ).toISOString();
+
+    const nextData = {
+      ...(current.data && typeof current.data === 'object' ? current.data : {}),
+      ownerId,
+      leaseVersion: nextLeaseVersion,
+      status: 'idle',
+      leaseExpiresAt: null,
+      lastCompletedAt: completed ? new Date(nowMs).toISOString() : (current.data?.lastCompletedAt ?? null),
+      lastReleasedAt: new Date(nowMs).toISOString(),
+      ...(summary ? { lastSummary: summary } : {}),
+    };
+
+    const releaseQuery = applySettingsLeaseCasFilters(
+      dbClient.from('settings').update({ data: nextData, updated_at: monotonicUpdatedIso }),
+      current
+    );
+
+    const { data: updatedRows, error: updateErr } = await releaseQuery.select('id, data, updated_at');
+    if (updateErr) return false;
+    const rows = Array.isArray(updatedRows) ? updatedRows : updatedRows ? [updatedRows] : [];
+    return rows.length === 1 && rows[0]?.data?.leaseVersion === nextLeaseVersion;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Triggers the dedicated 2-minute panel deletion synchronization cycle when
+ * PANEL_DELETION_SYNC_ENABLED=true. Enforces both in-process mutex and cross-instance
+ * CAS lease coordination so overlapping cycles cannot run across processes or instances.
+ */
+export const triggerPanelDeletionSyncIfNeeded = (
+  reason: string = 'Scheduled',
+  force: boolean = false
+): void => {
+  if (!isPanelDeletionSyncFlagEnabled()) {
+    return;
+  }
+
+  const now = Date.now();
+  const intervalMs = getPanelDeletionSyncIntervalMs();
+
+  if (!force && lastPanelDeletionSyncAt > 0 && now - lastPanelDeletionSyncAt < intervalMs) {
+    return;
+  }
+
+  if (isPanelDeletionSyncInProgress) {
+    console.log(`[3X-UI Deletion Scheduler] Skipped (${reason}): cycle already in progress.`);
+    return;
+  }
+
+  syncDeleted3XUiClients({
+    enforceCrossInstanceLease: true,
+    forceLease: force,
+    intervalMs,
+  }).catch((err: any) => {
+    console.error(`[3X-UI Deletion Scheduler] Failed for reason "${reason}":`, err?.message || err);
+  });
+};
+
 export const triggerBackgroundSyncIfNeeded = (reason: string = 'Scheduled', force: boolean = false): void => {
   const now = Date.now();
   const TEN_MINUTES_MS = 10 * 60 * 1000; // 10 minutes cooldown
@@ -4228,7 +5671,7 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
     const trialCleanupResult = await cleanupExpiredTrials();
 
     let deletedCount = 0;
-    const syncResult = await syncDeleted3XUiClients();
+    const syncResult = await syncDeleted3XUiClients({ enforceCrossInstanceLease: true });
     deletedCount = syncResult.deletedCount;
 
     // 3. Run scheduled VPN expiry reminder & expiration email check (non-blocking)
@@ -4323,6 +5766,12 @@ export interface PanelIdentityVerificationResult {
   reason: string;
 }
 
+export interface MassAbsenceSafetyContext {
+  trackedNonDeletedUuids: Set<string> | string[];
+  maxDeletesPerCycle?: number;
+  maxMissingRatio?: number;
+}
+
 export interface VerifyAndMarkDeletedParams {
   clientUuid: string;
   inboundId: number | null;
@@ -4339,8 +5788,15 @@ export interface VerifyAndMarkDeletedParams {
   configuredServers?: Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>;
   fetchUncachedInbound?: (inboundId: number, options?: { timeoutMs?: number }) => Promise<UncachedInboundReadResult>;
   fetchUncachedInboundsList?: (options?: { timeoutMs?: number }) => Promise<UncachedInboundsListReadResult>;
+  preVerifiedOutsideSnapshots?: {
+    snapshot1: UncachedInboundsListReadResult;
+    snapshot2: UncachedInboundsListReadResult;
+  };
+  massAbsenceSafetyContext?: MassAbsenceSafetyContext;
+  assertDistributedLeaseStillHeld?: () => Promise<void>;
   reReadDelayMs?: number;
   lockedReadTimeoutMs?: number;
+  lockLeaseBudgetRatio?: number;
   releaseRetryBaseDelayMs?: number;
   nowMs?: number;
 }
@@ -4352,6 +5808,9 @@ export interface VerifyAndMarkDeletedResult {
   reconciliationRequired?: boolean;
   reconciledAfterAmbiguousRpc?: boolean;
   mutationUncertain?: boolean;
+  circuitBreakerTriggered?: boolean;
+  circuitBreakerReason?: string;
+  distributedLeaseLost?: boolean;
   unresolvedGrantCount?: number;
   auditLogged?: boolean;
   manualReviewFlagged?: boolean;
@@ -4367,13 +5826,30 @@ export interface SyncDeletedClientsOptions {
   fetchUncachedInboundsList?: (options?: { timeoutMs?: number }) => Promise<UncachedInboundsListReadResult>;
   reReadDelayMs?: number;
   lockedReadTimeoutMs?: number;
+  lockLeaseBudgetRatio?: number;
   releaseRetryBaseDelayMs?: number;
+  enforceCrossInstanceLease?: boolean;
+  forceLease?: boolean;
+  leaseOwnerId?: string;
+  leaseTtlMs?: number;
+  intervalMs?: number;
+  maxDeletesPerCycle?: number;
+  maxMissingRatio?: number;
+  pageSize?: number;
   nowMs?: number;
 }
 
 export interface SyncDeletedClientsResult {
   synced: boolean;
   skippedDisabled?: boolean;
+  skippedBusy?: boolean;
+  skippedLease?: boolean;
+  leaseSkipReason?: string;
+  leaseLostMidSweep?: boolean;
+  leaseLostReason?: string;
+  circuitBreakerTriggered?: boolean;
+  circuitBreakerReason?: string;
+  panelRequestCount?: number;
   deletedCount: number;
   restoredCount: number;
   skippedCount: number;
@@ -4652,16 +6128,219 @@ export const verifyRecordPanelIdentity = (
   };
 };
 
+/**
+ * Deterministic primary-key cursor pagination helper (`id ASC` + `.gt('id', lastCursorId)`).
+ * Ensures queries over `vpn_accounts`, `vpn_configs`, `vpn_entitlement_grants`, and `xui_servers`
+ * are never silently truncated by PostgREST / Supabase default `max-rows` limits (e.g., 1,000 rows),
+ * and never falsely assumes a short page means completion when a server enforces a smaller cap
+ * than `requestedPageSize`. Loops until an empty page (`0` rows) is returned or a non-advancing
+ * cursor is detected, failing CLOSED if any page fails or cannot be verified complete.
+ */
+export const fetchAllTableRowsByPrimaryKeyCursor = async <T = any>(params: {
+  dbClient: any;
+  table: string;
+  selectColumns?: string;
+  primaryKeyColumn?: string;
+  pageSize?: number;
+  maxPages?: number;
+  applyFilters?: (query: any) => any;
+}): Promise<{ ok: true; rows: T[]; pagesFetched: number; reason?: string } | { ok: false; reason: string; rows: T[] }> => {
+  const { dbClient, table } = params;
+  const selectColumns = params.selectColumns || '*';
+  const pkCol = params.primaryKeyColumn || 'id';
+  const pageSize = Math.max(1, Math.min(Math.floor(params.pageSize || 1000), 5000));
+  const maxPages = Math.max(1, Math.floor(params.maxPages || 1000));
+
+  if (!dbClient || typeof dbClient.from !== 'function') {
+    return { ok: false, reason: `${table}_db_client_unavailable`, rows: [] };
+  }
+
+  const allRows: T[] = [];
+  const seenIds = new Set<string>();
+  let lastCursorId: string | number | null = null;
+  let pagesFetched = 0;
+
+  try {
+    while (pagesFetched < maxPages) {
+      let query: any = dbClient.from(table).select(selectColumns);
+      if (params.applyFilters) {
+        query = params.applyFilters(query);
+      }
+
+      if (typeof query.order === 'function') {
+        query = query.order(pkCol, { ascending: true });
+      }
+
+      const supportsGtCursor = typeof query.gt === 'function';
+      if (lastCursorId !== null && supportsGtCursor) {
+        query = query.gt(pkCol, lastCursorId);
+      }
+
+      if (typeof query.limit === 'function') {
+        query = query.limit(pageSize);
+      } else if (typeof query.range === 'function') {
+        const offset = pagesFetched * pageSize;
+        query = query.range(offset, offset + pageSize - 1);
+      }
+
+      const res: any = await query;
+      if (res?.error) {
+        return {
+          ok: false,
+          reason: `${table}_page_${pagesFetched + 1}_error:${res.error.message || res.error.code || 'db_error'}`,
+          rows: [],
+        };
+      }
+
+      if (!Array.isArray(res?.data)) {
+        return {
+          ok: false,
+          reason: `${table}_page_${pagesFetched + 1}_non_array_response`,
+          rows: [],
+        };
+      }
+
+      const pageRows: any[] = res.data;
+      pagesFetched += 1;
+
+      if (pageRows.length === 0) {
+        return { ok: true, rows: allRows, pagesFetched };
+      }
+
+      // If the mock/query builder doesn't support .gt() cursor filtering, fall back to verifying single-page completion
+      if (!supportsGtCursor) {
+        for (const r of pageRows) {
+          allRows.push(r as T);
+        }
+        return { ok: true, rows: allRows, pagesFetched };
+      }
+
+      let advancedInPage = 0;
+      let nextCursorCandidate: string | number | null = lastCursorId;
+
+      for (const r of pageRows) {
+        const rawPk = r?.[pkCol];
+        if (rawPk === null || rawPk === undefined || String(rawPk).trim() === '') {
+          return {
+            ok: false,
+            reason: `${table}_missing_primary_key_${pkCol}`,
+            rows: [],
+          };
+        }
+        const pkKey = String(rawPk);
+        if (seenIds.has(pkKey)) {
+          continue;
+        }
+        seenIds.add(pkKey);
+        allRows.push(r as T);
+        nextCursorCandidate = rawPk;
+        advancedInPage += 1;
+      }
+
+      // If the mock DB ignored .gt() and returned the exact same rows again, we have already collected the full set
+      if (advancedInPage === 0) {
+        return { ok: true, rows: allRows, pagesFetched };
+      }
+
+      if (nextCursorCandidate === lastCursorId) {
+        return {
+          ok: false,
+          reason: `${table}_cursor_did_not_advance`,
+          rows: [],
+        };
+      }
+
+      lastCursorId = nextCursorCandidate;
+    }
+
+    return {
+      ok: false,
+      reason: `${table}_pagination_exceeded_max_pages_${maxPages}`,
+      rows: [],
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      reason: `${table}_pagination_exception:${err?.message || 'unknown'}`,
+      rows: [],
+    };
+  }
+};
+
+/**
+ * Evaluates the mass-deletion / mass-absence circuit breaker against a live panel snapshot
+ * and the complete tracked non-deleted UUID population for the active panel.
+ */
+export const evaluateSnapshotMassAbsenceCircuitBreaker = (params: {
+  snapshot: UncachedInboundsListReadResult;
+  trackedNonDeletedUuids: Set<string> | string[];
+  maxDeletesPerCycle: number;
+  maxMissingRatio: number;
+}): {
+  triggered: boolean;
+  reason: string | null;
+  missingCount: number;
+  totalTrackedNonDeleted: number;
+  liveClientsCount: number;
+} => {
+  const trackedSet =
+    params.trackedNonDeletedUuids instanceof Set
+      ? params.trackedNonDeletedUuids
+      : new Set(
+          (Array.isArray(params.trackedNonDeletedUuids) ? params.trackedNonDeletedUuids : [])
+            .map((u) => String(u || '').trim().toLowerCase())
+            .filter(Boolean)
+        );
+  const totalTrackedNonDeleted = trackedSet.size;
+  const liveMap = params.snapshot?.liveClientByUuid;
+  const liveClientsCount = liveMap instanceof Map ? liveMap.size : 0;
+
+  let missingCount = 0;
+  for (const uuid of trackedSet) {
+    if (!liveMap || !liveMap.has(uuid)) {
+      missingCount += 1;
+    }
+  }
+
+  let reason: string | null = null;
+  if (liveClientsCount === 0 && totalTrackedNonDeleted >= 3) {
+    reason = 'unexpected_zero_live_clients';
+  } else if (missingCount > params.maxDeletesPerCycle) {
+    reason = 'max_deletes_per_cycle_exceeded';
+  } else if (
+    totalTrackedNonDeleted >= 8 &&
+    missingCount >= 3 &&
+    missingCount / totalTrackedNonDeleted > params.maxMissingRatio
+  ) {
+    reason = 'max_missing_ratio_exceeded';
+  }
+
+  return {
+    triggered: reason !== null,
+    reason,
+    missingCount,
+    totalTrackedNonDeleted,
+    liveClientsCount,
+  };
+};
+
 const loadConfiguredXuiServers = async (
   dbClient: any
 ): Promise<Array<{ id: string; panel_url?: string | null; is_active?: boolean | null }>> => {
   if (!dbClient || typeof dbClient.from !== 'function') return [];
   try {
-    const { data, error } = await dbClient
-      .from('xui_servers')
-      .select('id, panel_url, is_active');
-    if (error || !Array.isArray(data)) return [];
-    return data;
+    const res = await fetchAllTableRowsByPrimaryKeyCursor<{
+      id: string;
+      panel_url?: string | null;
+      is_active?: boolean | null;
+    }>({
+      dbClient,
+      table: 'xui_servers',
+      selectColumns: 'id, panel_url, is_active',
+      primaryKeyColumn: 'id',
+    });
+    if (!res.ok) return [];
+    return res.rows;
   } catch {
     return [];
   }
@@ -5019,90 +6698,223 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
   }
 
   const inboundId = Number(params.inboundId);
-  const readInbound = params.fetchUncachedInbound || fetchUncachedLiveInboundById;
   const readList = params.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
   const reReadDelayMs = params.reReadDelayMs ?? 150;
-  // Strictly bound Read 2 inside locks well below the 45s inbound lock lease
+  // Strictly bound the final locked verification read well below the 45s inbound lock lease
   const lockedReadTimeoutMs =
     params.lockedReadTimeoutMs !== undefined && Number.isFinite(params.lockedReadTimeoutMs) && params.lockedReadTimeoutMs > 0
       ? Math.min(Math.floor(params.lockedReadTimeoutMs), 15000)
       : 8000;
+  const leaseBudgetRatio =
+    params.lockLeaseBudgetRatio !== undefined &&
+    Number.isFinite(params.lockLeaseBudgetRatio) &&
+    params.lockLeaseBudgetRatio > 0 &&
+    params.lockLeaseBudgetRatio <= 0.6
+      ? params.lockLeaseBudgetRatio
+      : 0.5;
+  const maxAllowedLockedWindowMs = Math.max(
+    100,
+    Math.floor(INBOUND_LOCK_LEASE_SECONDS * 1000 * leaseBudgetRatio)
+  );
 
-  // Verify fresh uncached absence for a single read pass
-  const performSingleAuthoritativeAbsenceRead = async (
+  const maxDeletesPerCycle =
+    params.massAbsenceSafetyContext?.maxDeletesPerCycle ?? getPanelDeletionSyncMaxDeletesPerCycle();
+  const maxMissingRatio =
+    params.massAbsenceSafetyContext?.maxMissingRatio ?? getPanelDeletionSyncMaxMissingRatio();
+
+  // Verify complete panel-wide absence across EVERY inbound via fresh uncached /panel/api/inbounds/list.
+  // NEVER confirm deletion using only single-inbound /get/{id}, because a client moved to another
+  // inbound would be absent from the original inbound while still active on the panel.
+  const performPanelWideAuthoritativeAbsenceRead = async (
     readLabel: 'read1' | 'read2',
     timeoutMs?: number
-  ): Promise<{ absent: boolean; reason: string; inboundMissing?: boolean }> => {
+  ): Promise<{
+    absent: boolean;
+    reason: string;
+    inboundMissing?: boolean;
+    movedToInboundId?: number;
+    circuitBreakerTriggered?: boolean;
+    circuitBreakerReason?: string;
+    snapshot?: UncachedInboundsListReadResult;
+  }> => {
     const readOpts = timeoutMs ? { timeoutMs } : undefined;
-    const directRes = timeoutMs
-      ? await runWithStrictTimeout(readInbound(inboundId, readOpts), timeoutMs, `${readLabel}_direct_inbound_read`)
-      : await readInbound(inboundId);
-
-    if (directRes.status === 'error') {
-      return { absent: false, reason: `${readLabel}_error:${directRes.reason}` };
-    }
-
-    if (directRes.status === 'found') {
-      if (directRes.clientUuidSet.has(normUuid)) {
-        return { absent: false, reason: `${readLabel}_client_present` };
-      }
-      return { absent: true, reason: `${readLabel}_confirmed_absent_from_inbound` };
-    }
-
-    // directRes.status === 'not_found': NEVER assume deletion from an empty get/{id} alone!
-    // Require a fresh, uncached, 100%-cleanly-parsed non-empty /inbounds/list confirming that
-    // the inbound truly does not exist AND the client UUID does not exist on any other inbound.
     const listRes = timeoutMs
       ? await runWithStrictTimeout(readList(readOpts), timeoutMs, `${readLabel}_inbounds_list_read`)
       : await readList();
 
-    if (!listRes.ok || !listRes.allInboundsCleanlyParsed || listRes.inbounds.length === 0) {
+    if (!listRes || !listRes.ok) {
       return {
         absent: false,
-        reason: `${readLabel}_inbound_missing_unverified_list:${listRes.reason || 'incomplete_or_empty_list'}`,
+        reason: `${readLabel}_error:${listRes?.reason || 'panel_list_failed'}`,
       };
     }
 
-    if (listRes.parsedByInboundId.has(inboundId)) {
-      const ibEntry = listRes.parsedByInboundId.get(inboundId)!;
-      if (ibEntry.clientUuidSet.has(normUuid)) {
-        return { absent: false, reason: `${readLabel}_client_present_in_list` };
+    if (!listRes.allInboundsCleanlyParsed || !Array.isArray(listRes.inbounds) || listRes.inbounds.length === 0) {
+      return {
+        absent: false,
+        reason: `${readLabel}_incomplete_or_empty_list:${listRes.reason || (listRes.inbounds?.length === 0 ? 'empty_inbounds_list' : 'malformed_inbound_settings')}`,
+      };
+    }
+
+    const liveHit = listRes.liveClientByUuid.get(normUuid);
+    if (liveHit) {
+      const liveInboundId = Number(liveHit.inbound?.id);
+      if (Number.isInteger(liveInboundId) && liveInboundId > 0 && liveInboundId !== inboundId) {
+        return {
+          absent: false,
+          movedToInboundId: liveInboundId,
+          reason: `${readLabel}_client_moved_to_another_inbound`,
+          snapshot: listRes,
+        };
       }
-      return { absent: true, reason: `${readLabel}_confirmed_absent_from_list_inbound` };
+      return { absent: false, reason: `${readLabel}_client_present`, snapshot: listRes };
     }
 
-    if (listRes.liveClientByUuid.has(normUuid)) {
-      return { absent: false, reason: `${readLabel}_client_moved_to_another_inbound` };
+    // Apply mass-absence safety check on final locked full-panel snapshot (or whenever massAbsenceSafetyContext is provided)
+    if (params.massAbsenceSafetyContext) {
+      const cbCheck = evaluateSnapshotMassAbsenceCircuitBreaker({
+        snapshot: listRes,
+        trackedNonDeletedUuids: params.massAbsenceSafetyContext.trackedNonDeletedUuids,
+        maxDeletesPerCycle,
+        maxMissingRatio,
+      });
+      if (cbCheck.triggered && cbCheck.reason) {
+        return {
+          absent: false,
+          circuitBreakerTriggered: true,
+          circuitBreakerReason: cbCheck.reason,
+          reason: `${readLabel}_circuit_breaker:${cbCheck.reason}`,
+          snapshot: listRes,
+        };
+      }
     }
 
-    return { absent: true, inboundMissing: true, reason: `${readLabel}_inbound_and_client_confirmed_absent` };
+    const inboundMissing = !listRes.parsedByInboundId.has(inboundId);
+    return {
+      absent: true,
+      inboundMissing,
+      reason: inboundMissing
+        ? `${readLabel}_inbound_and_client_confirmed_panel_wide_absent`
+        : `${readLabel}_confirmed_panel_wide_absent`,
+      snapshot: listRes,
+    };
   };
 
-  // STEP 1 (OUTSIDE SHARED LOCKS): Fresh uncached Read 1.
-  // Any panel timeout, network error, missing/mismatched inbound, or present client exits immediately
-  // with ZERO lock acquisitions and ZERO risk of stranding shared inbound/client locks.
-  let read1: { absent: boolean; reason: string; inboundMissing?: boolean };
-  try {
-    read1 = await performSingleAuthoritativeAbsenceRead('read1');
-  } catch (read1Err: any) {
-    return {
-      confirmedDeleted: false,
-      dbWrites: 0,
-      reason: `read1_error:${read1Err?.message || 'panel_read_failed'}`,
-    };
-  }
+  // Validate optional pre-verified outside snapshots passed by syncDeleted3XUiClients
+  // (must be two distinct, complete, cleanly parsed, non-empty panel-wide snapshots both missing normUuid)
+  const preSnaps = params.preVerifiedOutsideSnapshots;
+  const hasValidPreVerifiedSnapshots = Boolean(
+    preSnaps &&
+    preSnaps.snapshot1 &&
+    preSnaps.snapshot2 &&
+    preSnaps.snapshot1 !== preSnaps.snapshot2 &&
+    preSnaps.snapshot1.ok &&
+    preSnaps.snapshot1.allInboundsCleanlyParsed &&
+    Array.isArray(preSnaps.snapshot1.inbounds) &&
+    preSnaps.snapshot1.inbounds.length > 0 &&
+    !preSnaps.snapshot1.liveClientByUuid.has(normUuid) &&
+    preSnaps.snapshot2.ok &&
+    preSnaps.snapshot2.allInboundsCleanlyParsed &&
+    Array.isArray(preSnaps.snapshot2.inbounds) &&
+    preSnaps.snapshot2.inbounds.length > 0 &&
+    !preSnaps.snapshot2.liveClientByUuid.has(normUuid)
+  );
 
-  if (!read1.absent) {
-    return {
-      confirmedDeleted: false,
-      dbWrites: 0,
-      reason: read1.reason,
+  // STEP 1 (OUTSIDE SHARED LOCKS): Fresh uncached panel-wide Read 1 (or verified two-snapshot sweep input).
+  // Any panel timeout, network error, partial/malformed inbound list, or present/moved client exits
+  // immediately with ZERO lock acquisitions and ZERO risk of stranding shared inbound/client locks.
+  let read1: {
+    absent: boolean;
+    reason: string;
+    inboundMissing?: boolean;
+    movedToInboundId?: number;
+    circuitBreakerTriggered?: boolean;
+    circuitBreakerReason?: string;
+  };
+  if (hasValidPreVerifiedSnapshots && preSnaps) {
+    const inboundMissing =
+      !preSnaps.snapshot1.parsedByInboundId.has(inboundId) &&
+      !preSnaps.snapshot2.parsedByInboundId.has(inboundId);
+    read1 = {
+      absent: true,
+      inboundMissing,
+      reason: inboundMissing
+        ? 'pre_verified_two_panel_wide_snapshots_inbound_missing'
+        : 'pre_verified_two_panel_wide_snapshots',
     };
-  }
+  } else {
+    try {
+      read1 = await performPanelWideAuthoritativeAbsenceRead('read1');
+    } catch (read1Err: any) {
+      return {
+        confirmedDeleted: false,
+        dbWrites: 0,
+        reason: `read1_error:${read1Err?.message || 'panel_read_failed'}`,
+      };
+    }
 
-  // Wait reReadDelayMs OUTSIDE shared locks so lock hold duration remains minimal
-  if (reReadDelayMs > 0) {
-    await new Promise((r) => setTimeout(r, reReadDelayMs));
+    if (!read1.absent) {
+      if (read1.circuitBreakerTriggered && read1.circuitBreakerReason) {
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: null,
+          action: 'panel_deletion_circuit_breaker_triggered',
+          targetType: 'xui_panel',
+          targetId: currentPanelIdentity,
+          dedupeWindowHours: 1,
+          details: {
+            panel_identity: currentPanelIdentity,
+            trigger_reason: read1.circuitBreakerReason,
+            stage: 'read1',
+            client_uuid: normUuid,
+            max_deletes_per_cycle: maxDeletesPerCycle,
+            max_missing_ratio: maxMissingRatio,
+            source: params.source || 'background_sync',
+          },
+        });
+        return {
+          confirmedDeleted: false,
+          circuitBreakerTriggered: true,
+          circuitBreakerReason: read1.circuitBreakerReason,
+          manualReviewFlagged: true,
+          dbWrites: 0,
+          reason: read1.reason,
+        };
+      }
+      if (read1.movedToInboundId) {
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: params.userId || null,
+          action: 'panel_deletion_inbound_mismatch',
+          targetType: 'vpn_client',
+          targetId: normUuid,
+          details: {
+            client_uuid: normUuid,
+            expected_inbound_id: inboundId,
+            live_inbound_id: read1.movedToInboundId,
+            panel_identity: currentPanelIdentity,
+            reason: read1.reason,
+            source: params.source || 'background_sync',
+          },
+        });
+        return {
+          confirmedDeleted: false,
+          manualReviewFlagged: true,
+          dbWrites: 0,
+          reason: read1.reason,
+        };
+      }
+      return {
+        confirmedDeleted: false,
+        dbWrites: 0,
+        reason: read1.reason,
+      };
+    }
+
+    // Wait reReadDelayMs OUTSIDE shared locks so lock hold duration remains minimal
+    if (reReadDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, reReadDelayMs));
+    }
   }
 
   // STEP 2 (READ-ONLY LOCK PRE-CHECK): Inspect provisioning_operations before calling acquire_provisioning_lock.
@@ -5186,14 +6998,40 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
             maxWaitMs: 2000,
           },
           async (assertInboundLockStillHeld) => {
-            // Verify both locks immediately upon entry
+            const lockAcquiredAtMs = Date.now();
+
+            // Verify both durable locks (and distributed sweep lease if present) immediately upon entry
             await assertClientLockStillHeld();
             await assertInboundLockStillHeld();
+            if (params.assertDistributedLeaseStillHeld) {
+              await params.assertDistributedLeaseStillHeld();
+            }
 
-            // Fresh uncached Read 2 inside strictly bounded locked window (read-only; pre-RPC)
-            let read2: { absent: boolean; reason: string; inboundMissing?: boolean };
+            // Bound the final locked full-panel verification strictly within remaining lock lease budget
+            const elapsedBeforeRead2Ms = Date.now() - lockAcquiredAtMs;
+            const remainingBudgetMs = maxAllowedLockedWindowMs - elapsedBeforeRead2Ms;
+            const minRequiredBudgetMs = Math.min(lockedReadTimeoutMs, 100);
+            if (remainingBudgetMs < minRequiredBudgetMs) {
+              const budgetErr: any = new Error(
+                `read2_error:locked_read_lease_budget_exhausted (${remainingBudgetMs}ms remaining)`
+              );
+              budgetErr.code = 'LOCKED_READ_LEASE_BUDGET_EXHAUSTED';
+              budgetErr.nonUncertainDeletionError = true;
+              throw budgetErr;
+            }
+            const effectiveRead2TimeoutMs = Math.min(lockedReadTimeoutMs, remainingBudgetMs);
+
+            // Fresh uncached panel-wide Read 2 inside strictly bounded locked window (read-only; pre-RPC)
+            let read2: {
+              absent: boolean;
+              reason: string;
+              inboundMissing?: boolean;
+              movedToInboundId?: number;
+              circuitBreakerTriggered?: boolean;
+              circuitBreakerReason?: string;
+            };
             try {
-              read2 = await performSingleAuthoritativeAbsenceRead('read2', lockedReadTimeoutMs);
+              read2 = await performPanelWideAuthoritativeAbsenceRead('read2', effectiveRead2TimeoutMs);
             } catch (read2Err: any) {
               // Read-only panel failure BEFORE RPC execution -> safe to finalize locks as 'failed' (never 'uncertain')
               const preRpcReadErr: any = new Error(`read2_error:${read2Err?.message || 'locked_read_failed'}`);
@@ -5203,6 +7041,57 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
             }
 
             if (!read2.absent) {
+              if (read2.circuitBreakerTriggered && read2.circuitBreakerReason) {
+                console.error(
+                  `[3X-UI Sync] LOCKED READ2 CIRCUIT BREAKER TRIGGERED (${read2.circuitBreakerReason}) for UUID ${normUuid}: aborting deletion.`
+                );
+                await recordDeduplicatedSyncAuditLog({
+                  dbClient,
+                  userId: null,
+                  action: 'panel_deletion_circuit_breaker_triggered',
+                  targetType: 'xui_panel',
+                  targetId: currentPanelIdentity,
+                  dedupeWindowHours: 1,
+                  details: {
+                    panel_identity: currentPanelIdentity,
+                    trigger_reason: read2.circuitBreakerReason,
+                    stage: 'locked_read2',
+                    client_uuid: normUuid,
+                    max_deletes_per_cycle: maxDeletesPerCycle,
+                    max_missing_ratio: maxMissingRatio,
+                    source: params.source || 'background_sync',
+                  },
+                });
+                const cbErr: any = new Error(read2.reason);
+                cbErr.code = 'LOCKED_READ2_CIRCUIT_BREAKER';
+                cbErr.nonUncertainDeletionError = true;
+                cbErr.circuitBreakerTriggered = true;
+                cbErr.circuitBreakerReason = read2.circuitBreakerReason;
+                throw cbErr;
+              }
+              if (read2.movedToInboundId) {
+                await recordDeduplicatedSyncAuditLog({
+                  dbClient,
+                  userId: params.userId || null,
+                  action: 'panel_deletion_inbound_mismatch',
+                  targetType: 'vpn_client',
+                  targetId: normUuid,
+                  details: {
+                    client_uuid: normUuid,
+                    expected_inbound_id: inboundId,
+                    live_inbound_id: read2.movedToInboundId,
+                    panel_identity: currentPanelIdentity,
+                    reason: read2.reason,
+                    source: params.source || 'background_sync',
+                  },
+                });
+                return {
+                  confirmedDeleted: false,
+                  manualReviewFlagged: true,
+                  dbWrites: 0,
+                  reason: read2.reason,
+                };
+              }
               return {
                 confirmedDeleted: false,
                 dbWrites: 0,
@@ -5210,11 +7099,22 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
               };
             }
 
-            // Re-verify BOTH durable lease ownerships immediately before executing the database mutation RPC
+            // Ensure locked verification completed well within lock lease budget before mutating DB
+            if (Date.now() - lockAcquiredAtMs >= maxAllowedLockedWindowMs) {
+              const postReadBudgetErr: any = new Error('read2_error:locked_lease_budget_exhausted_before_rpc');
+              postReadBudgetErr.code = 'LOCKED_READ_LEASE_BUDGET_EXHAUSTED';
+              postReadBudgetErr.nonUncertainDeletionError = true;
+              throw postReadBudgetErr;
+            }
+
+            // Re-verify BOTH durable lease ownerships AND the distributed sweep lease immediately before executing the database mutation RPC
             await assertClientLockStillHeld();
             await assertInboundLockStillHeld();
+            if (params.assertDistributedLeaseStillHeld) {
+              await params.assertDistributedLeaseStillHeld();
+            }
 
-            const reason = 'confirmed_absent_two_fresh_uncached_reads';
+            const reason = 'confirmed_absent_panel_wide_uncached_reads';
             const details = {
               source: params.source || 'background_sync',
               identity_match: identityCheck.code,
@@ -5392,6 +7292,28 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
         mutationUncertain: true,
         dbWrites: 0,
         reason: lockErr?.message || 'rpc_outcome_uncertain',
+      };
+    }
+
+    if (lockErr?.distributedLeaseLost === true) {
+      return {
+        confirmedDeleted: false,
+        applied: false,
+        distributedLeaseLost: true,
+        dbWrites: 0,
+        reason: lockErr?.message || 'distributed_lease_lost',
+      };
+    }
+
+    if (lockErr?.circuitBreakerTriggered === true) {
+      return {
+        confirmedDeleted: false,
+        applied: false,
+        circuitBreakerTriggered: true,
+        circuitBreakerReason: lockErr.circuitBreakerReason,
+        manualReviewFlagged: true,
+        dbWrites: 0,
+        reason: lockErr?.message || `read2_circuit_breaker:${lockErr.circuitBreakerReason}`,
       };
     }
 
@@ -5583,6 +7505,7 @@ export const syncDeleted3XUiClients = async (
     return {
       synced: false,
       skippedDisabled: true,
+      panelRequestCount: 0,
       deletedCount: 0,
       restoredCount: 0,
       skippedCount: 0,
@@ -5592,21 +7515,105 @@ export const syncDeleted3XUiClients = async (
     };
   }
 
-  console.log('[3X-UI Sync] Starting authoritative VPN client synchronization with 3X-UI panel...');
+  // In-process mutex prevents overlapping deletion sweeps within the same Node process
+  if (isPanelDeletionSyncInProgress) {
+    console.log('[3X-UI Sync] Skipping deletion synchronization: another cycle is already in progress in this process.');
+    return {
+      synced: false,
+      skippedBusy: true,
+      panelRequestCount: 0,
+      deletedCount: 0,
+      restoredCount: 0,
+      skippedCount: 0,
+      manualReviewCount: 0,
+      reconciliationFlaggedCount: 0,
+      details: [],
+    };
+  }
 
+  isPanelDeletionSyncInProgress = true;
   const dbClient = options?.dbClient || supabaseAdmin;
-  const readList = options?.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
-  const readInbound = options?.fetchUncachedInbound || fetchUncachedLiveInboundById;
+  const rawReadList = options?.fetchUncachedInboundsList || fetchUncachedLiveInboundsList;
   const nowMs = options?.nowMs ?? Date.now();
+  const reReadDelayMs = options?.reReadDelayMs ?? 150;
+  const intervalMs = options?.intervalMs ?? getPanelDeletionSyncIntervalMs();
+  const maxDeletesPerCycle = options?.maxDeletesPerCycle ?? getPanelDeletionSyncMaxDeletesPerCycle();
+  const maxMissingRatio = options?.maxMissingRatio ?? getPanelDeletionSyncMaxMissingRatio();
 
-  let currentPanelIdentity = String(options?.currentPanelIdentity || '').trim();
-  if (!currentPanelIdentity) {
-    try {
-      currentPanelIdentity = await getCurrentPanelIdentity();
-    } catch (err: any) {
-      console.warn('[3X-UI Sync] Cannot resolve active 3X-UI panel identity. Skipping cycle safely.', err?.message || err);
+  let panelRequestCount = 0;
+  const countedReadList = async (
+    readOpts?: { timeoutMs?: number }
+  ): Promise<UncachedInboundsListReadResult> => {
+    panelRequestCount += 1;
+    return await rawReadList(readOpts);
+  };
+
+  let leaseOwnerId: string | null = null;
+  let currentLeaseVersion: string | null = null;
+  const effectiveLeaseTtlMs = Math.max(options?.leaseTtlMs ?? Math.max(intervalMs + 60000, 180000), 30000);
+  const paginationPageSize = Math.max(1, Math.min(Math.floor(options?.pageSize || 1000), 5000));
+  let cycleCompletedSuccessfully = false;
+  let finalSummary: Record<string, any> | undefined;
+
+  try {
+    // Optional cross-instance CAS lease (always enabled for scheduled 2-minute sweeps & background sync)
+    if (options?.enforceCrossInstanceLease) {
+      const leaseRes = await acquireCrossInstanceDeletionSyncLease({
+        dbClient,
+        intervalMs,
+        nowMs,
+        force: Boolean(options.forceLease),
+        ownerId: options.leaseOwnerId,
+        leaseTtlMs: effectiveLeaseTtlMs,
+      });
+      if (!leaseRes.acquired) {
+        console.log(`[3X-UI Sync] Skipping cycle due to cross-instance lease (${leaseRes.reason || 'busy'}).`);
+        return {
+          synced: false,
+          skippedLease: true,
+          leaseSkipReason: leaseRes.reason || 'lease_not_acquired',
+          panelRequestCount: 0,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0,
+          details: [],
+        };
+      }
+      leaseOwnerId = leaseRes.ownerId;
+      currentLeaseVersion = leaseRes.leaseVersion ?? null;
+    }
+
+    console.log('[3X-UI Sync] Starting authoritative VPN client synchronization with 3X-UI panel...');
+
+    let currentPanelIdentity = String(options?.currentPanelIdentity || '').trim();
+    if (!currentPanelIdentity) {
+      try {
+        currentPanelIdentity = await getCurrentPanelIdentity();
+      } catch (err: any) {
+        console.warn('[3X-UI Sync] Cannot resolve active 3X-UI panel identity. Skipping cycle safely.', err?.message || err);
+        return {
+          synced: false,
+          panelRequestCount,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0,
+        };
+      }
+    }
+
+    // Step 1: Fresh, uncached live panel-wide Snapshot 1 (NEVER uses cachedInbounds)
+    const snap1 = await countedReadList();
+    if (!snap1 || !snap1.ok || !Array.isArray(snap1.inbounds) || snap1.inbounds.length === 0) {
+      console.warn(
+        `[3X-UI Sync] Live 3X-UI panel Snapshot 1 failed or returned empty inbounds (${snap1?.reason || 'empty_inbounds'}). Skipping cycle with zero writes.`
+      );
       return {
         synced: false,
+        panelRequestCount,
         deletedCount: 0,
         restoredCount: 0,
         skippedCount: 0,
@@ -5614,70 +7621,109 @@ export const syncDeleted3XUiClients = async (
         reconciliationFlaggedCount: 0,
       };
     }
-  }
 
-  // Step 1: Fresh, uncached live panel list read (NEVER uses cachedInbounds)
-  const listRes = await readList();
-  if (!listRes.ok) {
-    console.warn(`[3X-UI Sync] Live 3X-UI panel list failed (${listRes.reason}). Skipping cycle with zero writes.`);
-    return {
-      synced: false,
-      deletedCount: 0,
-      restoredCount: 0,
-      skippedCount: 0,
-      manualReviewCount: 0,
-      reconciliationFlaggedCount: 0,
-    };
-  }
+    if (snap1.allInboundsCleanlyParsed && snap1.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
+      setCachedInbounds(snap1.inbounds);
+    }
 
-  if (listRes.allInboundsCleanlyParsed && listRes.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
-    setCachedInbounds(listRes.inbounds);
-  }
+    const configuredServers =
+      options?.configuredServers !== undefined
+        ? options.configuredServers
+        : await loadConfiguredXuiServers(dbClient);
 
-  const configuredServers =
-    options?.configuredServers !== undefined
-      ? options.configuredServers
-      : await loadConfiguredXuiServers(dbClient);
+    console.log(
+      `[3X-UI Sync] Live panel reachable (identity=${currentPanelIdentity}). Found ${snap1.liveClientByUuid.size} live client UUIDs across ${snap1.inbounds.length} inbounds (unparsed=${snap1.unparsedInboundIds.length}).`
+    );
 
-  console.log(
-    `[3X-UI Sync] Live panel reachable (identity=${currentPanelIdentity}). Found ${listRes.liveClientByUuid.size} live client UUIDs across ${listRes.inbounds.length} inbounds (unparsed=${listRes.unparsedInboundIds.length}).`
-  );
+    let deletedCount = 0;
+    let restoredCount = 0;
+    let skippedCount = 0;
+    let manualReviewCount = 0;
+    let reconciliationFlaggedCount = 0;
+    const details: Array<{ clientUuid: string; outcome: string; reason: string }> = [];
 
-  let deletedCount = 0;
-  let restoredCount = 0;
-  let skippedCount = 0;
-  let manualReviewCount = 0;
-  let reconciliationFlaggedCount = 0;
-  const details: Array<{ clientUuid: string; outcome: string; reason: string }> = [];
-
-  try {
-    // Load all non-deleted vpn_accounts and vpn_configs (including active, disabled, expired)
-    const [accRes, cfgRes] = await Promise.all([
-      dbClient.from('vpn_accounts').select('*'),
-      dbClient.from('vpn_configs').select('*'),
+    // Load ALL vpn_accounts and vpn_configs across ALL customers (online and offline) using deterministic
+    // primary-key cursor pagination so datasets > 1,000 rows are never silently truncated by PostgREST max-rows.
+    const [accPaginated, cfgPaginated] = await Promise.all([
+      fetchAllTableRowsByPrimaryKeyCursor({
+        dbClient,
+        table: 'vpn_accounts',
+        selectColumns: '*',
+        primaryKeyColumn: 'id',
+        pageSize: paginationPageSize,
+      }),
+      fetchAllTableRowsByPrimaryKeyCursor({
+        dbClient,
+        table: 'vpn_configs',
+        selectColumns: '*',
+        primaryKeyColumn: 'id',
+        pageSize: paginationPageSize,
+      }),
     ]);
 
-    const accounts: any[] = Array.isArray(accRes?.data) ? accRes.data : [];
-    const configs: any[] = Array.isArray(cfgRes?.data) ? cfgRes.data : [];
+    if (!accPaginated.ok || !cfgPaginated.ok) {
+      const failReason = !accPaginated.ok
+        ? accPaginated.reason
+        : !cfgPaginated.ok
+          ? cfgPaginated.reason
+          : 'pagination_failed';
+      console.warn(
+        '[3X-UI Sync] Failed to load complete paginated customer VPN records from Supabase. Aborting cycle with zero writes.',
+        failReason
+      );
+      return {
+        synced: false,
+        panelRequestCount,
+        deletedCount: 0,
+        restoredCount: 0,
+        skippedCount: 0,
+        manualReviewCount: 0,
+        reconciliationFlaggedCount: 0,
+      };
+    }
 
-    // Also load grant inbound_ids as authoritative inbound fallback when vpn_configs.inbound_id is missing
-    const grantInboundByUuid = new Map<string, number>();
-    try {
-      const { data: grants } = await dbClient
-        .from('vpn_entitlement_grants')
-        .select('client_uuid, inbound_id')
-        .not('inbound_id', 'is', null);
-      if (Array.isArray(grants)) {
-        for (const g of grants) {
-          const gu = String(g?.client_uuid || '').trim().toLowerCase();
-          const gib = Number(g?.inbound_id);
-          if (gu && Number.isInteger(gib) && gib > 0 && !grantInboundByUuid.has(gu)) {
-            grantInboundByUuid.set(gu, gib);
-          }
+    const accounts: any[] = accPaginated.rows;
+    const configs: any[] = cfgPaginated.rows;
+
+    // Load ALL grant inbound_ids via deterministic pagination as authoritative inbound fallback when
+    // vpn_configs.inbound_id is missing, and track all distinct positive inbound_ids to detect conflicts.
+    // If vpn_entitlement_grants exists and a page query fails (other than missing table), abort deletion processing.
+    const grantInboundsByUuid = new Map<string, Set<number>>();
+    const grantsPaginated = await fetchAllTableRowsByPrimaryKeyCursor({
+      dbClient,
+      table: 'vpn_entitlement_grants',
+      selectColumns: 'id, client_uuid, inbound_id',
+      primaryKeyColumn: 'id',
+      pageSize: paginationPageSize,
+      applyFilters: (q) => q.not('inbound_id', 'is', null),
+    });
+
+    if (!grantsPaginated.ok) {
+      const isOptionalMissingTable = isMissingSchemaOrRpcError({ message: grantsPaginated.reason });
+      if (!isOptionalMissingTable) {
+        console.warn(
+          '[3X-UI Sync] Failed to load complete paginated vpn_entitlement_grants from Supabase. Aborting cycle with zero writes.',
+          grantsPaginated.reason
+        );
+        return {
+          synced: false,
+          panelRequestCount,
+          deletedCount: 0,
+          restoredCount: 0,
+          skippedCount: 0,
+          manualReviewCount: 0,
+          reconciliationFlaggedCount: 0,
+        };
+      }
+    } else {
+      for (const g of grantsPaginated.rows) {
+        const gu = String(g?.client_uuid || '').trim().toLowerCase();
+        const gib = Number(g?.inbound_id);
+        if (gu && Number.isInteger(gib) && gib > 0) {
+          if (!grantInboundsByUuid.has(gu)) grantInboundsByUuid.set(gu, new Set<number>());
+          grantInboundsByUuid.get(gu)!.add(gib);
         }
       }
-    } catch {
-      // Optional table
     }
 
     // Group accounts and configs by normalized client UUID
@@ -5686,6 +7732,7 @@ export const syncDeleted3XUiClients = async (
       accounts: any[];
       configs: any[];
       inboundId: number | null;
+      distinctInboundIds: Set<number>;
       userId: string | null;
       distinctOwners: Set<string>;
       hasConflictingOwnership: boolean;
@@ -5693,7 +7740,9 @@ export const syncDeleted3XUiClients = async (
       userEmail: string | null;
       orderId: string | null;
       panelIdentity: string | null;
+      distinctPanelIdentities: Set<string>;
       serverId: string | null;
+      distinctServerIds: Set<string>;
       createdAt: string | null;
       anyNonDeleted: boolean;
       allDeleted: boolean;
@@ -5705,11 +7754,15 @@ export const syncDeleted3XUiClients = async (
       if (!norm) return null;
       let g = groups.get(norm);
       if (!g) {
+        const grantInboundSet = grantInboundsByUuid.get(norm);
+        const distinctInboundIds = new Set<number>(grantInboundSet ? Array.from(grantInboundSet) : []);
+        const initialInboundId = distinctInboundIds.size === 1 ? Array.from(distinctInboundIds)[0] : null;
         g = {
           clientUuid: norm,
           accounts: [],
           configs: [],
-          inboundId: grantInboundByUuid.get(norm) ?? null,
+          inboundId: initialInboundId,
+          distinctInboundIds,
           userId: null,
           distinctOwners: new Set<string>(),
           hasConflictingOwnership: false,
@@ -5717,7 +7770,9 @@ export const syncDeleted3XUiClients = async (
           userEmail: null,
           orderId: null,
           panelIdentity: null,
+          distinctPanelIdentities: new Set<string>(),
           serverId: null,
+          distinctServerIds: new Set<string>(),
           createdAt: null,
           anyNonDeleted: false,
           allDeleted: true,
@@ -5740,8 +7795,20 @@ export const syncDeleted3XUiClients = async (
       }
       if (!g.userEmail && acc.email) g.userEmail = String(acc.email).trim().toLowerCase();
       if (!g.orderId && acc.order_id) g.orderId = String(acc.order_id).trim();
-      if (!g.panelIdentity && acc.panel_identity) g.panelIdentity = String(acc.panel_identity).trim();
-      if (!g.serverId && acc.server_id) g.serverId = String(acc.server_id).trim();
+      if (acc.panel_identity) {
+        const pid = String(acc.panel_identity).trim();
+        if (pid) {
+          g.distinctPanelIdentities.add(pid);
+          if (!g.panelIdentity) g.panelIdentity = pid;
+        }
+      }
+      if (acc.server_id) {
+        const sid = String(acc.server_id).trim();
+        if (sid) {
+          g.distinctServerIds.add(sid);
+          if (!g.serverId) g.serverId = sid;
+        }
+      }
       if (acc.created_at && (!g.createdAt || new Date(acc.created_at).getTime() > new Date(g.createdAt).getTime())) {
         g.createdAt = acc.created_at;
       }
@@ -5757,7 +7824,10 @@ export const syncDeleted3XUiClients = async (
       if (!g) continue;
       g.configs.push(cfg);
       const ibId = Number(cfg.inbound_id);
-      if (Number.isInteger(ibId) && ibId > 0) g.inboundId = ibId;
+      if (Number.isInteger(ibId) && ibId > 0) {
+        g.distinctInboundIds.add(ibId);
+        g.inboundId = ibId;
+      }
       const cfgCustUid = String(cfg.customer_uid || '').trim();
       const cfgUserId = String(cfg.user_id || '').trim();
       if (cfgCustUid && cfgUserId && cfgCustUid.toLowerCase() !== cfgUserId.toLowerCase()) {
@@ -5778,8 +7848,20 @@ export const syncDeleted3XUiClients = async (
         g.userEmail = String(cfg.customer_email || cfg.email).trim().toLowerCase();
       }
       if (!g.orderId && cfg.order_id) g.orderId = String(cfg.order_id).trim();
-      if (!g.panelIdentity && cfg.panel_identity) g.panelIdentity = String(cfg.panel_identity).trim();
-      if (!g.serverId && cfg.server_id) g.serverId = String(cfg.server_id).trim();
+      if (cfg.panel_identity) {
+        const pid = String(cfg.panel_identity).trim();
+        if (pid) {
+          g.distinctPanelIdentities.add(pid);
+          if (!g.panelIdentity) g.panelIdentity = pid;
+        }
+      }
+      if (cfg.server_id) {
+        const sid = String(cfg.server_id).trim();
+        if (sid) {
+          g.distinctServerIds.add(sid);
+          if (!g.serverId) g.serverId = sid;
+        }
+      }
       if (cfg.created_at && (!g.createdAt || new Date(cfg.created_at).getTime() > new Date(g.createdAt).getTime())) {
         g.createdAt = cfg.created_at;
       }
@@ -5791,17 +7873,55 @@ export const syncDeleted3XUiClients = async (
     }
 
     const nowIso = new Date(nowMs).toISOString();
+    const RECENT_PROVISION_GRACE_MS = 60 * 1000;
+    let totalTrackedNonDeleted = 0;
+    const trackedNonDeletedUuids = new Set<string>();
+    const snapshot1MissingCandidates: ClientRecordGroup[] = [];
 
     for (const group of groups.values()) {
       // Never auto-resurrect a configuration that is already confirmed deleted
       if (!group.anyNonDeleted || group.allDeleted) {
         continue;
       }
+      trackedNonDeletedUuids.add(group.clientUuid);
+      totalTrackedNonDeleted += 1;
 
-      const liveMatch = listRes.liveClientByUuid.get(group.clientUuid);
+      const liveMatch = snap1.liveClientByUuid.get(group.clientUuid);
       if (liveMatch) {
         // Client positively observed in live 3X-UI settings.clients[]!
-        // 1. Safely backfill panel_identity (and missing inbound_id on vpn_configs) for non-deleted rows
+        // Active, Disabled, Expired, and Data-Exhausted configs stay visible.
+        const liveInboundId = Number(liveMatch.inbound?.id);
+        const conflictingPositiveInbounds = Array.from(group.distinctInboundIds).filter(
+          (id) => Number.isInteger(id) && id > 0 && Number.isInteger(liveInboundId) && liveInboundId > 0 && id !== liveInboundId
+        );
+        const hasInboundMismatch = conflictingPositiveInbounds.length > 0 || group.distinctInboundIds.size > 1;
+
+        if (hasInboundMismatch) {
+          // NEVER automatically rewrite conflicting inbound_id; report for manual review!
+          await recordDeduplicatedSyncAuditLog({
+            dbClient,
+            userId: group.distinctOwners.size === 1 ? group.userId : null,
+            action: 'panel_deletion_inbound_mismatch',
+            targetType: 'vpn_client',
+            targetId: group.clientUuid,
+            details: {
+              client_uuid: group.clientUuid,
+              expected_inbound_ids: Array.from(group.distinctInboundIds),
+              live_inbound_id: Number.isInteger(liveInboundId) && liveInboundId > 0 ? liveInboundId : null,
+              panel_identity: currentPanelIdentity,
+              code: 'live_client_inbound_mismatch',
+              source: 'background_sync',
+            },
+          });
+          manualReviewCount += 1;
+          details.push({
+            clientUuid: group.clientUuid,
+            outcome: 'manual_review',
+            reason: 'live_client_inbound_mismatch',
+          });
+        }
+
+        // 1. Safely backfill null panel_identity (and null/0 inbound_id ONLY when no conflicting positive inbound exists)
         for (const acc of group.accounts) {
           const st = String(acc.status || '').trim().toLowerCase();
           if (st === 'deleted' || acc.deleted_from_panel_at) continue;
@@ -5848,8 +7968,14 @@ export const syncDeleted3XUiClients = async (
           if (!cfg.panel_identity && currentPanelIdentity) {
             updates.panel_identity = currentPanelIdentity;
           }
-          if ((!cfg.inbound_id || Number(cfg.inbound_id) <= 0) && liveMatch.inbound?.id) {
-            updates.inbound_id = Number(liveMatch.inbound.id);
+          // Only backfill NULL/0 inbound_id when there is NO conflicting positive inbound_id on this client group
+          if (
+            !hasInboundMismatch &&
+            (!cfg.inbound_id || Number(cfg.inbound_id) <= 0) &&
+            Number.isInteger(liveInboundId) &&
+            liveInboundId > 0
+          ) {
+            updates.inbound_id = liveInboundId;
           }
           if (
             (st === 'disabled' || st === 'expired') &&
@@ -5885,12 +8011,9 @@ export const syncDeleted3XUiClients = async (
         continue;
       }
 
-      // Client was NOT present in live list read 1.
-      // If any inbound in the list failed strict JSON parsing AND matches (or we don't know) this record's inbound, skip safely.
-      if (
-        !listRes.allInboundsCleanlyParsed &&
-        (!group.inboundId || listRes.unparsedInboundIds.includes(group.inboundId) || listRes.unparsedInboundIds.includes(-1))
-      ) {
+      // Client was NOT present in live Snapshot 1.
+      // Panel-wide absence requires EVERY inbound in Snapshot 1 to have parsed cleanly.
+      if (!snap1.allInboundsCleanlyParsed) {
         skippedCount += 1;
         details.push({
           clientUuid: group.clientUuid,
@@ -5900,6 +8023,7 @@ export const syncDeleted3XUiClients = async (
         continue;
       }
 
+      // Ownership protection: fail closed on missing or conflicting ownership
       if (group.hasConflictingOwnership || group.distinctOwners.size > 1 || group.hasMissingOwnership || !group.userId) {
         const ownershipCode =
           group.hasConflictingOwnership || group.distinctOwners.size > 1
@@ -5931,7 +8055,338 @@ export const syncDeleted3XUiClients = async (
         continue;
       }
 
-      // Run full authoritative verification (panel identity + ownership + durable client+inbound locks + 2 fresh uncached reads + atomic RPC)
+      // Conflicting positive inbound_id protection: fail closed and report for manual review
+      if (group.distinctInboundIds.size > 1) {
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: group.userId,
+          action: 'panel_deletion_inbound_mismatch',
+          targetType: 'vpn_client',
+          targetId: group.clientUuid,
+          details: {
+            client_uuid: group.clientUuid,
+            distinct_inbound_ids: Array.from(group.distinctInboundIds),
+            panel_identity: currentPanelIdentity,
+            code: 'conflicting_inbound_id',
+            source: 'background_sync',
+          },
+        });
+        manualReviewCount += 1;
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'manual_review',
+          reason: 'conflicting_inbound_id',
+        });
+        continue;
+      }
+
+      // Conflicting panel_identity protection across records
+      if (group.distinctPanelIdentities.size > 1) {
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: group.userId,
+          action: 'panel_deletion_ambiguous_identity',
+          targetType: 'vpn_client',
+          targetId: group.clientUuid,
+          details: {
+            client_uuid: group.clientUuid,
+            inbound_id: group.inboundId ?? null,
+            distinct_panel_identities: Array.from(group.distinctPanelIdentities),
+            code: 'conflicting_panel_identity',
+            source: 'background_sync',
+          },
+        });
+        manualReviewCount += 1;
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'manual_review',
+          reason: 'conflicting_panel_identity',
+        });
+        continue;
+      }
+
+      // Recent provision grace period (60s)
+      if (group.createdAt) {
+        const createdAtMs = new Date(group.createdAt).getTime();
+        if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS) {
+          skippedCount += 1;
+          details.push({
+            clientUuid: group.clientUuid,
+            outcome: 'skipped',
+            reason: 'recent_provision_grace_period',
+          });
+          continue;
+        }
+      }
+
+      // Strict panel identity + inbound_id verification (legacy rows with missing inbound_id stay visible)
+      const identityCheck = verifyRecordPanelIdentity({
+        currentPanelIdentity,
+        recordPanelIdentity: group.panelIdentity,
+        recordServerId: group.serverId,
+        recordInboundId: group.inboundId,
+        recordOwnerUid: group.userId,
+        recordOwnerEmail: group.userEmail,
+        configuredServers,
+      });
+
+      if (!identityCheck.ok) {
+        const auditAction =
+          identityCheck.code === 'wrong_panel_identity'
+            ? 'panel_deletion_wrong_panel_identity'
+            : 'panel_deletion_ambiguous_identity';
+        await recordDeduplicatedSyncAuditLog({
+          dbClient,
+          userId: group.userId,
+          action: auditAction,
+          targetType: 'vpn_client',
+          targetId: group.clientUuid,
+          details: {
+            client_uuid: group.clientUuid,
+            inbound_id: group.inboundId ?? null,
+            current_panel_identity: currentPanelIdentity,
+            record_panel_identity: group.panelIdentity,
+            record_server_id: group.serverId,
+            code: identityCheck.code,
+            reason: identityCheck.reason,
+            source: 'background_sync',
+          },
+        });
+        manualReviewCount += 1;
+        skippedCount += 1;
+        details.push({
+          clientUuid: group.clientUuid,
+          outcome: 'manual_review',
+          reason: identityCheck.code,
+        });
+        continue;
+      }
+
+      snapshot1MissingCandidates.push(group);
+    }
+
+    // Fast path: 0 deletion candidates -> complete cycle after exactly 1 panel request!
+    if (snapshot1MissingCandidates.length === 0) {
+      cycleCompletedSuccessfully = true;
+      lastPanelDeletionSyncAt = Date.now();
+      finalSummary = {
+        deletedCount,
+        restoredCount,
+        skippedCount,
+        manualReviewCount,
+        reconciliationFlaggedCount,
+        panelRequestCount,
+      };
+      console.log(
+        `[3X-UI Sync] Completed (0 deletion candidates, ${panelRequestCount} panel request). restoredActive=${restoredCount}, skipped=${skippedCount}, manualReview=${manualReviewCount}.`
+      );
+      return {
+        synced: true,
+        panelRequestCount,
+        deletedCount,
+        restoredCount,
+        skippedCount,
+        manualReviewCount,
+        reconciliationFlaggedCount,
+        details,
+      };
+    }
+
+    // Step 2: Wait reReadDelayMs OUTSIDE locks, then fetch fresh uncached panel-wide Snapshot 2
+    if (reReadDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, reReadDelayMs));
+    }
+
+    const snap2 = await countedReadList();
+    if (!snap2 || !snap2.ok || !snap2.allInboundsCleanlyParsed || !Array.isArray(snap2.inbounds) || snap2.inbounds.length === 0) {
+      console.warn(
+        `[3X-UI Sync] Live 3X-UI panel Snapshot 2 failed, malformed, or empty (${snap2?.reason || 'incomplete_or_empty'}). Aborting all deletions with zero writes.`
+      );
+      return {
+        synced: false,
+        panelRequestCount,
+        deletedCount: 0,
+        restoredCount,
+        skippedCount: skippedCount + snapshot1MissingCandidates.length,
+        manualReviewCount,
+        reconciliationFlaggedCount: 0,
+        details,
+      };
+    }
+
+    // Filter to candidates confirmed panel-wide absent in BOTH Snapshot 1 and Snapshot 2
+    const confirmedTwoSnapshotCandidates: ClientRecordGroup[] = [];
+    for (const candidate of snapshot1MissingCandidates) {
+      const snap2Match = snap2.liveClientByUuid.get(candidate.clientUuid);
+      if (snap2Match) {
+        const liveInboundId = Number(snap2Match.inbound?.id);
+        if (Number.isInteger(liveInboundId) && liveInboundId > 0 && liveInboundId !== candidate.inboundId) {
+          await recordDeduplicatedSyncAuditLog({
+            dbClient,
+            userId: candidate.userId,
+            action: 'panel_deletion_inbound_mismatch',
+            targetType: 'vpn_client',
+            targetId: candidate.clientUuid,
+            details: {
+              client_uuid: candidate.clientUuid,
+              expected_inbound_id: candidate.inboundId,
+              live_inbound_id: liveInboundId,
+              panel_identity: currentPanelIdentity,
+              code: 'reappeared_on_different_inbound_in_snapshot2',
+              source: 'background_sync',
+            },
+          });
+          manualReviewCount += 1;
+          skippedCount += 1;
+          details.push({
+            clientUuid: candidate.clientUuid,
+            outcome: 'manual_review',
+            reason: 'read2_client_moved_to_another_inbound',
+          });
+        } else {
+          skippedCount += 1;
+          details.push({
+            clientUuid: candidate.clientUuid,
+            outcome: 'skipped',
+            reason: 'read2_client_present_in_snapshot2',
+          });
+        }
+        continue;
+      }
+      confirmedTwoSnapshotCandidates.push(candidate);
+    }
+
+    // Step 3: Mass-Deletion Circuit Breaker (fires even when panel_identity matches!)
+    let circuitBreakerReason: string | null = null;
+    if ((snap1.liveClientByUuid.size === 0 || snap2.liveClientByUuid.size === 0) && totalTrackedNonDeleted >= 3) {
+      circuitBreakerReason = 'unexpected_zero_live_clients';
+    } else if (confirmedTwoSnapshotCandidates.length > maxDeletesPerCycle) {
+      circuitBreakerReason = 'max_deletes_per_cycle_exceeded';
+    } else if (
+      totalTrackedNonDeleted >= 8 &&
+      confirmedTwoSnapshotCandidates.length >= 3 &&
+      confirmedTwoSnapshotCandidates.length / totalTrackedNonDeleted > maxMissingRatio
+    ) {
+      circuitBreakerReason = 'max_missing_ratio_exceeded';
+    }
+
+    if (circuitBreakerReason) {
+      console.error(
+        `[3X-UI Sync] CIRCUIT BREAKER TRIGGERED (${circuitBreakerReason}): stopping ALL automatic deletions. candidates=${confirmedTwoSnapshotCandidates.length}, totalTracked=${totalTrackedNonDeleted}, liveSnap1=${snap1.liveClientByUuid.size}, liveSnap2=${snap2.liveClientByUuid.size}.`
+      );
+      await recordDeduplicatedSyncAuditLog({
+        dbClient,
+        userId: null,
+        action: 'panel_deletion_circuit_breaker_triggered',
+        targetType: 'xui_panel',
+        targetId: currentPanelIdentity,
+        dedupeWindowHours: 1,
+        details: {
+          panel_identity: currentPanelIdentity,
+          trigger_reason: circuitBreakerReason,
+          candidate_count: confirmedTwoSnapshotCandidates.length,
+          total_tracked_non_deleted: totalTrackedNonDeleted,
+          live_clients_snap1: snap1.liveClientByUuid.size,
+          live_clients_snap2: snap2.liveClientByUuid.size,
+          max_deletes_per_cycle: maxDeletesPerCycle,
+          max_missing_ratio: maxMissingRatio,
+          source: 'background_sync',
+        },
+      });
+      manualReviewCount += 1;
+      skippedCount += confirmedTwoSnapshotCandidates.length;
+      for (const c of confirmedTwoSnapshotCandidates) {
+        details.push({
+          clientUuid: c.clientUuid,
+          outcome: 'skipped',
+          reason: `circuit_breaker:${circuitBreakerReason}`,
+        });
+      }
+      return {
+        synced: false,
+        circuitBreakerTriggered: true,
+        circuitBreakerReason,
+        panelRequestCount,
+        deletedCount: 0,
+        restoredCount,
+        skippedCount,
+        manualReviewCount,
+        reconciliationFlaggedCount: 0,
+        details,
+      };
+    }
+
+    // Step 4: For each surviving candidate, renew the distributed lease, verify lease ownership
+    // immediately before the deletion-marker RPC, and apply the mass-absence circuit breaker
+    // to every final locked full-panel snapshot.
+    // Total panel requests: 2 + K (Snapshot 1 + Snapshot 2 + 1 bounded locked panel-wide read per candidate)
+    for (let i = 0; i < confirmedTwoSnapshotCandidates.length; i++) {
+      const group = confirmedTwoSnapshotCandidates[i];
+
+      // Renew the cross-instance sweep lease before processing each deletion candidate so a sweep
+      // that takes > 180s cannot expire while active, and abort the entire remaining sweep if
+      // the lease was expired or lost to another worker.
+      if (leaseOwnerId) {
+        const renewRes = await renewCrossInstanceDeletionSyncLease({
+          dbClient,
+          ownerId: leaseOwnerId,
+          expectedLeaseVersion: currentLeaseVersion,
+          leaseTtlMs: effectiveLeaseTtlMs,
+        });
+        if (!renewRes.renewed) {
+          console.error(
+            `[3X-UI Sync] Distributed sweep lease renewal failed before candidate ${group.clientUuid} (${renewRes.reason || 'lease_lost'}). Aborting entire remaining sweep.`
+          );
+          for (let j = i; j < confirmedTwoSnapshotCandidates.length; j++) {
+            const rem = confirmedTwoSnapshotCandidates[j];
+            skippedCount += 1;
+            details.push({
+              clientUuid: rem.clientUuid,
+              outcome: 'skipped',
+              reason: `distributed_lease_lost:${renewRes.reason || 'renew_failed'}`,
+            });
+          }
+          // Null out leaseOwnerId so the finally block does not attempt to release a lost lease
+          leaseOwnerId = null;
+          currentLeaseVersion = null;
+          return {
+            synced: false,
+            leaseLostMidSweep: true,
+            leaseLostReason: renewRes.reason || 'renew_failed',
+            panelRequestCount,
+            deletedCount,
+            restoredCount,
+            skippedCount,
+            manualReviewCount,
+            reconciliationFlaggedCount,
+            details,
+          };
+        }
+        currentLeaseVersion = renewRes.leaseVersion ?? currentLeaseVersion;
+      }
+
+      const assertDistributedLeaseStillHeld = leaseOwnerId
+        ? async (): Promise<void> => {
+            const checkRes = await verifyCrossInstanceDeletionSyncLeaseOwnership({
+              dbClient,
+              ownerId: leaseOwnerId!,
+              expectedLeaseVersion: currentLeaseVersion,
+              minRemainingBudgetMs: 1000,
+            });
+            if (!checkRes.valid) {
+              const leaseErr: any = new Error(
+                `distributed_lease_lost_before_rpc:${checkRes.reason || 'invalid'}`
+              );
+              leaseErr.code = 'DISTRIBUTED_LEASE_LOST';
+              leaseErr.distributedLeaseLost = true;
+              leaseErr.nonUncertainDeletionError = true;
+              throw leaseErr;
+            }
+          }
+        : undefined;
+
       const verifyRes = await verifyAndMarkClientDeletedIfConfirmed({
         clientUuid: group.clientUuid,
         inboundId: group.inboundId,
@@ -5946,13 +8401,80 @@ export const syncDeleted3XUiClients = async (
         dbClient,
         currentPanelIdentity,
         configuredServers,
-        fetchUncachedInbound: readInbound,
-        fetchUncachedInboundsList: readList,
-        reReadDelayMs: options?.reReadDelayMs,
+        fetchUncachedInboundsList: countedReadList,
+        preVerifiedOutsideSnapshots: {
+          snapshot1: snap1,
+          snapshot2: snap2,
+        },
+        massAbsenceSafetyContext: {
+          trackedNonDeletedUuids,
+          maxDeletesPerCycle,
+          maxMissingRatio,
+        },
+        assertDistributedLeaseStillHeld,
+        reReadDelayMs,
         lockedReadTimeoutMs: options?.lockedReadTimeoutMs,
+        lockLeaseBudgetRatio: options?.lockLeaseBudgetRatio,
         releaseRetryBaseDelayMs: options?.releaseRetryBaseDelayMs,
         nowMs,
       });
+
+      if (verifyRes.distributedLeaseLost) {
+        console.error(
+          `[3X-UI Sync] Distributed sweep lease lost during candidate ${group.clientUuid} (${verifyRes.reason}). Aborting entire remaining sweep.`
+        );
+        for (let j = i; j < confirmedTwoSnapshotCandidates.length; j++) {
+          const rem = confirmedTwoSnapshotCandidates[j];
+          skippedCount += 1;
+          details.push({
+            clientUuid: rem.clientUuid,
+            outcome: 'skipped',
+            reason: verifyRes.reason,
+          });
+        }
+        leaseOwnerId = null;
+        currentLeaseVersion = null;
+        return {
+          synced: false,
+          leaseLostMidSweep: true,
+          leaseLostReason: verifyRes.reason,
+          panelRequestCount,
+          deletedCount,
+          restoredCount,
+          skippedCount,
+          manualReviewCount,
+          reconciliationFlaggedCount,
+          details,
+        };
+      }
+
+      if (verifyRes.circuitBreakerTriggered) {
+        console.error(
+          `[3X-UI Sync] Final locked snapshot circuit breaker triggered during candidate ${group.clientUuid} (${verifyRes.circuitBreakerReason || verifyRes.reason}). Aborting entire remaining sweep.`
+        );
+        manualReviewCount += 1;
+        for (let j = i; j < confirmedTwoSnapshotCandidates.length; j++) {
+          const rem = confirmedTwoSnapshotCandidates[j];
+          skippedCount += 1;
+          details.push({
+            clientUuid: rem.clientUuid,
+            outcome: 'skipped',
+            reason: `circuit_breaker:${verifyRes.circuitBreakerReason || verifyRes.reason}`,
+          });
+        }
+        return {
+          synced: false,
+          circuitBreakerTriggered: true,
+          circuitBreakerReason: verifyRes.circuitBreakerReason || verifyRes.reason,
+          panelRequestCount,
+          deletedCount,
+          restoredCount,
+          skippedCount,
+          manualReviewCount,
+          reconciliationFlaggedCount,
+          details,
+        };
+      }
 
       if (verifyRes.confirmedDeleted) {
         if (verifyRes.applied) deletedCount += 1;
@@ -5980,12 +8502,24 @@ export const syncDeleted3XUiClients = async (
       }
     }
 
+    cycleCompletedSuccessfully = true;
+    lastPanelDeletionSyncAt = Date.now();
+    finalSummary = {
+      deletedCount,
+      restoredCount,
+      skippedCount,
+      manualReviewCount,
+      reconciliationFlaggedCount,
+      panelRequestCount,
+    };
+
     console.log(
-      `[3X-UI Sync] Completed. confirmedDeleted=${deletedCount}, restoredActive=${restoredCount}, skipped=${skippedCount}, manualReview=${manualReviewCount}, reconciliationFlagged=${reconciliationFlaggedCount}.`
+      `[3X-UI Sync] Completed (${panelRequestCount} panel requests). confirmedDeleted=${deletedCount}, restoredActive=${restoredCount}, skipped=${skippedCount}, manualReview=${manualReviewCount}, reconciliationFlagged=${reconciliationFlaggedCount}.`
     );
 
     return {
       synced: true,
+      panelRequestCount,
       deletedCount,
       restoredCount,
       skippedCount,
@@ -5997,12 +8531,25 @@ export const syncDeleted3XUiClients = async (
     console.error('[3X-UI Sync] Unexpected error during synchronization cycle:', err?.message || err);
     return {
       synced: false,
+      panelRequestCount,
       deletedCount: 0,
       restoredCount: 0,
       skippedCount: 0,
       manualReviewCount: 0,
       reconciliationFlaggedCount: 0,
     };
+  } finally {
+    if (leaseOwnerId) {
+      await releaseCrossInstanceDeletionSyncLease({
+        dbClient,
+        ownerId: leaseOwnerId,
+        expectedLeaseVersion: currentLeaseVersion,
+        completed: cycleCompletedSuccessfully,
+        nowMs: Date.now(),
+        summary: finalSummary,
+      }).catch(() => {});
+    }
+    isPanelDeletionSyncInProgress = false;
   }
 };
 
@@ -6085,70 +8632,105 @@ export async function withClientMutationLock<T>(
 
   const operationKey = `client:${cleanUuid}`;
   const operationType = params.operationType || 'client_lock';
-  const requireDurable =
-    params.requireDurableLock !== undefined
-      ? params.requireDurableLock
-      : isAutoActivateRenewalsFlagEnabled() || isAutoActivateNewOrdersFlagEnabled();
+  const requireDurable = params.requireDurableLock ?? true;
 
-  const lockRes = await acquireDurableProvisioningOperationLock({
-    dbClient: params.dbClient,
-    operationKey,
-    operationType,
-    targetId: params.targetId,
-    clientUuid: cleanUuid,
-    leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
-    metadata: params.metadata || { targetId: params.targetId, clientUuid: cleanUuid },
-    requireDurableLock: requireDurable,
-    allowUncertainRecovery: params.allowUncertainRecovery ?? false,
+  // Layer 1: Same-process FIFO serialization per client UUID so concurrent in-process
+  // operations (such as rapid duplicate traffic resets) cannot race past cooldown/lock checks.
+  const previousClientTail = clientProcessQueues.get(cleanUuid) || Promise.resolve();
+  let releaseLocalClientQueue!: () => void;
+  const localClientGate = new Promise<void>((resolve) => {
+    releaseLocalClientQueue = resolve;
   });
+  const nextClientTail = previousClientTail.then(() => localClientGate);
+  clientProcessQueues.set(cleanUuid, nextClientTail);
 
-  if (!lockRes.acquired) {
-    const conflictErr: any = new Error(
-      lockRes.previousStatus === 'uncertain'
-        ? `VPN client '${cleanUuid}' has an uncertain prior external provisioning state; automatic modification is blocked until admin reconciliation.`
-        : lockRes.error || `Another operation (${lockRes.previousOperationType || 'active'}) is currently modifying VPN client '${cleanUuid}'.`
-    );
-    conflictErr.statusCode = 409;
-    conflictErr.code = lockRes.previousStatus === 'uncertain' ? 'CLIENT_LOCK_UNCERTAIN' : 'CLIENT_LOCK_BUSY';
-    throw conflictErr;
-  }
+  await previousClientTail;
 
-  const assertClientLockStillHeld = async (): Promise<void> => {
-    if (!lockRes.tableAvailable) return;
-    const renewed = await renewDurableProvisioningOperationLock({
+  try {
+    const lockRes = await acquireDurableProvisioningOperationLock({
       dbClient: params.dbClient,
       operationKey,
-      lockOwnerId: lockRes.lockOwnerId,
+      operationType,
+      targetId: params.targetId,
+      clientUuid: cleanUuid,
       leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+      metadata: params.metadata || { targetId: params.targetId, clientUuid: cleanUuid },
+      requireDurableLock: requireDurable,
+      allowUncertainRecovery: params.allowUncertainRecovery ?? false,
     });
-    if (!renewed) {
-      const fenceErr: any = new Error(
-        `Lost durable client mutation lock '${operationKey}' before 3X-UI mutation; aborting to prevent concurrent client corruption.`
-      );
-      fenceErr.statusCode = 409;
-      throw fenceErr;
-    }
-  };
 
-  let outcome: 'completed' | 'failed' | 'uncertain' = 'completed';
-  let errMsg: string | null = null;
-  try {
-    return await fn(assertClientLockStillHeld);
-  } catch (err: any) {
-    outcome = err?.xuiUncertain === true || err?.mutationUncertain === true ? 'uncertain' : 'failed';
-    errMsg = err?.message || String(err);
-    throw err;
-  } finally {
-    if (lockRes.tableAvailable) {
-      await finalizeDurableProvisioningOperationLock({
+    if (!lockRes.acquired) {
+      if (
+        lockRes.failureKind === 'permission_error' ||
+        lockRes.failureKind === 'rpc_error' ||
+        lockRes.failureKind === 'unavailable'
+      ) {
+        const infraErr: any = buildDurableLockFailureError(lockRes, `VPN client '${cleanUuid}'`);
+        infraErr.beforeExternalWrite = true;
+        infraErr.xuiUncertain = false;
+        throw infraErr;
+      }
+      const conflictErr: any = new Error(
+        lockRes.previousStatus === 'uncertain'
+          ? `VPN client '${cleanUuid}' has an uncertain prior external provisioning state; automatic modification is blocked until admin reconciliation.`
+          : lockRes.error || `Another operation (${lockRes.previousOperationType || 'active'}) is currently modifying VPN client '${cleanUuid}'.`
+      );
+      conflictErr.statusCode = 409;
+      conflictErr.code = lockRes.previousStatus === 'uncertain' ? 'CLIENT_LOCK_UNCERTAIN' : 'CLIENT_LOCK_BUSY';
+      conflictErr.beforeExternalWrite = true;
+      conflictErr.xuiUncertain = false;
+      throw conflictErr;
+    }
+
+    const assertClientLockStillHeld = async (): Promise<void> => {
+      if (!lockRes.tableAvailable) return;
+      const renewed = await renewDurableProvisioningOperationLock({
         dbClient: params.dbClient,
         operationKey,
         lockOwnerId: lockRes.lockOwnerId,
-        status: outcome,
-        clientUuid: cleanUuid,
-        errorMessage: errMsg,
-        retryBaseDelayMs: params.releaseRetryBaseDelayMs,
+        leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
       });
+      if (!renewed) {
+        const fenceErr: any = new Error(
+          `Lost durable client mutation lock '${operationKey}' before 3X-UI mutation; aborting to prevent concurrent client corruption.`
+        );
+        fenceErr.statusCode = 409;
+        fenceErr.code = 'CLIENT_LOCK_LOST';
+        fenceErr.beforeExternalWrite = true;
+        fenceErr.xuiUncertain = false;
+        throw fenceErr;
+      }
+    };
+
+    let outcome: 'completed' | 'failed' | 'uncertain' = 'completed';
+    let errMsg: string | null = null;
+    try {
+      return await fn(assertClientLockStillHeld);
+    } catch (err: any) {
+      if (err?.beforeExternalWrite === true || err?.xuiUncertain === false) {
+        outcome = 'failed';
+      } else {
+        outcome = err?.xuiUncertain === true || err?.mutationUncertain === true ? 'uncertain' : 'failed';
+      }
+      errMsg = err?.message || String(err);
+      throw err;
+    } finally {
+      if (lockRes.tableAvailable) {
+        await finalizeDurableProvisioningOperationLock({
+          dbClient: params.dbClient,
+          operationKey,
+          lockOwnerId: lockRes.lockOwnerId,
+          status: outcome,
+          clientUuid: cleanUuid,
+          errorMessage: errMsg,
+          retryBaseDelayMs: params.releaseRetryBaseDelayMs,
+        });
+      }
+    }
+  } finally {
+    releaseLocalClientQueue();
+    if (clientProcessQueues.get(cleanUuid) === nextClientTail) {
+      clientProcessQueues.delete(cleanUuid);
     }
   }
 }
@@ -6159,11 +8741,37 @@ export async function withClientMutationLock<T>(
  * Coordinated under `client:<uuid>` durable lock and blocked if an unresolved
  * provisional/uncertain renewal grant exists for the client.
  */
+export interface ResetClientTrafficOptions {
+  dbClient?: any;
+  requestApiFn?: typeof requestApi;
+  getInboundsFn?: typeof getInbounds;
+  /**
+   * Optional verification callback invoked AFTER acquiring `client:<uuid>` lock,
+   * checking unresolved renewal grants, and acquiring `inbound:<id>` lock, and
+   * BEFORE rechecking BOTH lock leases immediately prior to dispatching the 3X-UI reset POST.
+   * Bounded within remaining lock lease time. Any rejection releases locks cleanly
+   * without marking them 'uncertain'.
+   */
+  beforeResetUnderLocks?: (ctx: {
+    inboundId: number | null;
+    clientUuid: string;
+    email: string;
+    remainingLeaseMs: number;
+  }) => Promise<{ email?: string; inboundId?: number } | void>;
+  /**
+   * Optional accounting callback invoked AFTER a successful 3X-UI reset while STILL
+   * holding the `client:<uuid>` lock (e.g., to record cooldown logs concurrency-safely).
+   */
+  afterResetUnderClientLock?: () => Promise<void>;
+  maxLockedVerificationMs?: number;
+  requireDurableLock?: boolean;
+}
+
 export const resetClientTraffic = async (
   email: string,
   inboundId?: number,
   clientUuid?: string,
-  options?: { dbClient?: any }
+  options?: ResetClientTrafficOptions
 ): Promise<{ success: boolean; message: string }> => {
   console.log(`[xuiService] Resetting traffic in 3X-UI for client - Email: '${email}', Inbound: ${inboundId}, UUID: '${clientUuid}'`);
 
@@ -6172,8 +8780,11 @@ export const resetClientTraffic = async (
   }
 
   const dbClient = options?.dbClient || supabaseAdmin;
+  const requestApiCall = options?.requestApiFn || requestApi;
+  const getInboundsCall = options?.getInboundsFn || getInbounds;
   let resolvedInboundId = inboundId && Number(inboundId) > 0 ? Number(inboundId) : null;
   let resolvedUuid = String(clientUuid || '').trim();
+  let resolvedEmail = String(email || '').trim();
 
   if ((!resolvedInboundId || !resolvedUuid) && (clientUuid || email)) {
     try {
@@ -6201,33 +8812,38 @@ export const resetClientTraffic = async (
     }
   }
 
-  const endpointsToTry: string[] = [];
-  if (email) {
-    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(email)}`);
-    if (resolvedInboundId && resolvedInboundId > 0) {
-      endpointsToTry.push(`/panel/api/inbounds/${resolvedInboundId}/resetClientTraffic/${encodeURIComponent(email)}`);
-      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${resolvedInboundId}/${encodeURIComponent(email)}`);
+  const buildEndpointsToTry = (targetEmail: string, targetInboundId: number | null, targetUuid: string): string[] => {
+    const eps: string[] = [];
+    if (targetEmail) {
+      eps.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(targetEmail)}`);
+      if (targetInboundId && targetInboundId > 0) {
+        eps.push(`/panel/api/inbounds/${targetInboundId}/resetClientTraffic/${encodeURIComponent(targetEmail)}`);
+        eps.push(`/panel/api/inbounds/resetClientTraffic/${targetInboundId}/${encodeURIComponent(targetEmail)}`);
+      }
+      eps.push(`/panel/api/inbounds/resetClientTraffic/${encodeURIComponent(targetEmail)}`);
     }
-    endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${encodeURIComponent(email)}`);
-  }
 
-  if (resolvedUuid) {
-    if (resolvedInboundId && resolvedInboundId > 0) {
-      endpointsToTry.push(`/panel/api/inbounds/${resolvedInboundId}/resetClientTraffic/${encodeURIComponent(resolvedUuid)}`);
-      endpointsToTry.push(`/panel/api/inbounds/resetClientTraffic/${resolvedInboundId}/${encodeURIComponent(resolvedUuid)}`);
+    if (targetUuid) {
+      if (targetInboundId && targetInboundId > 0) {
+        eps.push(`/panel/api/inbounds/${targetInboundId}/resetClientTraffic/${encodeURIComponent(targetUuid)}`);
+        eps.push(`/panel/api/inbounds/resetClientTraffic/${targetInboundId}/${encodeURIComponent(targetUuid)}`);
+      }
+      eps.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(targetUuid)}`);
     }
-    endpointsToTry.push(`/panel/api/clients/resetTraffic/${encodeURIComponent(resolvedUuid)}`);
-  }
+    return eps;
+  };
 
   const executeReset = async (): Promise<{ success: boolean; message: string }> => {
+    const endpointsToTry = buildEndpointsToTry(resolvedEmail, resolvedInboundId, resolvedUuid);
     let resetSuccess = false;
     let lastError: any = null;
     let responseMsg = '';
+    let hadUncertainTransportFailure = false;
 
     for (const ep of endpointsToTry) {
       try {
         console.log(`[xuiService] Invoking 3X-UI reset endpoint: ${ep}`);
-        const res: any = await requestApi(ep, 'POST');
+        const res: any = await requestApiCall(ep, 'POST');
         resetSuccess = true;
         responseMsg = res?.msg || 'Traffic has been reset.';
         console.log(`[xuiService] Successfully reset traffic via ${ep}:`, res);
@@ -6235,16 +8851,37 @@ export const resetClientTraffic = async (
       } catch (err: any) {
         console.warn(`[xuiService] Reset endpoint ${ep} failed:`, err?.response?.data || err.message);
         lastError = err;
+        const msgLower = String(err?.message || '').toLowerCase();
+        const codeUpper = String(err?.code || '').toUpperCase();
+        if (
+          msgLower.includes('timeout') ||
+          msgLower.includes('etimedout') ||
+          msgLower.includes('econnreset') ||
+          msgLower.includes('socket hang up') ||
+          msgLower.includes('network error') ||
+          codeUpper === 'ETIMEDOUT' ||
+          codeUpper === 'ECONNABORTED' ||
+          codeUpper === 'ECONNRESET'
+        ) {
+          hadUncertainTransportFailure = true;
+        }
       }
     }
 
     if (!resetSuccess) {
-      throw new Error(`Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`);
+      const failErr: any = new Error(
+        `Failed to reset traffic in 3X-UI: ${lastError?.message || 'Server returned an error'}`
+      );
+      if (hadUncertainTransportFailure) {
+        failErr.xuiUncertain = true;
+        failErr.mutationUncertain = true;
+      }
+      throw failErr;
     }
 
     invalidateInboundCache(resolvedInboundId || inboundId || null);
     try {
-      await getInbounds(true);
+      await getInboundsCall(true);
     } catch (refreshErr: any) {
       console.warn('[xuiService] Inbounds cache refresh warning after reset:', refreshErr?.message || refreshErr);
     }
@@ -6252,28 +8889,152 @@ export const resetClientTraffic = async (
     return { success: true, message: responseMsg || 'Traffic counter successfully reset in 3X-UI' };
   };
 
-  const runUnderInboundLock = async (): Promise<{ success: boolean; message: string }> => {
-    if (resolvedUuid) {
-      await assertNoUnresolvedClientRenewalGrant({
-        dbClient,
-        clientUuid: resolvedUuid,
-        operationDescription: 'resetting client traffic',
-      });
+  const runBoundedPreResetVerification = async (
+    lockAcquiredAtMs: number
+  ): Promise<void> => {
+    if (!options?.beforeResetUnderLocks) return;
+
+    const leaseWindowMs = INBOUND_LOCK_LEASE_SECONDS * 1000;
+    const elapsedMs = Math.max(0, Date.now() - lockAcquiredAtMs);
+    const safeLeaseBudgetMs = Math.max(1000, Math.floor(leaseWindowMs * 0.5) - elapsedMs);
+    const maxBudgetMs = Math.min(options.maxLockedVerificationMs ?? 12000, safeLeaseBudgetMs);
+
+    if (maxBudgetMs <= 0) {
+      const leaseTimeoutErr: any = new Error(
+        'Traffic reset verification exceeded safe lock lease window before contacting 3X-UI; aborted safely.'
+      );
+      leaseTimeoutErr.status = 409;
+      leaseTimeoutErr.statusCode = 409;
+      leaseTimeoutErr.code = 'LOCK_VERIFICATION_LEASE_EXHAUSTED';
+      leaseTimeoutErr.beforeExternalWrite = true;
+      leaseTimeoutErr.xuiUncertain = false;
+      throw leaseTimeoutErr;
     }
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const verificationRes = await Promise.race([
+        options.beforeResetUnderLocks({
+          inboundId: resolvedInboundId,
+          clientUuid: resolvedUuid,
+          email: resolvedEmail,
+          remainingLeaseMs: maxBudgetMs,
+        }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            const timeoutErr: any = new Error(
+              'Traffic reset eligibility verification timed out before 3X-UI mutation; aborted safely.'
+            );
+            timeoutErr.status = 503;
+            timeoutErr.statusCode = 503;
+            timeoutErr.code = 'LOCKED_VERIFICATION_TIMEOUT';
+            timeoutErr.beforeExternalWrite = true;
+            timeoutErr.xuiUncertain = false;
+            reject(timeoutErr);
+          }, maxBudgetMs);
+        }),
+      ]);
+
+      if (verificationRes && typeof verificationRes === 'object') {
+        if (verificationRes.email && String(verificationRes.email).trim()) {
+          resolvedEmail = String(verificationRes.email).trim();
+        }
+        if (
+          verificationRes.inboundId &&
+          Number(verificationRes.inboundId) > 0 &&
+          resolvedInboundId &&
+          Number(verificationRes.inboundId) !== resolvedInboundId
+        ) {
+          const movedErr: any = new Error(
+            'VPN configuration inbound changed during verification; please retry.'
+          );
+          movedErr.status = 409;
+          movedErr.statusCode = 409;
+          movedErr.code = 'INBOUND_CHANGED_DURING_RESET';
+          movedErr.beforeExternalWrite = true;
+          movedErr.xuiUncertain = false;
+          throw movedErr;
+        }
+      }
+    } catch (verifyErr: any) {
+      if (verifyErr && typeof verifyErr === 'object') {
+        verifyErr.beforeExternalWrite = true;
+        verifyErr.xuiUncertain = false;
+      }
+      throw verifyErr;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  };
+
+  const runUnderInboundLock = async (
+    assertClientLockStillHeld?: () => Promise<void>
+  ): Promise<{ success: boolean; message: string }> => {
+    if (resolvedUuid) {
+      try {
+        await assertNoUnresolvedClientRenewalGrant({
+          dbClient,
+          clientUuid: resolvedUuid,
+          operationDescription: 'resetting client traffic',
+        });
+      } catch (grantErr: any) {
+        if (grantErr && typeof grantErr === 'object') {
+          grantErr.beforeExternalWrite = true;
+          grantErr.xuiUncertain = false;
+        }
+        throw grantErr;
+      }
+    }
+
     if (resolvedInboundId && resolvedInboundId > 0) {
       return await withInboundWriteLock(
         {
           dbClient,
           inboundId: resolvedInboundId,
-          targetId: `reset_traffic:${resolvedUuid || email}`,
+          targetId: `reset_traffic:${resolvedUuid || resolvedEmail}`,
           clientUuid: resolvedUuid || null,
-          requireDurableLock: isAutoActivateNewOrdersFlagEnabled() || isAutoActivateRenewalsFlagEnabled(),
+          requireDurableLock:
+            options?.requireDurableLock ??
+            (isAutoActivateNewOrdersFlagEnabled() || isAutoActivateRenewalsFlagEnabled()),
         },
         async (assertInboundLockStillHeld) => {
+          const inboundLockAcquiredAtMs = Date.now();
           await assertInboundLockStillHeld();
+
+          // Run authoritative eligibility + fresh panel + cooldown recheck inside both locks
+          await runBoundedPreResetVerification(inboundLockAcquiredAtMs);
+
+          // Recheck BOTH lock leases AFTER all fresh DB/panel reads and IMMEDIATELY BEFORE 3X-UI POST
+          try {
+            if (assertClientLockStillHeld) {
+              await assertClientLockStillHeld();
+            }
+            await assertInboundLockStillHeld();
+          } catch (leaseErr: any) {
+            if (leaseErr && typeof leaseErr === 'object') {
+              leaseErr.beforeExternalWrite = true;
+              leaseErr.xuiUncertain = false;
+            }
+            throw leaseErr;
+          }
+
           return executeReset();
         }
       );
+    }
+
+    const noInboundAcquiredAtMs = Date.now();
+    await runBoundedPreResetVerification(noInboundAcquiredAtMs);
+    if (assertClientLockStillHeld) {
+      try {
+        await assertClientLockStillHeld();
+      } catch (leaseErr: any) {
+        if (leaseErr && typeof leaseErr === 'object') {
+          leaseErr.beforeExternalWrite = true;
+          leaseErr.xuiUncertain = false;
+        }
+        throw leaseErr;
+      }
     }
     return executeReset();
   };
@@ -6285,16 +9046,34 @@ export const resetClientTraffic = async (
         clientUuid: resolvedUuid,
         operationType: 'traffic_reset',
         targetId: `reset_traffic:${resolvedUuid}`,
-        requireDurableLock: isAutoActivateRenewalsFlagEnabled(),
+        requireDurableLock: options?.requireDurableLock ?? isAutoActivateRenewalsFlagEnabled(),
       },
       async (assertClientLockStillHeld) => {
         await assertClientLockStillHeld();
-        return runUnderInboundLock();
+        const resetResult = await runUnderInboundLock(assertClientLockStillHeld);
+        if (options?.afterResetUnderClientLock) {
+          try {
+            await options.afterResetUnderClientLock();
+          } catch (acctErr: any) {
+            // Never mark the client lock 'uncertain' after a confirmed successful reset;
+            // accounting failures are logged cleanly.
+            console.warn('[xuiService] Post-reset accounting warning:', acctErr?.message || acctErr);
+          }
+        }
+        return resetResult;
       }
     );
   }
 
-  return runUnderInboundLock();
+  const resetResult = await runUnderInboundLock();
+  if (options?.afterResetUnderClientLock) {
+    try {
+      await options.afterResetUnderClientLock();
+    } catch (acctErr: any) {
+      console.warn('[xuiService] Post-reset accounting warning:', acctErr?.message || acctErr);
+    }
+  }
+  return resetResult;
 };
 
 // ============================================================================
@@ -7328,24 +10107,35 @@ export async function provisionProvisionalRenewal(
               delete updatePayload.lastTrafficResetTime;
 
               // Verify all 3 locks are still held right before dispatching external 3X-UI mutation
-              await assertInboundLockStillHeld();
-              await assertClientLockStillHeld();
-              const renewStillHeld = await renewDurableProvisioningOperationLock({
-                dbClient,
-                operationKey: renewLockKey,
-                lockOwnerId: renewLockRes.lockOwnerId,
-              });
-              if (!renewStillHeld) {
-                const fenceErr: any = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
-                fenceErr.statusCode = 409;
-                throw fenceErr;
-              }
+              // and inside requestApi after authentication / re-authentication.
+              const verifyAllLocksBeforeExternalMutation = async (): Promise<void> => {
+                await assertInboundLockStillHeld();
+                await assertClientLockStillHeld();
+                const renewStillHeld = await renewDurableProvisioningOperationLock({
+                  dbClient,
+                  operationKey: renewLockKey,
+                  lockOwnerId: renewLockRes.lockOwnerId,
+                });
+                if (!renewStillHeld) {
+                  const fenceErr: any = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
+                  fenceErr.statusCode = 409;
+                  fenceErr.code = 'RENEW_LOCK_LOST';
+                  fenceErr.beforeExternalWrite = true;
+                  fenceErr.xuiUncertain = false;
+                  throw fenceErr;
+                }
+              };
+
+              await verifyAllLocksBeforeExternalMutation();
 
               xuiWriteAttempted = true;
               const updateRes = await requestApiCall<any>(
                 `/panel/api/inbounds/update/${inboundId}`,
                 'POST',
-                updatePayload
+                updatePayload,
+                {
+                  beforeSend: verifyAllLocksBeforeExternalMutation,
+                }
               );
               if (updateRes && updateRes.success === false) {
                 throw new Error(updateRes.msg || updateRes.message || '3X-UI panel rejected renewal inbound update.');
@@ -7391,7 +10181,12 @@ export async function provisionProvisionalRenewal(
           );
         } catch (xuiErr: any) {
           const errText = xuiErr?.message || String(xuiErr);
-          const isUncertain = xuiWriteAttempted && !xuiWriteConfirmed;
+          const isUncertain = Boolean(
+            xuiWriteAttempted &&
+            !xuiWriteConfirmed &&
+            xuiErr?.beforeExternalWrite !== true &&
+            xuiErr?.xuiUncertain !== false
+          );
           renewLockOutcome = isUncertain ? 'uncertain' : 'failed';
           renewLockError = errText;
 
@@ -7631,6 +10426,8 @@ export interface ConfirmProvisionalRenewalOptions {
   dbClient?: any;
   getInboundsFn?: typeof getInbounds;
   heldRenewLockOwnerId?: string;
+  heldRenewLockTableAvailable?: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -7708,7 +10505,7 @@ export async function confirmProvisionalRenewal(
       allowUncertainRecovery: true,
       metadata: { renewRequestId: cleanRequestId, action: 'confirm_provisional_renewal' },
     },
-    async () => {
+    async (assertClientLockStillHeld) => {
       // Verify live 3X-UI inbound and client reflect the provisionally granted entitlement
       const liveInbounds = await getInboundsCall(true);
       let liveInbound: any = null;
@@ -7760,6 +10557,31 @@ export async function confirmProvisionalRenewal(
           );
           conflictErr.statusCode = 409;
           throw conflictErr;
+        }
+      }
+
+      // Verify request deadline + client & renewal lock ownership right before DB confirmation
+      assertRequestNotTimedOutBeforeExternalMutation(
+        options?.signal,
+        `provisional renewal confirmation for request ${cleanRequestId}`
+      );
+      await assertClientLockStillHeld();
+      if (options?.heldRenewLockOwnerId && options?.heldRenewLockTableAvailable !== false) {
+        const renewLockValid = await renewDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: `renew:${cleanRequestId}`,
+          lockOwnerId: options.heldRenewLockOwnerId,
+          leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+        });
+        if (!renewLockValid) {
+          const fenceErr: any = new Error(
+            `Lost durable renewal lock 'renew:${cleanRequestId}' before DB confirmation; refusing stale write.`
+          );
+          fenceErr.statusCode = 409;
+          fenceErr.code = 'RENEW_LOCK_LOST';
+          fenceErr.beforeExternalWrite = true;
+          fenceErr.xuiUncertain = false;
+          throw fenceErr;
         }
       }
 
@@ -7900,6 +10722,9 @@ export interface RevokeProvisionalRenewalOptions {
   requestApiFn?: typeof requestApi;
   getInboundsFn?: typeof getInbounds;
   nowMs?: number;
+  heldRenewLockOwnerId?: string;
+  heldRenewLockTableAvailable?: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -8049,8 +10874,46 @@ export async function revokeProvisionalRenewal(
         throw conflictErr;
       }
 
+      const assertRenewLockStillHeld = async (
+        stage: 'before_external_write' | 'before_db_finalization'
+      ): Promise<void> => {
+        if (!options?.heldRenewLockOwnerId) return;
+        if (options?.heldRenewLockTableAvailable === false) {
+          const missingErr: any = new Error(
+            `Missing verified durable renewal lock 'renew:${cleanRequestId}' (${stage}); refusing to proceed without required lock.`
+          );
+          missingErr.statusCode = 409;
+          missingErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'RENEW_LOCK_MISSING';
+          missingErr.beforeExternalWrite = stage === 'before_external_write';
+          missingErr.xuiUncertain = stage === 'before_db_finalization';
+          missingErr.markLockUncertain = stage === 'before_db_finalization';
+          throw missingErr;
+        }
+        const renewed = await renewDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: `renew:${cleanRequestId}`,
+          lockOwnerId: options.heldRenewLockOwnerId,
+          leaseSeconds: DEFAULT_LOCK_LEASE_SECONDS,
+        });
+        if (!renewed) {
+          const fenceErr: any = new Error(
+            stage === 'before_db_finalization'
+              ? `Lost durable renewal lock 'renew:${cleanRequestId}' after 3X-UI rollback; refusing stale DB finalization. Manual reconciliation required.`
+              : `Lost durable renewal lock 'renew:${cleanRequestId}' before 3X-UI rollback; aborting before external mutation.`
+          );
+          fenceErr.statusCode = 409;
+          fenceErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'RENEW_LOCK_LOST';
+          fenceErr.beforeExternalWrite = stage === 'before_external_write';
+          fenceErr.xuiUncertain = stage === 'before_db_finalization';
+          fenceErr.markLockUncertain = stage === 'before_db_finalization';
+          throw fenceErr;
+        }
+      };
+
       let restoredEnable = false;
       let restoredStatus = 'active' as 'active' | 'expired' | 'disabled';
+      let xuiWriteAttempted = false;
+      let xuiWriteConfirmed = false;
 
       try {
         await withInboundWriteLock(
@@ -8060,6 +10923,7 @@ export async function revokeProvisionalRenewal(
             targetId: `reject_renew:${cleanRequestId}`,
             clientUuid,
             requireDurableLock: true,
+            allowUncertainRecovery: false,
           },
           async (assertInboundLockStillHeld) => {
             const fetchFreshInbound = async (): Promise<any | null> => {
@@ -8156,6 +11020,10 @@ export async function revokeProvisionalRenewal(
               ? 'expired'
               : 'disabled';
 
+            const preWriteEnable = Boolean(liveClient.enable);
+            const preWriteExpiryMs = Number(liveClient.expiryTime || 0);
+            const preWriteTotalBytes = Number(liveClient.totalGB || 0);
+
             clientsList[cIdx] = {
               ...liveClient,
               id: clientUuid,
@@ -8176,22 +11044,59 @@ export async function revokeProvisionalRenewal(
             delete updatePayload.trafficReset;
             delete updatePayload.lastTrafficResetTime;
 
-            await assertInboundLockStillHeld();
-            await assertClientLockStillHeld();
+            const verifyAllLocksBeforeExternalMutation = async (): Promise<void> => {
+              assertRequestNotTimedOutBeforeExternalMutation(
+                options?.signal,
+                `provisional renewal rollback for request ${cleanRequestId}`
+              );
+              await assertInboundLockStillHeld();
+              await assertClientLockStillHeld();
+              await assertRenewLockStillHeld('before_external_write');
+            };
 
-            const updateRes = await requestApiCall<any>(
-              `/panel/api/inbounds/update/${inboundId}`,
-              'POST',
-              updatePayload
-            );
-            if (updateRes && updateRes.success === false) {
-              throw new Error(updateRes.msg || updateRes.message || '3X-UI rejected renewal rollback update.');
+            await verifyAllLocksBeforeExternalMutation();
+
+            xuiWriteAttempted = true;
+            let updateRes: any = null;
+            let explicitPanelErr: any = null;
+            try {
+              updateRes = await requestApiCall<any>(
+                `/panel/api/inbounds/update/${inboundId}`,
+                'POST',
+                updatePayload,
+                {
+                  beforeSend: verifyAllLocksBeforeExternalMutation,
+                  signal: options?.signal,
+                }
+              );
+            } catch (apiErr: any) {
+              if (apiErr?.xuiExplicitRejection === true || isHttp400Or422Error(apiErr)) {
+                explicitPanelErr = apiErr;
+              } else {
+                throw apiErr;
+              }
             }
 
             // MANDATORY READ-BACK VERIFICATION from live 3X-UI
-            const verifiedInbound = await fetchFreshInbound();
+            // (runs both on success AND on generic success:false rejection, and even if deadline elapsed after dispatch)
+            let verifiedInbound: any = null;
+            let readbackFetchErr: any = null;
+            try {
+              verifiedInbound = await fetchFreshInbound();
+            } catch (rbErr: any) {
+              readbackFetchErr = rbErr;
+            }
             if (!verifiedInbound) {
-              throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal rollback.`);
+              const reconErr: any = new Error(
+                explicitPanelErr || (updateRes && updateRes.success === false)
+                  ? `3X-UI rejected renewal rollback (${explicitPanelErr?.message || updateRes?.msg || 'success:false'}) and read-back verification failed${readbackFetchErr ? `: ${readbackFetchErr?.message || String(readbackFetchErr)}` : ''}.`
+                  : `Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal rollback${readbackFetchErr ? `: ${readbackFetchErr?.message || String(readbackFetchErr)}` : ''}.`
+              );
+              reconErr.statusCode = 409;
+              reconErr.code = 'RECONCILIATION_REQUIRED';
+              reconErr.xuiUncertain = true;
+              reconErr.markLockUncertain = true;
+              throw reconErr;
             }
             let verifiedSettings: any = {};
             try {
@@ -8206,46 +11111,153 @@ export async function revokeProvisionalRenewal(
               (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
             );
 
-            if (
-              !verifiedClient ||
-              Boolean(verifiedClient.enable) !== restoredEnable ||
-              Number(verifiedClient.expiryTime) !== prevExpiryMs ||
-              Number(verifiedClient.totalGB) !== prevTotalBytes
-            ) {
-              throw new Error(
-                `Read-back verification failed after renewal rollback for client ${clientUuid}: expected enable=${restoredEnable}, expiryTime=${prevExpiryMs}, totalGB=${prevTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+            if (!verifiedClient) {
+              const missingErr: any = new Error(
+                `Read-back verification failed after renewal rollback for client ${clientUuid}: client missing from inbound ${inboundId}.`
               );
+              missingErr.statusCode = 409;
+              missingErr.code = 'RECONCILIATION_REQUIRED';
+              missingErr.xuiUncertain = true;
+              missingErr.markLockUncertain = true;
+              throw missingErr;
             }
 
+            const matchesRestoredTarget =
+              Boolean(verifiedClient.enable) === restoredEnable &&
+              Number(verifiedClient.expiryTime) === prevExpiryMs &&
+              Number(verifiedClient.totalGB) === prevTotalBytes;
+
+            if (!matchesRestoredTarget) {
+              const strictlyUnchanged =
+                Boolean(verifiedClient.enable) === preWriteEnable &&
+                Number(verifiedClient.expiryTime || 0) === preWriteExpiryMs &&
+                Number(verifiedClient.totalGB || 0) === preWriteTotalBytes;
+
+              const panelMsg =
+                explicitPanelErr?.message ||
+                (updateRes && updateRes.success === false ? (updateRes.msg || updateRes.message) : null) ||
+                `Read-back verification failed after renewal rollback for client ${clientUuid}: expected enable=${restoredEnable}, expiryTime=${prevExpiryMs}, totalGB=${prevTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`;
+
+              const readbackErr: any = new Error(panelMsg);
+              if (!strictlyUnchanged) {
+                readbackErr.statusCode = 409;
+                readbackErr.code = 'RECONCILIATION_REQUIRED';
+                readbackErr.xuiUncertain = true;
+                readbackErr.markLockUncertain = true;
+              } else {
+                readbackErr.xuiUncertain = false;
+              }
+              throw readbackErr;
+            }
+
+            xuiWriteConfirmed = true;
             invalidateInboundCache(inboundId);
           }
         );
       } catch (err: any) {
-        if (err?.statusCode === 409) {
+        if (err?.statusCode === 409 || err?.beforeExternalWrite === true) {
+          if (
+            err?.xuiUncertain === true &&
+            err?.code !== 'RENEW_LOCK_LOST' &&
+            err?.code !== 'RENEW_LOCK_MISSING'
+          ) {
+            let canSafelyUpdateGrantRows = true;
+            try {
+              await assertClientLockStillHeld();
+              await assertRenewLockStillHeld('before_external_write');
+            } catch {
+              canSafelyUpdateGrantRows = false;
+            }
+            if (canSafelyUpdateGrantRows) {
+              const nowIso = new Date().toISOString();
+              const errText = err?.message || String(err);
+              await dbClient
+                .from('vpn_entitlement_grants')
+                .update({
+                  status: 'uncertain',
+                  last_error: errText,
+                  updated_at: nowIso,
+                })
+                .eq('id', grantRow.id);
+              await dbClient
+                .from('renew_requests')
+                .update({
+                  provisioning_status: 'uncertain',
+                  updated_at: nowIso,
+                })
+                .eq('id', cleanRequestId);
+            }
+          }
           throw err;
         }
         const nowIso = new Date().toISOString();
         const errText = err?.message || String(err);
-        await dbClient
-          .from('vpn_entitlement_grants')
-          .update({
-            status: 'revoke_failed',
-            last_error: errText,
-            updated_at: nowIso,
-          })
-          .eq('id', grantRow.id);
-        await dbClient
-          .from('renew_requests')
-          .update({
-            provisioning_status: 'revoke_failed',
-            updated_at: nowIso,
-          })
-          .eq('id', cleanRequestId);
+        const isUncertainAfterWrite = Boolean(
+          xuiWriteAttempted &&
+          !xuiWriteConfirmed &&
+          err?.beforeExternalWrite !== true &&
+          err?.xuiUncertain !== false
+        );
+
+        let canSafelyUpdateGrantRows = true;
+        try {
+          await assertClientLockStillHeld();
+          await assertRenewLockStillHeld('before_external_write');
+        } catch {
+          canSafelyUpdateGrantRows = false;
+        }
+
+        const targetStatus = isUncertainAfterWrite ? 'uncertain' : 'revoke_failed';
+        if (canSafelyUpdateGrantRows) {
+          await dbClient
+            .from('vpn_entitlement_grants')
+            .update({
+              status: targetStatus,
+              last_error: errText,
+              updated_at: nowIso,
+            })
+            .eq('id', grantRow.id);
+          await dbClient
+            .from('renew_requests')
+            .update({
+              provisioning_status: targetStatus,
+              updated_at: nowIso,
+            })
+            .eq('id', cleanRequestId);
+        }
+
+        if (isUncertainAfterWrite) {
+          const reconErr: any = new Error(
+            `Provisional renewal rollback outcome is uncertain after external 3X-UI dispatch (${errText}). Marked for reconciliation.`
+          );
+          reconErr.statusCode = 409;
+          reconErr.code = 'RECONCILIATION_REQUIRED';
+          reconErr.xuiUncertain = true;
+          reconErr.markLockUncertain = true;
+          throw reconErr;
+        }
 
         throw new Error(
           `Failed to roll back provisional renewal on 3X-UI (retained in recoverable 'revoke_failed' state): ${errText}`
         );
       }
+
+      // Post-write lock fencing: verify BOTH client:<uuid> AND renew:<id> locks are STILL owned
+      // by this worker before restoring DB rows so a stale worker never overwrites another worker's state.
+      try {
+        await assertClientLockStillHeld();
+      } catch (clientLossErr: any) {
+        const reconErr: any = new Error(
+          `Lost durable client lock 'client:${clientUuid}' after 3X-UI renewal rollback; refusing stale DB finalization. Manual reconciliation required.`
+        );
+        reconErr.statusCode = 409;
+        reconErr.code = 'RECONCILIATION_REQUIRED';
+        reconErr.beforeExternalWrite = false;
+        reconErr.xuiUncertain = true;
+        reconErr.markLockUncertain = true;
+        throw reconErr;
+      }
+      await assertRenewLockStillHeld('before_db_finalization');
 
       // Restore vpn_accounts, vpn_configs, and parent orders.expiry_date from pre_renewal_db_snapshot
       const nowIso = new Date().toISOString();

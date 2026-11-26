@@ -18,8 +18,12 @@ import {
   generalApiRateLimit,
   webhookRateLimit,
 } from './src/api/middleware/rateLimitMiddleware.js';
-import { triggerBackgroundSyncIfNeeded } from './src/api/services/xuiService.js';
+import {
+  triggerBackgroundSyncIfNeeded,
+  triggerPanelDeletionSyncIfNeeded,
+} from './src/api/services/xuiService.js';
 import { startTelegramBotPolling } from './src/api/services/telegramService.js';
+import { getBackendApiTimeoutMs } from './src/utils/apiTimeoutRoutes.js';
 
 dotenv.config();
 
@@ -113,18 +117,14 @@ app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
 app.use('/api', (req, res, next) => {
-  const normalizedApiPath = (req.path || '').replace(/\/+$/, '');
-  const isCreateOrderPost = req.method === 'POST' && normalizedApiPath === '/renew/orders';
-  const isCreateRenewPost = req.method === 'POST' && normalizedApiPath === '/renew/request';
-  const isLongRunning =
-    isCreateOrderPost ||
-    isCreateRenewPost ||
-    req.path.includes('claim-trial') ||
-    req.path.includes('approve') ||
-    req.path.includes('telegram');
-  const timeoutMs = isLongRunning ? 70000 : 25000;
+  const timeoutMs = getBackendApiTimeoutMs(req.method, req.path);
+  const timeoutController = new AbortController();
+  (req as any).timeoutSignal = timeoutController.signal;
 
   const timer = setTimeout(() => {
+    if (!timeoutController.signal.aborted) {
+      timeoutController.abort(new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+    }
     if (!res.headersSent) {
       console.error(`[API Timeout] ${req.method} ${req.originalUrl} timed out after ${timeoutMs}ms`);
       res.status(504).json({
@@ -179,11 +179,24 @@ app.listen(PORT, '0.0.0.0', () => {
       }
     }, 5000);
 
+    setTimeout(() => {
+      try {
+        triggerPanelDeletionSyncIfNeeded('Server Start', false);
+      } catch (err) {
+        console.error('[Scheduler] Initial panel deletion sync error:', err);
+      }
+    }, 10000);
+
     setInterval(() => {
       try {
         triggerBackgroundSyncIfNeeded('Scheduled', false);
       } catch (err) {
         console.error('[Scheduler] Scheduled background sync error:', err);
+      }
+      try {
+        triggerPanelDeletionSyncIfNeeded('Scheduled', false);
+      } catch (err) {
+        console.error('[Scheduler] Scheduled panel deletion sync error:', err);
       }
     }, 60000);
   }

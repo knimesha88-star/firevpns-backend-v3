@@ -769,6 +769,7 @@ export interface ExecuteRenewalActionOptions {
   updateClientExpiryFn?: typeof xuiService.updateClientExpiry;
   nowMs?: number;
   skipSideEffects?: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -802,17 +803,16 @@ export const executeRenewalApproval = async (
     operationType: 'approve_renew',
     targetId: cleanRequestId,
     leaseSeconds: 120,
-    requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
-    allowUncertainRecovery: true,
+    requireDurableLock: true,
+    allowUncertainRecovery: false,
     metadata: { action: 'approve_renew', adminLabel: options?.adminLabel || 'Admin' },
   });
 
   if (!lockClaim.acquired) {
-    const lockErr: any = new Error(
-      `Renewal request ${cleanRequestId} is currently locked by another operation (${lockClaim.previousStatus || 'in_progress'}). Please wait and retry.`
+    throw xuiService.buildDurableLockFailureError(
+      lockClaim,
+      `Renewal request '${cleanRequestId}'`
     );
-    lockErr.statusCode = 409;
-    throw lockErr;
   }
 
   let finalLockStatus: 'completed' | 'failed' | 'uncertain' = 'failed';
@@ -871,6 +871,8 @@ export const executeRenewalApproval = async (
       adminLabel: options?.adminLabel || (options?.adminId ? `Admin (${options.adminId})` : 'Admin Panel'),
       getInboundsFn: options?.getInboundsFn,
       heldRenewLockOwnerId: lockClaim.lockOwnerId,
+      heldRenewLockTableAvailable: lockClaim.tableAvailable,
+      signal: options?.signal,
     });
 
     if (provisionalConfirm.handledAsProvisional) {
@@ -1003,17 +1005,51 @@ export const executeRenewalApproval = async (
       throw uuidErr;
     }
 
+    const assertRenewLockStillHeld = async (
+      stage: 'before_external_write' | 'before_db_finalization'
+    ): Promise<void> => {
+      if (!lockClaim.tableAvailable) {
+        const missingErr: any = new Error(
+          `Missing verified durable renewal lock '${lockKey}' (${stage}); refusing to proceed without required lock.`
+        );
+        missingErr.statusCode = 409;
+        missingErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'RENEW_LOCK_MISSING';
+        missingErr.beforeExternalWrite = stage === 'before_external_write';
+        missingErr.xuiUncertain = stage === 'before_db_finalization';
+        missingErr.markLockUncertain = stage === 'before_db_finalization';
+        throw missingErr;
+      }
+      const renewed = await xuiService.renewDurableProvisioningOperationLock({
+        dbClient,
+        operationKey: lockKey,
+        lockOwnerId: lockClaim.lockOwnerId,
+      });
+      if (!renewed) {
+        const fenceErr: any = new Error(
+          stage === 'before_db_finalization'
+            ? `Lost durable renewal lock '${lockKey}' after 3X-UI renewal mutation; refusing stale DB finalization. Manual reconciliation required.`
+            : `Lost durable renewal lock '${lockKey}' before 3X-UI renewal mutation; aborting before external mutation.`
+        );
+        fenceErr.statusCode = 409;
+        fenceErr.code = stage === 'before_db_finalization' ? 'RECONCILIATION_REQUIRED' : 'RENEW_LOCK_LOST';
+        fenceErr.beforeExternalWrite = stage === 'before_external_write';
+        fenceErr.xuiUncertain = stage === 'before_db_finalization';
+        fenceErr.markLockUncertain = stage === 'before_db_finalization';
+        throw fenceErr;
+      }
+    };
+
     const manualUpdateResult = await xuiService.withClientMutationLock(
       {
         dbClient,
         clientUuid: targetUuid,
         operationType: 'client_lock',
         targetId: `approve_renew:${cleanRequestId}`,
-        requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
-        allowUncertainRecovery: true,
+        requireDurableLock: true,
+        allowUncertainRecovery: false,
         metadata: { renewRequestId: cleanRequestId, action: 'manual_approve_renew' },
       },
-      async () => {
+      async (assertClientLockStillHeld) => {
         await xuiService.assertNoUnresolvedClientRenewalGrant({
           dbClient,
           clientUuid: targetUuid,
@@ -1060,8 +1096,41 @@ export const executeRenewalApproval = async (
           parsedNotes?.planName ||
           '';
 
+        // Narrowly scoped fencing callbacks verifying BOTH renew:<id> AND client:<uuid> locks
+        // immediately before every external 3X-UI mutation attempt (and after post-write read-back).
+        const verifyRenewalAndClientLocksBeforeExternalMutation = async (): Promise<void> => {
+          await assertClientLockStillHeld();
+          await assertRenewLockStillHeld('before_external_write');
+        };
+        const verifyRenewalAndClientLocksAfterExternalMutation = async (): Promise<void> => {
+          try {
+            await assertClientLockStillHeld();
+          } catch {
+            const reconErr: any = new Error(
+              `Lost durable client lock 'client:${targetUuid}' after 3X-UI renewal update; manual reconciliation required.`
+            );
+            reconErr.statusCode = 409;
+            reconErr.code = 'RECONCILIATION_REQUIRED';
+            reconErr.beforeExternalWrite = false;
+            reconErr.xuiUncertain = true;
+            reconErr.markLockUncertain = true;
+            throw reconErr;
+          }
+          await assertRenewLockStillHeld('before_db_finalization');
+        };
+
         const { new_expiryMs, newTotalBytes, verifiedEnable, inboundId } =
-          await updateClientExpiryCall(targetUuid, durationMonths, planName, oldExpiryMs);
+          await updateClientExpiryCall(targetUuid, durationMonths, planName, oldExpiryMs, {
+            dbClient,
+            getInboundsFn: options?.getInboundsFn,
+            requestApiFn: options?.requestApiFn,
+            nowMs: options?.nowMs,
+            requireDurableLock: true,
+            allowUncertainRecovery: false,
+            beforeExternalMutation: verifyRenewalAndClientLocksBeforeExternalMutation,
+            afterExternalMutationCheck: verifyRenewalAndClientLocksAfterExternalMutation,
+            signal: options?.signal,
+          });
 
         if (!verifiedEnable || !new_expiryMs || new_expiryMs <= Date.now()) {
           throw new Error(
@@ -1078,6 +1147,9 @@ export const executeRenewalApproval = async (
         };
       }
     );
+
+    // Post-write lock fencing: ensure this worker STILL owns renew:<id> before finalizing DB rows
+    await assertRenewLockStillHeld('before_db_finalization');
 
     const { oldExpiryIso, new_expiryMs, new_expiryIso, newTotalBytes } = manualUpdateResult;
     const nowIso = new Date().toISOString();
@@ -1120,7 +1192,14 @@ export const executeRenewalApproval = async (
 
     if (updateErr) {
       console.error('[RenewController] Error updating renew_requests table:', updateErr);
-      throw updateErr;
+      const dbErr: any = new Error(
+        `3X-UI renewal succeeded but updating renew_requests failed (${updateErr?.message || updateErr}); manual reconciliation required.`
+      );
+      dbErr.statusCode = 409;
+      dbErr.code = 'RECONCILIATION_REQUIRED';
+      dbErr.xuiUncertain = true;
+      dbErr.markLockUncertain = true;
+      throw dbErr;
     }
 
     const dataLimitStr =
@@ -1269,8 +1348,10 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
       adminId: req.user?.uid || null,
       adminLabel: req.user?.email ? `Admin (${req.user.email})` : 'Admin Panel',
       dbClient: (req as any).dbClient || supabaseAdmin || supabase,
+      signal: (req as any).timeoutSignal,
     });
 
+    if (res.headersSent) return;
     res.json({
       success: true,
       provisionalConfirmed: result.provisionalConfirmed,
@@ -1282,10 +1363,13 @@ export const approveRenewRequest = async (req: AuthRequest, res: Response): Prom
   } catch (error: any) {
     const statusCode = Number(error?.statusCode) || 500;
     console.error(`[RenewController] Error approving renewal request ${requestId}:`, error?.message || error);
+    if (res.headersSent) return;
     res.status(statusCode).json({
+      success: false,
       error:
         error?.message ||
         'Failed to approve renewal and reactivate 3X-UI client. The request remains pending and can be retried safely.',
+      ...(error?.code ? { code: error.code } : {}),
     });
   }
 };
@@ -1321,17 +1405,16 @@ export const executeRenewalRejection = async (
     operationType: 'reject_renew',
     targetId: cleanRequestId,
     leaseSeconds: 120,
-    requireDurableLock: xuiService.isAutoActivateRenewalsFlagEnabled(),
-    allowUncertainRecovery: true,
+    requireDurableLock: true,
+    allowUncertainRecovery: false,
     metadata: { action: 'reject_renew', reason, adminLabel: options?.adminLabel || 'Admin' },
   });
 
   if (!lockClaim.acquired) {
-    const lockErr: any = new Error(
-      `Renewal request ${cleanRequestId} is currently locked by another operation (${lockClaim.previousStatus || 'in_progress'}). Please wait and retry.`
+    throw xuiService.buildDurableLockFailureError(
+      lockClaim,
+      `Renewal request '${cleanRequestId}'`
     );
-    lockErr.statusCode = 409;
-    throw lockErr;
   }
 
   let finalLockStatus: 'completed' | 'failed' | 'uncertain' = 'failed';
@@ -1368,11 +1451,36 @@ export const executeRenewalRejection = async (
       requestApiFn: options?.requestApiFn,
       getInboundsFn: options?.getInboundsFn,
       nowMs: options?.nowMs,
+      heldRenewLockOwnerId: lockClaim.lockOwnerId,
+      heldRenewLockTableAvailable: lockClaim.tableAvailable,
+      signal: options?.signal,
     });
 
     let updatedRow: any = data;
 
     if (!revokeRes.handledAsProvisional) {
+      xuiService.assertRequestNotTimedOutBeforeExternalMutation(
+        options?.signal,
+        `manual renewal rejection for request ${cleanRequestId}`
+      );
+      if (lockClaim.tableAvailable) {
+        const renewLockStillOwned = await xuiService.renewDurableProvisioningOperationLock({
+          dbClient,
+          operationKey: lockKey,
+          lockOwnerId: lockClaim.lockOwnerId,
+        });
+        if (!renewLockStillOwned) {
+          const fenceErr: any = new Error(
+            `Lost durable renewal lock '${lockKey}' before updating manual rejection in DB; aborting stale write.`
+          );
+          fenceErr.statusCode = 409;
+          fenceErr.code = 'RENEW_LOCK_LOST';
+          fenceErr.beforeExternalWrite = true;
+          fenceErr.xuiUncertain = false;
+          throw fenceErr;
+        }
+      }
+
       const { data: manualRejectedRow, error: updateErr } = await dbClient
         .from('renew_requests')
         .update({
@@ -1469,8 +1577,10 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
       adminId: req.user?.uid || null,
       adminLabel: req.user?.email ? `Admin (${req.user.email})` : 'Admin Panel',
       dbClient: (req as any).dbClient || supabaseAdmin || supabase,
+      signal: (req as any).timeoutSignal,
     });
 
+    if (res.headersSent) return;
     res.json({
       success: true,
       provisionalRevoked: result.provisionalRevoked,
@@ -1482,7 +1592,12 @@ export const rejectRenewRequest = async (req: AuthRequest, res: Response): Promi
   } catch (error: any) {
     const statusCode = Number(error?.statusCode) || 500;
     console.error(`[RenewController] Error rejecting renewal request ${requestId}:`, error?.message || error);
-    res.status(statusCode).json({ error: error?.message || 'Failed to reject renewal request' });
+    if (res.headersSent) return;
+    res.status(statusCode).json({
+      success: false,
+      error: error?.message || 'Failed to reject renewal request',
+      ...(error?.code ? { code: error.code } : {}),
+    });
   }
 };
 

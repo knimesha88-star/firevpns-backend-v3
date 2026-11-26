@@ -14,6 +14,7 @@ import {
   confirmProvisionalRenewal,
   revokeProvisionalRenewal,
   parseInboundSettingsClientsStrict,
+  resetClientTraffic,
   XuiInbound,
   UncachedInboundReadResult,
   UncachedInboundsListReadResult,
@@ -481,7 +482,15 @@ test('R2. Panel read timeout (Read 1 and bounded Read 2): zero stranded or uncer
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'error', reason: 'timeout of 10000ms exceeded' }),
+      fetchUncachedInboundsList: async () => ({
+        ok: false,
+        reason: 'timeout of 10000ms exceeded',
+        inbounds: [],
+        parsedByInboundId: new Map(),
+        unparsedInboundIds: [],
+        allInboundsCleanlyParsed: false,
+        liveClientByUuid: new Map(),
+      }),
     });
     assert.equal(res1.confirmedDeleted, false);
     assert.match(res1.reason, /^read1_error:/);
@@ -503,14 +512,14 @@ test('R2. Panel read timeout (Read 1 and bounded Read 2): zero stranded or uncer
       reReadDelayMs: 0,
       lockedReadTimeoutMs: 40,
       releaseRetryBaseDelayMs: 1,
-      fetchUncachedInbound: async (): Promise<UncachedInboundReadResult> => {
+      fetchUncachedInboundsList: async () => {
         readAttempt++;
         if (readAttempt === 1) {
-          return { status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() };
+          return buildListResult([emptyIb]);
         }
         // Hang longer than lockedReadTimeoutMs
         await new Promise((r) => setTimeout(r, 200));
-        return { status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() };
+        return buildListResult([emptyIb]);
       },
     });
 
@@ -525,16 +534,16 @@ test('R2. Panel read timeout (Read 1 and bounded Read 2): zero stranded or uncer
 });
 
 // ---------------------------------------------------------------------------
-// 3 & 4. Missing inbound & Inbound mismatch: NO stranded or uncertain locks
+// 3 & 4. Missing inbound & Inbound mismatch / moved client: NO stranded or uncertain locks
 // ---------------------------------------------------------------------------
-test('R3 & R4. Missing inbound and inbound_id_mismatch leave zero stranded or uncertain locks', async () => {
+test('R3 & R4. Empty list, incomplete Read 2 list, and moved client leave zero stranded or uncertain locks', async () => {
   await withEnv({ PANEL_DELETION_SYNC_ENABLED: 'true' }, async () => {
     const db = createLockAwareMockDb({
       vpn_accounts: [{ id: 'a-m', user_id: 'u-1', uuid: 'uuid-miss-ib', status: 'active', enable: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT }],
       vpn_configs: [{ id: 'c-m', customer_uid: 'u-1', uuid: 'uuid-miss-ib', inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT }],
     });
 
-    // Missing inbound on Read 1 with empty list -> exits before lock acquisition
+    // Empty list on Read 1 -> exits before lock acquisition
     const resMiss1 = await verifyAndMarkClientDeletedIfConfirmed({
       clientUuid: 'uuid-miss-ib',
       inboundId: 2,
@@ -544,13 +553,12 @@ test('R3 & R4. Missing inbound and inbound_id_mismatch leave zero stranded or un
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'not_found' }),
       fetchUncachedInboundsList: async () => buildListResult([]),
     });
     assert.equal(resMiss1.confirmedDeleted, false);
     assert.equal(db.state.rpcCalls.length, 0);
 
-    // Missing inbound on Read 2 with incomplete list -> exits cleanly, both locks completed (not uncertain/in_progress)
+    // Incomplete/failed list on Read 2 -> exits cleanly, both locks completed (not uncertain/in_progress)
     let callIdx = 0;
     const emptyIb = makeInbound(2, []);
     const resMiss2 = await verifyAndMarkClientDeletedIfConfirmed({
@@ -562,28 +570,27 @@ test('R3 & R4. Missing inbound and inbound_id_mismatch leave zero stranded or un
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => {
+      fetchUncachedInboundsList: async () => {
         callIdx++;
-        return callIdx === 1
-          ? { status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }
-          : { status: 'not_found' };
+        if (callIdx === 1) return buildListResult([emptyIb]);
+        return {
+          ok: false,
+          reason: 'network_error',
+          inbounds: [],
+          parsedByInboundId: new Map(),
+          unparsedInboundIds: [],
+          allInboundsCleanlyParsed: false,
+          liveClientByUuid: new Map(),
+        };
       },
-      fetchUncachedInboundsList: async () => ({
-        ok: false,
-        reason: 'network_error',
-        inbounds: [],
-        parsedByInboundId: new Map(),
-        unparsedInboundIds: [],
-        allInboundsCleanlyParsed: false,
-        liveClientByUuid: new Map(),
-      }),
     });
     assert.equal(resMiss2.confirmedDeleted, false);
     assert.equal(db.getLockRow('inbound:2')?.status, 'completed');
     assert.equal(db.getLockRow('client:uuid-miss-ib')?.status, 'completed');
 
-    // Inbound mismatch on Read 2 -> clean completion with zero writes and zero stranded/uncertain locks
+    // Client moved to inbound 99 detected on Read 2 -> clean completion, manualReviewFlagged, zero writes and zero stranded/uncertain locks
     let mismatchIdx = 0;
+    const movedIb99 = makeInbound(99, [{ id: 'uuid-miss-ib', email: 'm', enable: true, expiryTime: FUTURE_EXPIRY_MS, totalGB: 0 }]);
     const resMismatch = await verifyAndMarkClientDeletedIfConfirmed({
       clientUuid: 'uuid-miss-ib',
       inboundId: 2,
@@ -593,15 +600,16 @@ test('R3 & R4. Missing inbound and inbound_id_mismatch leave zero stranded or un
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => {
+      fetchUncachedInboundsList: async () => {
         mismatchIdx++;
         return mismatchIdx === 1
-          ? { status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }
-          : { status: 'error', reason: 'inbound_id_mismatch' };
+          ? buildListResult([emptyIb])
+          : buildListResult([emptyIb, movedIb99]);
       },
     });
     assert.equal(resMismatch.confirmedDeleted, false);
-    assert.equal(resMismatch.reason, 'read2_error:inbound_id_mismatch');
+    assert.equal(resMismatch.manualReviewFlagged, true);
+    assert.equal(resMismatch.reason, 'read2_client_moved_to_another_inbound');
     assert.equal(db.getLockRow('inbound:2')?.status, 'completed');
     assert.equal(db.getLockRow('client:uuid-miss-ib')?.status, 'completed');
   });
@@ -636,7 +644,7 @@ test('R5. RPC definitive skip_reason and definitive pre-commit DB error finalize
       dbClient: dbSkip,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(resSkip.confirmedDeleted, false);
     assert.equal(resSkip.reason, 'rpc_skipped:ownership_mismatch');
@@ -665,7 +673,7 @@ test('R5. RPC definitive skip_reason and definitive pre-commit DB error finalize
       dbClient: dbPerm,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(resPerm.confirmedDeleted, false);
     assert.equal(resPerm.mutationUncertain, undefined);
@@ -708,7 +716,7 @@ test('R6. RPC timeout after possible commit reconciles authoritatively (confirme
       dbClient: dbCommitted,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(resCommitted.confirmedDeleted, true);
     assert.equal(resCommitted.reconciledAfterAmbiguousRpc, true);
@@ -738,7 +746,7 @@ test('R6. RPC timeout after possible commit reconciles authoritatively (confirme
       dbClient: dbUnconfirmed,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(resUnconfirmed.confirmedDeleted, false);
     assert.equal(resUnconfirmed.mutationUncertain, true);
@@ -864,7 +872,7 @@ test('R9. Lease expiration during verification aborts before deletion RPC with z
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
       releaseRetryBaseDelayMs: 1,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
 
     assert.equal(res.confirmedDeleted, false);
@@ -901,7 +909,7 @@ test('R10. Concurrent purchase/renewal locks are respected by read-only pre-chec
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(skipActive.confirmedDeleted, false);
     assert.equal(skipActive.reason, 'lock_precheck_in_progress:inbound:2');
@@ -921,7 +929,7 @@ test('R10. Concurrent purchase/renewal locks are respected by read-only pre-chec
       dbClient: db,
       currentPanelIdentity: PANEL_ID,
       reReadDelayMs: 0,
-      fetchUncachedInbound: async () => ({ status: 'found', inbound: emptyIb, clients: [], clientUuidSet: new Set() }),
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
     });
     assert.equal(skipUnc.confirmedDeleted, false);
     assert.equal(skipUnc.reason, 'lock_precheck_uncertain:client:uuid-concurrent');
@@ -1157,3 +1165,88 @@ test('R11 & R12. Existing automatic purchase, order revocation, renewal approval
     assert.equal(typeof provisionProvisionalRenewal, 'function');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 13. Existing uncertain locks remain untouched & concurrent traffic reset + deletion sync stay serialized
+// ---------------------------------------------------------------------------
+test('R13. Existing uncertain locks are NEVER modified/cleared by deletion sweeps and concurrent traffic reset stays serialized', async () => {
+  await withEnv({ PANEL_DELETION_SYNC_ENABLED: 'true' }, async () => {
+    const targetUuid = '756415e2-9913-4c70-b6d8-e122d308f5e9';
+    const db = createLockAwareMockDb({
+      vpn_accounts: [
+        { id: 'a-u1', user_id: 'u-1', uuid: targetUuid, status: 'active', enable: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT },
+      ],
+      vpn_configs: [
+        { id: 'c-u1', customer_uid: 'u-1', uuid: targetUuid, inbound_id: 2, status: 'active', enabled: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT },
+      ],
+      provisioning_operations: [
+        { operation_key: 'inbound:2', operation_type: 'inbound_write', target_id: `panel-delete-sync:${targetUuid}`, client_uuid: targetUuid, lock_owner_id: 'legacy-owner-1', status: 'uncertain' },
+        { operation_key: `client:${targetUuid}`, operation_type: 'client_lock', target_id: `panel-delete-sync:${targetUuid}`, client_uuid: targetUuid, lock_owner_id: 'legacy-owner-2', status: 'uncertain' },
+      ],
+    });
+
+    const emptyIb = makeInbound(2, []);
+    const sweepRes = await syncDeleted3XUiClients({
+      dbClient: db,
+      currentPanelIdentity: PANEL_ID,
+      configuredServers: [],
+      fetchUncachedInboundsList: async () => buildListResult([emptyIb]),
+      reReadDelayMs: 0,
+    });
+
+    assert.equal(sweepRes.deletedCount, 0);
+    assert.equal(db.getLockRow('inbound:2')?.status, 'uncertain');
+    assert.equal(db.getLockRow('inbound:2')?.lock_owner_id, 'legacy-owner-1');
+    assert.equal(db.getLockRow(`client:${targetUuid}`)?.status, 'uncertain');
+    assert.equal(db.getLockRow(`client:${targetUuid}`)?.lock_owner_id, 'legacy-owner-2');
+    assert.equal(db.state.rpcCalls.filter((c: any) => c.fn === 'acquire_provisioning_lock').length, 0);
+
+    // Verify concurrent traffic reset holding client:<uuid> lock causes deletion sync to skip cleanly
+    const resetUuid = 'uuid-reset-race';
+    const dbRace = createLockAwareMockDb({
+      vpn_accounts: [{ id: 'a-r', user_id: 'u-2', uuid: resetUuid, status: 'active', enable: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT }],
+      vpn_configs: [{ id: 'c-r', customer_uid: 'u-2', uuid: resetUuid, inbound_id: 3, status: 'active', enabled: true, panel_identity: PANEL_ID, created_at: PAST_CREATED_AT }],
+    });
+    let releaseResetGate!: () => void;
+    const resetInLock = new Promise<void>((resolve) => {
+      releaseResetGate = resolve;
+    });
+    let enteredResetLock!: () => void;
+    const resetLockedSignal = new Promise<void>((resolve) => {
+      enteredResetLock = resolve;
+    });
+
+    const resetPromise = resetClientTraffic('reset@example.com', 3, resetUuid, {
+      dbClient: dbRace,
+      requireDurableLock: true,
+      beforeResetUnderLocks: async () => {
+        enteredResetLock();
+        await resetInLock;
+      },
+      requestApiFn: async <T>() => ({ success: true } as T),
+    });
+
+    await resetLockedSignal;
+    const delDuringReset = await verifyAndMarkClientDeletedIfConfirmed({
+      clientUuid: resetUuid,
+      inboundId: 3,
+      userId: 'u-2',
+      recordPanelIdentity: PANEL_ID,
+      createdAt: PAST_CREATED_AT,
+      dbClient: dbRace,
+      currentPanelIdentity: PANEL_ID,
+      reReadDelayMs: 0,
+      fetchUncachedInboundsList: async () => buildListResult([makeInbound(3, [])]),
+    });
+
+    assert.equal(delDuringReset.confirmedDeleted, false);
+    assert.match(delDuringReset.reason, /^lock_precheck_in_progress:/);
+
+    releaseResetGate();
+    const resetRes = await resetPromise;
+    assert.equal(resetRes.success, true);
+    assert.equal(dbRace.getLockRow(`client:${resetUuid}`)?.status, 'completed');
+    assert.equal(dbRace.getLockRow('inbound:3')?.status, 'completed');
+  });
+});
+

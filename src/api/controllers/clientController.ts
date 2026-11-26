@@ -38,7 +38,21 @@ export const getStatus = async (req: AuthRequest, res: Response): Promise<void> 
       });
       return;
     }
-    res.json({ success: true, data: client });
+    if (client && client._noActiveConfig === true) {
+      res.json({
+        success: true,
+        data: null,
+        deletedUuids: Array.isArray(client.deletedUuids) ? client.deletedUuids : [],
+      });
+      return;
+    }
+    const deletedUuids = Array.isArray(client?.deletedUuids) ? client.deletedUuids : [];
+    if (client && typeof client === 'object' && 'deletedUuids' in client) {
+      const { deletedUuids: _omitted, ...cleanClient } = client;
+      res.json({ success: true, data: cleanClient, deletedUuids });
+      return;
+    }
+    res.json({ success: true, data: client, deletedUuids });
   } catch (error: any) {
     const totalTime = Date.now() - reqStart;
     console.error(`[API Performance] [GET /api/client/status] Request failed after ${totalTime}ms:`, error);
