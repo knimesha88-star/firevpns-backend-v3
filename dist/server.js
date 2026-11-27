@@ -10613,7 +10613,7 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
     }
   );
 }
-var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, lastInboundsCacheTime, cachedXuiConfig, XUI_CONFIG_TTL_MS, cachedXuiAuth, XUI_AUTH_TTL_MS, invalidateXuiConfigCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, clientProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isPanelDeletionSyncFlagEnabled, getPanelDeletionSyncIntervalMs, getPanelDeletionSyncMaxDeletesPerCycle, getPanelDeletionSyncMaxMissingRatio, isMissingSchemaOrRpcError, isTransientLockReleaseError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, isPanelDeletionSyncInProgress, lastPanelDeletionSyncAt, PANEL_DELETION_SYNC_LEASE_KEY, PANEL_DELETION_SYNC_INSTANCE_ID, applySettingsLeaseCasFilters, acquireCrossInstanceDeletionSyncLease, renewCrossInstanceDeletionSyncLease, verifyCrossInstanceDeletionSyncLeaseOwnership, releaseCrossInstanceDeletionSyncLease, triggerPanelDeletionSyncIfNeeded, triggerBackgroundSyncIfNeeded, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, fetchAllTableRowsByPrimaryKeyCursor, evaluateSnapshotMassAbsenceCircuitBreaker, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, isDefinitivePreCommitDeletionRpcError, isAmbiguousDeletionRpcError, runWithStrictTimeout, reconcileClientPanelDeletionState, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
+var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, cachedInboundsPanelIdentity, lastInboundsCacheTime, isCacheRefreshing, inboundsCacheGeneration, lastFailedInboundsAt, FAILED_INBOUNDS_COOLDOWN_MS, inboundsInFlight, getInboundsSnapshotTimestamp, getXuiAuthTimeoutMs, getXuiSingleInboundTimeoutMs, getXuiFullListTimeoutMs, cachedXuiConfig, xuiConfigGeneration, xuiConfigInFlight, XUI_CONFIG_TTL_MS, MAX_XUI_AUTH_SCOPE_ENTRIES, MAX_XUI_PANEL_CAPABILITY_ENTRIES, MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES, maxXuiAuthScopeEntriesOverride, maxClientTrafficMutationStateEntriesOverride, getEffectiveMaxXuiAuthScopeEntries, getEffectiveMaxClientTrafficMutationStateEntries, setBoundedMapEntry, cachedXuiAuthByScope, xuiAuthGenerationByScope, globalXuiAuthEpoch, minValidAuthGenerationFloor, nextMonotonicAuthGeneration, xuiAuthInFlight, rememberedLoginEndpointByPanel, confirmedUnsupportedCsrfByPanel, XUI_AUTH_TTL_MS, setScopeAuthGenerationEntry, getScopeAuthGeneration, ensureScopeAuthGeneration, bumpScopeAuthGeneration, clientTrafficMutationStateByUuid, globalTrafficMutationEpoch, maxEvictedTrafficMutationEpoch, clientTrafficInvalidationListeners, getClientTrafficMutationState, getTrafficMutationEpochSnapshot, registerClientTrafficCacheInvalidator, unregisterClientTrafficCacheInvalidator, notifyClientTrafficInvalidated, invalidateXuiConfigCache, invalidateXuiAuthCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, computeXuiCredentialScopeKey, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, clientProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isPanelDeletionSyncFlagEnabled, getPanelDeletionSyncIntervalMs, getPanelDeletionSyncMaxDeletesPerCycle, getPanelDeletionSyncMaxMissingRatio, isMissingSchemaOrRpcError, isTransientLockReleaseError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, isPanelDeletionSyncInProgress, lastPanelDeletionSyncAt, PANEL_DELETION_SYNC_LEASE_KEY, PANEL_DELETION_SYNC_INSTANCE_ID, applySettingsLeaseCasFilters, acquireCrossInstanceDeletionSyncLease, renewCrossInstanceDeletionSyncLease, verifyCrossInstanceDeletionSyncLeaseOwnership, releaseCrossInstanceDeletionSyncLease, triggerPanelDeletionSyncIfNeeded, triggerBackgroundSyncIfNeeded, startBackgroundSyncScheduler, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, fetchAllTableRowsByPrimaryKeyCursor, evaluateSnapshotMassAbsenceCircuitBreaker, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, isDefinitivePreCommitDeletionRpcError, isAmbiguousDeletionRpcError, runWithStrictTimeout, reconcileClientPanelDeletionState, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
 var init_xuiService = __esm({
   "src/api/services/xuiService.ts"() {
     "use strict";
@@ -10624,14 +10624,240 @@ var init_xuiService = __esm({
     TRIAL_GRACE_PERIOD_MINUTES = Number(process.env.TRIAL_GRACE_PERIOD_MINUTES) || 5;
     TRIAL_GRACE_PERIOD_MS = TRIAL_GRACE_PERIOD_MINUTES * 60 * 1e3;
     cachedInbounds = [];
+    cachedInboundsPanelIdentity = "";
     lastInboundsCacheTime = 0;
+    isCacheRefreshing = false;
+    inboundsCacheGeneration = 0;
+    lastFailedInboundsAt = 0;
+    FAILED_INBOUNDS_COOLDOWN_MS = 10 * 1e3;
+    inboundsInFlight = /* @__PURE__ */ new Map();
+    getInboundsSnapshotTimestamp = () => lastInboundsCacheTime;
+    getXuiAuthTimeoutMs = () => {
+      const raw = Number(process.env.XUI_AUTH_TIMEOUT_MS);
+      if (!Number.isFinite(raw) || raw <= 0) return 6e3;
+      return Math.max(2e3, Math.min(Math.floor(raw), 12e3));
+    };
+    getXuiSingleInboundTimeoutMs = () => {
+      const raw = Number(process.env.XUI_SINGLE_INBOUND_TIMEOUT_MS);
+      if (!Number.isFinite(raw) || raw <= 0) return 8e3;
+      return Math.max(2e3, Math.min(Math.floor(raw), 15e3));
+    };
+    getXuiFullListTimeoutMs = () => {
+      const raw = Number(process.env.XUI_FULL_LIST_TIMEOUT_MS);
+      if (!Number.isFinite(raw) || raw <= 0) return 15e3;
+      return Math.max(5e3, Math.min(Math.floor(raw), 25e3));
+    };
     cachedXuiConfig = null;
+    xuiConfigGeneration = 0;
+    xuiConfigInFlight = null;
     XUI_CONFIG_TTL_MS = 60 * 1e3;
-    cachedXuiAuth = null;
+    MAX_XUI_AUTH_SCOPE_ENTRIES = 32;
+    MAX_XUI_PANEL_CAPABILITY_ENTRIES = 64;
+    MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES = 5e3;
+    maxXuiAuthScopeEntriesOverride = null;
+    maxClientTrafficMutationStateEntriesOverride = null;
+    getEffectiveMaxXuiAuthScopeEntries = () => maxXuiAuthScopeEntriesOverride !== null && maxXuiAuthScopeEntriesOverride > 0 ? maxXuiAuthScopeEntriesOverride : MAX_XUI_AUTH_SCOPE_ENTRIES;
+    getEffectiveMaxClientTrafficMutationStateEntries = () => maxClientTrafficMutationStateEntriesOverride !== null && maxClientTrafficMutationStateEntriesOverride > 0 ? maxClientTrafficMutationStateEntriesOverride : MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES;
+    setBoundedMapEntry = (map, key, value, maxEntries, onEvict) => {
+      if (map.has(key)) {
+        map.delete(key);
+      }
+      map.set(key, value);
+      while (map.size > maxEntries) {
+        const oldestKey = map.keys().next().value;
+        if (oldestKey === void 0) break;
+        const oldestVal = map.get(oldestKey);
+        map.delete(oldestKey);
+        if (onEvict) {
+          onEvict(oldestKey, oldestVal);
+        }
+      }
+    };
+    cachedXuiAuthByScope = /* @__PURE__ */ new Map();
+    xuiAuthGenerationByScope = /* @__PURE__ */ new Map();
+    globalXuiAuthEpoch = 0;
+    minValidAuthGenerationFloor = 0;
+    nextMonotonicAuthGeneration = 1;
+    xuiAuthInFlight = /* @__PURE__ */ new Map();
+    rememberedLoginEndpointByPanel = /* @__PURE__ */ new Map();
+    confirmedUnsupportedCsrfByPanel = /* @__PURE__ */ new Map();
     XUI_AUTH_TTL_MS = 10 * 60 * 1e3;
+    setScopeAuthGenerationEntry = (scopeKey, generation) => {
+      const maxScopeEntries = getEffectiveMaxXuiAuthScopeEntries();
+      const maxGenEntries = maxScopeEntries * 2;
+      if (xuiAuthGenerationByScope.has(scopeKey)) {
+        xuiAuthGenerationByScope.delete(scopeKey);
+      }
+      xuiAuthGenerationByScope.set(scopeKey, generation);
+      nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, generation + 1);
+      while (xuiAuthGenerationByScope.size > maxGenEntries) {
+        let victimKey;
+        for (const candidateKey of xuiAuthGenerationByScope.keys()) {
+          if (candidateKey !== scopeKey && !cachedXuiAuthByScope.has(candidateKey)) {
+            victimKey = candidateKey;
+            break;
+          }
+        }
+        if (victimKey === void 0) {
+          victimKey = xuiAuthGenerationByScope.keys().next().value;
+        }
+        if (victimKey === void 0) break;
+        const evictedGen = xuiAuthGenerationByScope.get(victimKey) ?? 0;
+        xuiAuthGenerationByScope.delete(victimKey);
+        minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, evictedGen + 1);
+        nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, minValidAuthGenerationFloor + 1);
+        cachedXuiAuthByScope.delete(victimKey);
+        const victimInFlight = xuiAuthInFlight.get(victimKey);
+        if (victimInFlight && victimInFlight.generation <= evictedGen) {
+          xuiAuthInFlight.delete(victimKey);
+        }
+      }
+    };
+    getScopeAuthGeneration = (scopeKey) => {
+      const existing = xuiAuthGenerationByScope.get(scopeKey);
+      if (existing !== void 0) return existing;
+      return Math.max(globalXuiAuthEpoch, minValidAuthGenerationFloor, nextMonotonicAuthGeneration);
+    };
+    ensureScopeAuthGeneration = (scopeKey) => {
+      const existing = xuiAuthGenerationByScope.get(scopeKey);
+      if (existing !== void 0 && existing >= globalXuiAuthEpoch) {
+        return existing;
+      }
+      const allocatedGen = Math.max(
+        (existing ?? 0) + 1,
+        globalXuiAuthEpoch,
+        minValidAuthGenerationFloor,
+        nextMonotonicAuthGeneration
+      );
+      nextMonotonicAuthGeneration = allocatedGen + 1;
+      setScopeAuthGenerationEntry(scopeKey, allocatedGen);
+      return allocatedGen;
+    };
+    bumpScopeAuthGeneration = (scopeKey) => {
+      const existing = xuiAuthGenerationByScope.get(scopeKey);
+      const currentGen = existing !== void 0 ? existing : 0;
+      const nextGen = Math.max(
+        currentGen + 1,
+        globalXuiAuthEpoch + 1,
+        minValidAuthGenerationFloor + 1,
+        nextMonotonicAuthGeneration
+      );
+      nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, nextGen + 1);
+      setScopeAuthGenerationEntry(scopeKey, nextGen);
+      return nextGen;
+    };
+    clientTrafficMutationStateByUuid = /* @__PURE__ */ new Map();
+    globalTrafficMutationEpoch = 0;
+    maxEvictedTrafficMutationEpoch = 0;
+    clientTrafficInvalidationListeners = /* @__PURE__ */ new Set();
+    getClientTrafficMutationState = (clientUuid) => {
+      const normUuid = String(clientUuid || "").trim().toLowerCase();
+      if (!normUuid) {
+        return { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false };
+      }
+      const existing = clientTrafficMutationStateByUuid.get(normUuid);
+      return existing ? { ...existing, present: true } : { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false };
+    };
+    getTrafficMutationEpochSnapshot = () => ({
+      currentEpoch: globalTrafficMutationEpoch,
+      maxEvictedEpoch: maxEvictedTrafficMutationEpoch,
+      trackedUuidsCount: clientTrafficMutationStateByUuid.size
+    });
+    registerClientTrafficCacheInvalidator = (listener) => {
+      clientTrafficInvalidationListeners.add(listener);
+    };
+    unregisterClientTrafficCacheInvalidator = (listener) => {
+      clientTrafficInvalidationListeners.delete(listener);
+    };
+    notifyClientTrafficInvalidated = (clientUuid, reason, timestampMs = Date.now()) => {
+      const normUuid = String(clientUuid || "").trim().toLowerCase();
+      if (!normUuid) {
+        return { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: globalTrafficMutationEpoch, present: false };
+      }
+      globalTrafficMutationEpoch += 1;
+      const prev = clientTrafficMutationStateByUuid.get(normUuid);
+      const baseSeq = prev ? prev.seq : maxEvictedTrafficMutationEpoch;
+      const next = {
+        seq: Math.max(baseSeq + 1, globalTrafficMutationEpoch),
+        lastResetAtMs: reason === "reset" ? Math.max(prev?.lastResetAtMs ?? 0, timestampMs) : prev?.lastResetAtMs ?? 0,
+        deletedAtMs: reason === "deleted" ? Math.max(prev?.deletedAtMs ?? 0, timestampMs) : prev?.deletedAtMs ?? 0,
+        epoch: globalTrafficMutationEpoch,
+        present: true
+      };
+      setBoundedMapEntry(
+        clientTrafficMutationStateByUuid,
+        normUuid,
+        next,
+        getEffectiveMaxClientTrafficMutationStateEntries(),
+        (_evictedUuid, evictedState) => {
+          maxEvictedTrafficMutationEpoch = Math.max(
+            maxEvictedTrafficMutationEpoch,
+            evictedState.epoch ?? evictedState.seq
+          );
+        }
+      );
+      for (const listener of clientTrafficInvalidationListeners) {
+        try {
+          listener(normUuid, reason, next);
+        } catch {
+        }
+      }
+      return { ...next };
+    };
     invalidateXuiConfigCache = () => {
+      xuiConfigGeneration += 1;
+      globalXuiAuthEpoch = Math.max(globalXuiAuthEpoch + 1, minValidAuthGenerationFloor + 1, nextMonotonicAuthGeneration);
+      minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, globalXuiAuthEpoch);
+      nextMonotonicAuthGeneration = globalXuiAuthEpoch + 1;
+      for (const [k, gen] of Array.from(xuiAuthGenerationByScope.entries())) {
+        const bumped = Math.max(gen + 1, globalXuiAuthEpoch);
+        xuiAuthGenerationByScope.set(k, bumped);
+        nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, bumped + 1);
+      }
+      inboundsCacheGeneration += 1;
       cachedXuiConfig = null;
-      cachedXuiAuth = null;
+      xuiConfigInFlight = null;
+      cachedXuiAuthByScope.clear();
+      xuiAuthInFlight.clear();
+      rememberedLoginEndpointByPanel.clear();
+      confirmedUnsupportedCsrfByPanel.clear();
+      lastInboundsCacheTime = 0;
+      lastFailedInboundsAt = 0;
+      inboundsInFlight.clear();
+    };
+    invalidateXuiAuthCache = (scopeKey, expectedGeneration) => {
+      if (!scopeKey) {
+        if (expectedGeneration !== void 0 && expectedGeneration !== globalXuiAuthEpoch) {
+          return globalXuiAuthEpoch;
+        }
+        globalXuiAuthEpoch = Math.max(globalXuiAuthEpoch + 1, minValidAuthGenerationFloor + 1, nextMonotonicAuthGeneration);
+        minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, globalXuiAuthEpoch);
+        nextMonotonicAuthGeneration = globalXuiAuthEpoch + 1;
+        for (const [k, gen] of Array.from(xuiAuthGenerationByScope.entries())) {
+          const bumped = Math.max(gen + 1, globalXuiAuthEpoch);
+          xuiAuthGenerationByScope.set(k, bumped);
+          nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, bumped + 1);
+        }
+        cachedXuiAuthByScope.clear();
+        xuiAuthInFlight.clear();
+        confirmedUnsupportedCsrfByPanel.clear();
+        return globalXuiAuthEpoch;
+      }
+      const currentScopeGen = getScopeAuthGeneration(scopeKey);
+      if (expectedGeneration !== void 0 && expectedGeneration !== currentScopeGen) {
+        return currentScopeGen;
+      }
+      const nextGen = bumpScopeAuthGeneration(scopeKey);
+      const existingCached = cachedXuiAuthByScope.get(scopeKey);
+      if (existingCached) {
+        confirmedUnsupportedCsrfByPanel.delete(existingCached.panelIdentity);
+        cachedXuiAuthByScope.delete(scopeKey);
+      } else {
+        const panelPart = scopeKey.split("::")[0];
+        if (panelPart) confirmedUnsupportedCsrfByPanel.delete(panelPart);
+      }
+      xuiAuthInFlight.delete(scopeKey);
+      return nextGen;
     };
     validateXuiPanelUrl = (urlStr) => {
       const trimmed = String(urlStr || "").trim();
@@ -10683,27 +10909,43 @@ var init_xuiService = __esm({
       if (!forceRefresh && cachedXuiConfig && cachedXuiConfig.expiresAt > now) {
         return cachedXuiConfig.config;
       }
-      const db = supabaseAdmin || supabase;
-      const { data: doc } = await db.from("settings").select("*").eq("id", "xui").maybeSingle();
-      const data = doc && typeof doc.data === "object" ? doc.data : {};
-      const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || "").trim();
-      const username = String(data.username || process.env.XUI_USERNAME || "admin").trim();
-      const password = String(
-        data.password || data.apiToken || process.env.XUI_PASSWORD || process.env.XUI_API_TOKEN || ""
-      ).trim();
-      const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
-      if (!panelUrl) {
-        throw new Error("3X-UI settings not configured");
+      if (!forceRefresh && xuiConfigInFlight && xuiConfigInFlight.generation === xuiConfigGeneration) {
+        return xuiConfigInFlight.promise;
       }
-      const config = {
-        panelUrl,
-        username,
-        password,
-        apiToken,
-        panelName: String(data.panelName || "Primary Node")
-      };
-      cachedXuiConfig = { config, expiresAt: now + XUI_CONFIG_TTL_MS };
-      return config;
+      const capturedGeneration = xuiConfigGeneration;
+      const fetchPromise = (async () => {
+        const db = supabaseAdmin || supabase;
+        const { data: doc } = await db.from("settings").select("*").eq("id", "xui").maybeSingle();
+        const data = doc && typeof doc.data === "object" ? doc.data : {};
+        const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || "").trim();
+        const username = String(data.username || process.env.XUI_USERNAME || "admin").trim();
+        const password = String(
+          data.password || data.apiToken || process.env.XUI_PASSWORD || process.env.XUI_API_TOKEN || ""
+        ).trim();
+        const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
+        if (!panelUrl) {
+          throw new Error("3X-UI settings not configured");
+        }
+        const config = {
+          panelUrl,
+          username,
+          password,
+          apiToken,
+          panelName: String(data.panelName || "Primary Node")
+        };
+        if (capturedGeneration === xuiConfigGeneration) {
+          cachedXuiConfig = { config, expiresAt: Date.now() + XUI_CONFIG_TTL_MS };
+        }
+        return config;
+      })();
+      xuiConfigInFlight = { generation: capturedGeneration, promise: fetchPromise };
+      try {
+        return await fetchPromise;
+      } finally {
+        if (xuiConfigInFlight && xuiConfigInFlight.promise === fetchPromise) {
+          xuiConfigInFlight = null;
+        }
+      }
     };
     getMaskedXuiSettings = async () => {
       const db = supabaseAdmin || supabase;
@@ -10783,82 +11025,246 @@ var init_xuiService = __esm({
         validateStatus: (status) => status < 500
       });
     };
-    getXuiAuthHeaders = async (config, forceRefresh = false, timeoutMs = 6e3) => {
+    computeXuiCredentialScopeKey = (config) => {
+      const panelIdentity = computePanelIdentity(config.panelUrl) || String(config.panelUrl || "").trim();
+      const secretMaterial = `${String(config.username || "admin").trim()}\0${String(config.password || "")}\0${String(config.apiToken || "")}`;
+      const credentialFingerprint = crypto5.createHash("sha256").update(secretMaterial).digest("hex").slice(0, 16);
+      return {
+        panelIdentity,
+        credentialFingerprint,
+        scopeKey: `${panelIdentity}::${credentialFingerprint}`
+      };
+    };
+    getXuiAuthHeaders = async (config, forceRefresh = false, timeoutMs = getXuiAuthTimeoutMs(), authOptions) => {
+      const { panelIdentity, scopeKey } = computeXuiCredentialScopeKey(config);
       const now = Date.now();
-      if (!forceRefresh && cachedXuiAuth && cachedXuiAuth.panelUrl === config.panelUrl && cachedXuiAuth.expiresAt > now) {
-        return { ...cachedXuiAuth.headers };
+      const panelPrefix = `${panelIdentity}::`;
+      for (const existingScopeKey of Array.from(cachedXuiAuthByScope.keys())) {
+        if (existingScopeKey !== scopeKey && existingScopeKey.startsWith(panelPrefix)) {
+          invalidateXuiAuthCache(existingScopeKey);
+        }
       }
+      for (const existingInFlightKey of Array.from(xuiAuthInFlight.keys())) {
+        if (existingInFlightKey !== scopeKey && existingInFlightKey.startsWith(panelPrefix)) {
+          invalidateXuiAuthCache(existingInFlightKey);
+        }
+      }
+      const hasExistingScopeGen = xuiAuthGenerationByScope.has(scopeKey);
+      const currentScopeGen = getScopeAuthGeneration(scopeKey);
+      const cachedEntry = cachedXuiAuthByScope.get(scopeKey);
+      if (!forceRefresh && hasExistingScopeGen && cachedEntry && cachedEntry.generation === currentScopeGen && cachedEntry.generation >= globalXuiAuthEpoch && cachedEntry.expiresAt > now) {
+        setScopeAuthGenerationEntry(scopeKey, currentScopeGen);
+        return { ...cachedEntry.headers };
+      }
+      const existingInFlight = xuiAuthInFlight.get(scopeKey);
+      if (hasExistingScopeGen && existingInFlight && existingInFlight.generation === currentScopeGen && existingInFlight.generation >= globalXuiAuthEpoch && (!forceRefresh || existingInFlight.isForceRefresh)) {
+        return { ...await existingInFlight.promise };
+      }
+      if (forceRefresh) {
+        invalidateXuiAuthCache(scopeKey);
+      }
+      const capturedGeneration = ensureScopeAuthGeneration(scopeKey);
       const username = config.username || "admin";
       const password = config.password || config.apiToken;
       if (!password) {
         throw new Error("API token or password is missing in 3X-UI settings");
       }
-      const { baseUrl } = parseUrl(config.panelUrl);
-      const authTimeoutMs = Math.max(1e3, Math.min(timeoutMs, 6e3));
-      const client = createAxiosInstance(baseUrl, authTimeoutMs);
-      const headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "X-Requested-With": "XMLHttpRequest"
-      };
-      const loginEndpoints = ["/login", "/panel/login"];
-      let cookieHeader = "";
-      for (const loginEp of loginEndpoints) {
-        try {
-          const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
-          const res = await client.post(
-            fullPath,
-            `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+      let authPromise = null;
+      authPromise = (async () => {
+        const authTimeoutMs = Math.max(
+          200,
+          Math.min(Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : getXuiAuthTimeoutMs(), 12e3)
+        );
+        const authDeadlineMs = Date.now() + authTimeoutMs;
+        const { baseUrl } = parseUrl(config.panelUrl);
+        const client = authOptions?.loginPostFn && authOptions?.csrfGetFn ? null : createAxiosInstance(baseUrl, authTimeoutMs);
+        const headers = {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          "X-Requested-With": "XMLHttpRequest"
+        };
+        const defaultLoginEndpoints = ["/login", "/panel/login"];
+        const rememberedEndpoint = rememberedLoginEndpointByPanel.get(panelIdentity);
+        const loginEndpoints = rememberedEndpoint && defaultLoginEndpoints.includes(rememberedEndpoint) ? [rememberedEndpoint, ...defaultLoginEndpoints.filter((ep) => ep !== rememberedEndpoint)] : defaultLoginEndpoints;
+        let cookieHeader = "";
+        let lastLoginErr = null;
+        for (let idx = 0; idx < loginEndpoints.length; idx++) {
+          const loginEp = loginEndpoints[idx];
+          const remainingBeforeLoginMs = authDeadlineMs - Date.now();
+          if (remainingBeforeLoginMs <= 40) {
+            break;
+          }
+          const endpointsRemaining = loginEndpoints.length - idx;
+          const attemptTimeoutMs = endpointsRemaining > 1 ? Math.max(60, Math.min(remainingBeforeLoginMs, Math.floor(authTimeoutMs * 0.6))) : Math.max(60, remainingBeforeLoginMs);
+          try {
+            const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
+            const body = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+            const reqHeaders = {
+              ...headers,
+              "Content-Type": "application/x-www-form-urlencoded"
+            };
+            const res = authOptions?.loginPostFn ? await authOptions.loginPostFn(fullPath, body, reqHeaders, attemptTimeoutMs) : await client.post(fullPath, body, { headers: reqHeaders, timeout: attemptTimeoutMs });
+            const setCookie = res.headers?.["set-cookie"];
+            const loginPayloadOk = !res.data || res.data.success !== false;
+            if (res.status >= 200 && res.status < 400 && loginPayloadOk && setCookie && Array.isArray(setCookie) && setCookie.length > 0) {
+              cookieHeader = setCookie.map((c) => c.split(";")[0]).join("; ");
+              if (xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration && capturedGeneration >= globalXuiAuthEpoch) {
+                setBoundedMapEntry(
+                  rememberedLoginEndpointByPanel,
+                  panelIdentity,
+                  loginEp,
+                  MAX_XUI_PANEL_CAPABILITY_ENTRIES
+                );
+              }
+              console.log(`[xuiService] Successfully authenticated via ${fullPath} session login`);
+              break;
+            }
+          } catch (loginErr) {
+            lastLoginErr = loginErr;
+          }
+        }
+        if (!cookieHeader && lastLoginErr && Date.now() >= authDeadlineMs) {
+          const msg = String(lastLoginErr?.message || "").toLowerCase();
+          const code = String(lastLoginErr?.code || "").toUpperCase();
+          if (code === "ETIMEDOUT" || code === "ECONNABORTED" || msg.includes("timeout") || msg.includes("timed out")) {
+            throw lastLoginErr;
+          }
+        }
+        if (cookieHeader) {
+          headers["Cookie"] = cookieHeader;
+        }
+        headers["Authorization"] = `Bearer ${password}`;
+        const confirmedUnsupported = confirmedUnsupportedCsrfByPanel.get(panelIdentity);
+        const shouldSkipCsrf = Boolean(
+          !forceRefresh && confirmedUnsupported && confirmedUnsupported.scopeKey === scopeKey && confirmedUnsupported.generation === capturedGeneration
+        );
+        const remainingForCsrfMs = authDeadlineMs - Date.now();
+        if (!shouldSkipCsrf && remainingForCsrfMs > 60) {
+          try {
+            const csrfTimeoutMs = Math.max(60, Math.min(2500, remainingForCsrfMs));
+            const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, "/csrf-token");
+            const csrfRes = authOptions?.csrfGetFn ? await authOptions.csrfGetFn(csrfPath, headers, csrfTimeoutMs) : await client.get(csrfPath, { headers, timeout: csrfTimeoutMs });
+            if (csrfRes.status === 404 || csrfRes.status === 405 || csrfRes.status === 501) {
+              if (cookieHeader && xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration && capturedGeneration >= globalXuiAuthEpoch) {
+                setBoundedMapEntry(
+                  confirmedUnsupportedCsrfByPanel,
+                  panelIdentity,
+                  {
+                    scopeKey,
+                    generation: capturedGeneration,
+                    confirmedAt: Date.now()
+                  },
+                  MAX_XUI_PANEL_CAPABILITY_ENTRIES
+                );
+              }
+            } else {
+              if (csrfRes.status >= 200 && csrfRes.status < 300 && xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration && capturedGeneration >= globalXuiAuthEpoch) {
+                confirmedUnsupportedCsrfByPanel.delete(panelIdentity);
+              }
+              if (csrfRes.data?.obj) {
+                headers["X-CSRF-Token"] = csrfRes.data.obj;
+              }
+              if (Array.isArray(csrfRes.headers?.["set-cookie"]) && csrfRes.headers["set-cookie"].length > 0) {
+                const csrfCookie = csrfRes.headers["set-cookie"].map((c) => c.split(";")[0]).join("; ");
+                headers["Cookie"] = headers["Cookie"] ? `${headers["Cookie"]}; ${csrfCookie}` : csrfCookie;
+              }
+            }
+          } catch {
+          }
+        }
+        const hasActiveScopeAtFinish = xuiAuthGenerationByScope.has(scopeKey);
+        const currentGenAtFinish = hasActiveScopeAtFinish ? xuiAuthGenerationByScope.get(scopeKey) : -1;
+        const existingCachedAtFinish = cachedXuiAuthByScope.get(scopeKey);
+        const isCurrentValidGeneration = hasActiveScopeAtFinish && capturedGeneration >= globalXuiAuthEpoch && capturedGeneration === currentGenAtFinish && (!existingCachedAtFinish || existingCachedAtFinish.generation <= capturedGeneration);
+        if (!isCurrentValidGeneration) {
+          if (hasActiveScopeAtFinish && existingCachedAtFinish && existingCachedAtFinish.generation === currentGenAtFinish && existingCachedAtFinish.generation >= globalXuiAuthEpoch && existingCachedAtFinish.expiresAt > Date.now()) {
+            return { ...existingCachedAtFinish.headers };
+          }
+          const activeInFlight = xuiAuthInFlight.get(scopeKey);
+          if (hasActiveScopeAtFinish && activeInFlight && activeInFlight.promise !== authPromise && activeInFlight.generation === currentGenAtFinish && activeInFlight.generation >= globalXuiAuthEpoch) {
+            return { ...await activeInFlight.promise };
+          }
+          const staleErr = new Error(
+            `Stale 3X-UI authentication response rejected for scope ${scopeKey} (captured generation ${capturedGeneration}, current generation ${currentGenAtFinish}).`
+          );
+          staleErr.code = "XUI_AUTH_STALE_GENERATION";
+          staleErr.staleGeneration = true;
+          throw staleErr;
+        }
+        if (cookieHeader) {
+          setScopeAuthGenerationEntry(scopeKey, capturedGeneration);
+          setBoundedMapEntry(
+            cachedXuiAuthByScope,
+            scopeKey,
             {
-              headers: {
-                ...headers,
-                "Content-Type": "application/x-www-form-urlencoded"
+              scopeKey,
+              panelIdentity,
+              panelUrl: config.panelUrl,
+              generation: capturedGeneration,
+              headers: { ...headers },
+              expiresAt: Date.now() + XUI_AUTH_TTL_MS
+            },
+            getEffectiveMaxXuiAuthScopeEntries(),
+            (evictedScopeKey, evictedEntry) => {
+              if (!xuiAuthGenerationByScope.has(evictedScopeKey)) {
+                minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, evictedEntry.generation + 1);
+                nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, minValidAuthGenerationFloor + 1);
               }
             }
           );
-          const setCookie = res.headers["set-cookie"];
-          if (setCookie && Array.isArray(setCookie)) {
-            cookieHeader = setCookie.map((c) => c.split(";")[0]).join("; ");
-            console.log(`[xuiService] Successfully authenticated via ${fullPath} session login`);
-            break;
-          }
-        } catch (e) {
         }
-      }
-      if (cookieHeader) {
-        headers["Cookie"] = cookieHeader;
-      }
-      headers["Authorization"] = `Bearer ${password}`;
+        return { ...headers };
+      })();
+      xuiAuthInFlight.set(scopeKey, {
+        generation: capturedGeneration,
+        isForceRefresh: Boolean(forceRefresh),
+        promise: authPromise
+      });
       try {
-        const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, "/csrf-token");
-        const csrfRes = await client.get(csrfPath, { headers, timeout: 4e3 });
-        if (csrfRes.data?.obj) {
-          headers["X-CSRF-Token"] = csrfRes.data.obj;
+        return await authPromise;
+      } finally {
+        const active = xuiAuthInFlight.get(scopeKey);
+        if (active && active.promise === authPromise) {
+          xuiAuthInFlight.delete(scopeKey);
         }
-        if (csrfRes.headers["set-cookie"]) {
-          const csrfCookie = csrfRes.headers["set-cookie"].map((c) => c.split(";")[0]).join("; ");
-          headers["Cookie"] = headers["Cookie"] ? `${headers["Cookie"]}; ${csrfCookie}` : csrfCookie;
-        }
-      } catch (e) {
       }
-      if (cookieHeader) {
-        cachedXuiAuth = {
-          panelUrl: config.panelUrl,
-          headers: { ...headers },
-          expiresAt: now + XUI_AUTH_TTL_MS
-        };
-      }
-      return headers;
     };
     requestApi = async (endpoint, method = "GET", data, options) => {
-      const effectiveTimeoutMs = options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1e3, Math.min(Math.floor(options.timeoutMs), 3e4)) : 1e4;
+      const effectiveTimeoutMs = options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(method === "GET" ? 200 : 1e3, Math.min(Math.floor(options.timeoutMs), 3e4)) : 1e4;
+      const requestStartMs = Date.now();
+      const operationDeadlineMs = requestStartMs + effectiveTimeoutMs;
+      const getRemainingGetBudgetMs = (stage, minRequiredMs = 60) => {
+        if (method !== "GET") return effectiveTimeoutMs;
+        const remaining = operationDeadlineMs - Date.now();
+        if (remaining < minRequiredMs) {
+          const timeoutErr = new Error(
+            `3X-UI GET ${endpoint} timed out after ${effectiveTimeoutMs}ms (${stage} budget exhausted)`
+          );
+          timeoutErr.code = "ETIMEDOUT";
+          timeoutErr.statusCode = 504;
+          throw timeoutErr;
+        }
+        return remaining;
+      };
       if (method === "POST") {
         assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint}`);
       }
       const config = options?.configOverride || await getXuiConfig();
+      const { scopeKey } = computeXuiCredentialScopeKey(config);
       const resolveAuthHeaders = options?.authHeadersFn || getXuiAuthHeaders;
+      const authGenBeforeCall = ensureScopeAuthGeneration(scopeKey);
       let headers;
       try {
-        headers = await resolveAuthHeaders(config, false, effectiveTimeoutMs);
+        const initialAuthTimeoutMs = method === "GET" ? getRemainingGetBudgetMs("initial_auth") : effectiveTimeoutMs;
+        try {
+          headers = await resolveAuthHeaders(config, false, initialAuthTimeoutMs);
+        } catch (firstAuthErr) {
+          if (firstAuthErr?.code === "XUI_AUTH_STALE_GENERATION") {
+            const retryInitialAuthMs = method === "GET" ? getRemainingGetBudgetMs("initial_auth_stale_retry") : effectiveTimeoutMs;
+            headers = await resolveAuthHeaders(config, false, retryInitialAuthMs);
+          } else {
+            throw firstAuthErr;
+          }
+        }
       } catch (authErr) {
         if (method === "POST" && authErr && typeof authErr === "object") {
           if (authErr.beforeExternalWrite === void 0) authErr.beforeExternalWrite = true;
@@ -10876,25 +11282,64 @@ var init_xuiService = __esm({
         }
       }
       const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-      const client = options?.httpRequestFn ? null : createAxiosInstance(baseUrl, effectiveTimeoutMs);
-      const executeHttp = (reqHeaders) => options?.httpRequestFn ? options.httpRequestFn({ url: fullPath, method, data, headers: reqHeaders }) : client.request({
-        url: fullPath,
-        method,
-        data,
-        headers: reqHeaders,
-        ...method === "POST" ? { maxRedirects: 0 } : {}
-      });
+      const executeHttp = (reqHeaders, stageLabel) => {
+        const reqTimeoutMs = method === "GET" ? getRemainingGetBudgetMs(stageLabel) : effectiveTimeoutMs;
+        if (options?.httpRequestFn) {
+          return options.httpRequestFn({ url: fullPath, method, data, headers: reqHeaders });
+        }
+        const client = createAxiosInstance(baseUrl, reqTimeoutMs);
+        return client.request({
+          url: fullPath,
+          method,
+          data,
+          headers: reqHeaders,
+          timeout: reqTimeoutMs,
+          ...method === "POST" ? { maxRedirects: 0 } : {}
+        });
+      };
       try {
-        let response = await executeHttp(headers);
+        let response = await executeHttp(headers, "initial_get");
         let attemptedAuthenticatedRetry = false;
         const locationHeader = String(
           response?.headers?.location || response?.headers?.Location || ""
         ).toLowerCase();
         const isUnauthenticatedRejection = response.status === 401 || response.status === 403 || (response.status === 302 || response.status === 307) && (method !== "POST" || /(?:^|\/)(?:login|auth)(?:[/?#]|$)|login|signin/i.test(locationHeader));
         if (isUnauthenticatedRejection) {
-          cachedXuiAuth = null;
           try {
-            headers = await resolveAuthHeaders(config, true, effectiveTimeoutMs);
+            const retryAuthBudgetMs = method === "GET" ? getRemainingGetBudgetMs("reauth_after_401") : effectiveTimeoutMs;
+            const currentScopeGen = getScopeAuthGeneration(scopeKey);
+            if (options?.authHeadersFn) {
+              if (currentScopeGen === authGenBeforeCall) {
+                const nextGen = invalidateXuiAuthCache(scopeKey, authGenBeforeCall);
+                const customReauthPromise = resolveAuthHeaders(config, true, retryAuthBudgetMs);
+                xuiAuthInFlight.set(scopeKey, {
+                  generation: nextGen,
+                  isForceRefresh: true,
+                  promise: customReauthPromise
+                });
+                try {
+                  headers = { ...await customReauthPromise };
+                } finally {
+                  const active = xuiAuthInFlight.get(scopeKey);
+                  if (active && active.promise === customReauthPromise) {
+                    xuiAuthInFlight.delete(scopeKey);
+                  }
+                }
+              } else {
+                const activeInFlight = xuiAuthInFlight.get(scopeKey);
+                if (activeInFlight && activeInFlight.generation === currentScopeGen) {
+                  headers = { ...await activeInFlight.promise };
+                } else {
+                  headers = await resolveAuthHeaders(config, false, retryAuthBudgetMs);
+                }
+              }
+            } else {
+              if (currentScopeGen === authGenBeforeCall) {
+                headers = await getXuiAuthHeaders(config, true, retryAuthBudgetMs);
+              } else {
+                headers = await getXuiAuthHeaders(config, false, retryAuthBudgetMs);
+              }
+            }
           } catch (reauthErr) {
             if (method === "POST" && reauthErr && typeof reauthErr === "object") {
               if (reauthErr.beforeExternalWrite === void 0) reauthErr.beforeExternalWrite = true;
@@ -10915,7 +11360,7 @@ var init_xuiService = __esm({
             }
           }
           attemptedAuthenticatedRetry = true;
-          response = await executeHttp(headers);
+          response = await executeHttp(headers, "retry_get_after_401");
         }
         if (response.status !== 200) {
           const statusErr = new Error(`3X-UI API Error: ${response.status} ${response.statusText}`);
@@ -10964,23 +11409,69 @@ var init_xuiService = __esm({
       }
       throw lastError || new Error("Connection test failed on all endpoints");
     };
-    getInbounds = async (forceRefresh = false) => {
+    getInbounds = async (forceRefresh = false, options) => {
+      let panelIdentity = String(options?.panelIdentity || "").trim();
+      if (!panelIdentity && !options?.fetcher) {
+        try {
+          const cfg = await getXuiConfig();
+          panelIdentity = computePanelIdentity(cfg.panelUrl) || "default";
+        } catch {
+          panelIdentity = "default";
+        }
+      }
+      if (!panelIdentity) {
+        panelIdentity = "default";
+      }
       const now = Date.now();
       const CACHE_TTL_MS = 5 * 60 * 1e3;
-      if (!forceRefresh && cachedInbounds.length > 0 && now - lastInboundsCacheTime < CACHE_TTL_MS) {
+      const samePanelCache = !cachedInboundsPanelIdentity || panelIdentity === "default" || cachedInboundsPanelIdentity === panelIdentity;
+      if (!forceRefresh && samePanelCache && cachedInbounds.length > 0 && now - lastInboundsCacheTime < CACHE_TTL_MS) {
+        return cachedInbounds;
+      }
+      const existingInFlight = inboundsInFlight.get(panelIdentity);
+      if (existingInFlight && existingInFlight.generation === inboundsCacheGeneration && (!forceRefresh || existingInFlight.isForceRefresh)) {
+        return existingInFlight.promise;
+      }
+      if (!forceRefresh && !options?.skipFailureCooldown && samePanelCache && lastFailedInboundsAt > 0 && now - lastFailedInboundsAt < FAILED_INBOUNDS_COOLDOWN_MS) {
         return cachedInbounds;
       }
       const endpoint = "/panel/api/inbounds/list";
-      try {
-        const inboundsData = await requestApi(endpoint);
-        if (Array.isArray(inboundsData)) {
-          setCachedInbounds(inboundsData);
-          return inboundsData;
+      const capturedGeneration = inboundsCacheGeneration;
+      const timeoutMs = options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(2e3, Math.min(Math.floor(options.timeoutMs), 25e3)) : getXuiFullListTimeoutMs();
+      const fetchPromise = (async () => {
+        isCacheRefreshing = true;
+        try {
+          const inboundsData = options?.fetcher ? await options.fetcher() : await requestApi(endpoint, "GET", void 0, { timeoutMs });
+          if (Array.isArray(inboundsData)) {
+            if (capturedGeneration === inboundsCacheGeneration) {
+              setCachedInbounds(inboundsData, panelIdentity, capturedGeneration);
+              lastFailedInboundsAt = 0;
+            }
+            return inboundsData;
+          }
+          return samePanelCache ? cachedInbounds : [];
+        } catch (error) {
+          if (capturedGeneration === inboundsCacheGeneration) {
+            lastFailedInboundsAt = Date.now();
+          }
+          console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
+          return samePanelCache ? cachedInbounds : [];
+        } finally {
+          isCacheRefreshing = false;
         }
-        return cachedInbounds;
-      } catch (error) {
-        console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
-        return cachedInbounds;
+      })();
+      inboundsInFlight.set(panelIdentity, {
+        generation: capturedGeneration,
+        isForceRefresh: Boolean(forceRefresh),
+        promise: fetchPromise
+      });
+      try {
+        return await fetchPromise;
+      } finally {
+        const active = inboundsInFlight.get(panelIdentity);
+        if (active && active.promise === fetchPromise) {
+          inboundsInFlight.delete(panelIdentity);
+        }
       }
     };
     LIVE_INBOUND_CACHE_TTL_MS = 10 * 1e3;
@@ -10989,6 +11480,9 @@ var init_xuiService = __esm({
     liveInboundCacheGeneration = 0;
     invalidateInboundCache = (inboundId) => {
       liveInboundCacheGeneration += 1;
+      inboundsCacheGeneration += 1;
+      lastFailedInboundsAt = 0;
+      inboundsInFlight.clear();
       const numericId = inboundId !== void 0 && inboundId !== null ? Number(inboundId) : NaN;
       if (!Number.isNaN(numericId) && numericId > 0) {
         liveInboundCache.delete(numericId);
@@ -11006,8 +11500,12 @@ var init_xuiService = __esm({
       }
       const forceRefresh = typeof options === "boolean" ? options : Boolean(options?.forceRefresh);
       const customFetcher = typeof options === "object" ? options?.fetcher : void 0;
+      const timeoutMs = typeof options === "object" && options?.timeoutMs ? options.timeoutMs : getXuiSingleInboundTimeoutMs();
       const now = Date.now();
-      if (!forceRefresh) {
+      if (forceRefresh) {
+        liveInboundCacheGeneration += 1;
+        liveInboundCache.delete(normalizedId);
+      } else {
         const cachedEntry = liveInboundCache.get(normalizedId);
         if (cachedEntry && now - cachedEntry.fetchedAt < LIVE_INBOUND_CACHE_TTL_MS) {
           return cachedEntry.inbound;
@@ -11025,7 +11523,7 @@ var init_xuiService = __esm({
             inbound = await customFetcher(normalizedId);
           } else {
             console.log(`[XUI Service] Fetching live inbound ${normalizedId} directly for dashboard query...`);
-            const res = await requestApi(`/panel/api/inbounds/get/${normalizedId}`, "GET");
+            const res = await requestApi(`/panel/api/inbounds/get/${normalizedId}`, "GET", void 0, { timeoutMs });
             inbound = res?.obj || res;
           }
           if (inbound && typeof inbound === "object" && inbound.id !== void 0) {
@@ -13904,13 +14402,23 @@ var init_xuiService = __esm({
       }
       return { count: expiredCount };
     };
-    setCachedInbounds = (inbounds) => {
+    setCachedInbounds = (inbounds, panelIdentity, expectedGeneration) => {
+      if (expectedGeneration !== void 0 && expectedGeneration !== inboundsCacheGeneration) {
+        return;
+      }
       if (Array.isArray(inbounds)) {
         cachedInbounds = inbounds;
         lastInboundsCacheTime = Date.now();
+        if (panelIdentity !== void 0) {
+          cachedInboundsPanelIdentity = panelIdentity;
+        }
       }
     };
-    getCachedInbounds = async () => {
+    getCachedInbounds = async (panelIdentity) => {
+      const requestedPanel = String(panelIdentity || "").trim();
+      if (requestedPanel && cachedInboundsPanelIdentity && cachedInboundsPanelIdentity !== "default" && requestedPanel !== cachedInboundsPanelIdentity) {
+        return [];
+      }
       return cachedInbounds;
     };
     isSyncInProgress = false;
@@ -14311,7 +14819,33 @@ var init_xuiService = __esm({
         console.error(`[Background Sync] Failed for reason "${reason}":`, err.message || err);
       });
     };
-    runBackgroundSync = async (reason = "Scheduled", force = false) => {
+    startBackgroundSyncScheduler = (deps) => {
+      const triggerBg = deps?.triggerBackgroundSyncFn || triggerBackgroundSyncIfNeeded;
+      const triggerDel = deps?.triggerPanelDeletionSyncFn || triggerPanelDeletionSyncIfNeeded;
+      const startupDelayMs = deps?.startupDelayMs ?? 5e3;
+      const intervalMs = deps?.intervalMs ?? 6e4;
+      const startupTimer = setTimeout(() => {
+        try {
+          triggerBg("Server Start", true);
+        } catch (err) {
+          console.error("[Scheduler] Initial background sync error:", err);
+        }
+      }, startupDelayMs);
+      const intervalTimer = setInterval(() => {
+        try {
+          triggerBg("Scheduled", false);
+        } catch (err) {
+          console.error("[Scheduler] Scheduled background sync error:", err);
+        }
+        try {
+          triggerDel("Scheduled", false);
+        } catch (err) {
+          console.error("[Scheduler] Scheduled panel deletion sync error:", err);
+        }
+      }, intervalMs);
+      return { startupTimer, intervalTimer };
+    };
+    runBackgroundSync = async (reason = "Scheduled", force = false, deps) => {
       if (isSyncInProgress) {
         console.log("[Background Sync] Skipped (sync already in progress)");
         return;
@@ -14320,21 +14854,41 @@ var init_xuiService = __esm({
       console.log(`[Background Sync] Synchronization started (Reason: ${reason})`);
       const syncStartTime = Date.now();
       try {
-        const inbounds = await getInbounds(force);
-        const trialCleanupResult = await cleanupExpiredTrials();
+        let inbounds = [];
+        try {
+          const fetchInbounds = deps?.getInboundsFn || getInbounds;
+          inbounds = await fetchInbounds(force);
+        } catch (inbErr) {
+          console.error("[Background Sync] Initial inbound warmup failed (continuing cleanup/deletion sync):", inbErr?.message || inbErr);
+        }
+        let trialCleanupResult = { count: 0 };
+        try {
+          const runTrialCleanup = deps?.cleanupExpiredTrialsFn || cleanupExpiredTrials;
+          trialCleanupResult = await runTrialCleanup();
+        } catch (trialErr) {
+          console.error("[Background Sync] Expired trial cleanup failed (continuing deletion sync):", trialErr?.message || trialErr);
+        }
         let deletedCount = 0;
-        const syncResult = await syncDeleted3XUiClients({ enforceCrossInstanceLease: true });
-        deletedCount = syncResult.deletedCount;
-        runScheduledExpiryEmailCheck().catch((expErr) => {
+        try {
+          const runDeletionSync = deps?.syncDeleted3XUiClientsFn || syncDeleted3XUiClients;
+          const syncResult = await runDeletionSync({ enforceCrossInstanceLease: true });
+          deletedCount = syncResult.deletedCount;
+        } catch (delErr) {
+          console.error("[Background Sync] Panel deletion sync failed:", delErr?.message || delErr);
+        }
+        const runExpiryCheck = deps?.runScheduledExpiryEmailCheckFn || runScheduledExpiryEmailCheck;
+        runExpiryCheck().catch((expErr) => {
           console.warn("[Background Sync] Scheduled expiry email check warning:", expErr?.message || expErr);
         });
         lastSyncAt = Date.now();
         const durationSec = ((Date.now() - syncStartTime) / 1e3).toFixed(1);
         let ordersCount = 0;
-        try {
-          const { count } = await supabaseAdmin.from("orders").select("*", { count: "exact", head: true }).in("status", ["active", "trial", "pending"]);
-          ordersCount = count || 0;
-        } catch (e) {
+        if (!deps) {
+          try {
+            const { count } = await supabaseAdmin.from("orders").select("*", { count: "exact", head: true }).in("status", ["active", "trial", "pending"]);
+            ordersCount = count || 0;
+          } catch {
+          }
         }
         let clientsCount = 0;
         if (inbounds && inbounds.length > 0) {
@@ -14342,7 +14896,7 @@ var init_xuiService = __esm({
             let settingsObj = {};
             try {
               if (ib.settings) settingsObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings;
-            } catch (e) {
+            } catch {
             }
             const clients = settingsObj.clients || [];
             clientsCount += clients.length;
@@ -14402,7 +14956,11 @@ var init_xuiService = __esm({
     };
     fetchUncachedLiveInboundsList = async (options) => {
       try {
-        const rawList = await requestApi("/panel/api/inbounds/list", "GET", void 0, options);
+        const effectiveOptions = {
+          ...options,
+          timeoutMs: options?.timeoutMs ?? getXuiFullListTimeoutMs()
+        };
+        const rawList = await requestApi("/panel/api/inbounds/list", "GET", void 0, effectiveOptions);
         if (!Array.isArray(rawList)) {
           return {
             ok: false,
@@ -15277,6 +15835,7 @@ var init_xuiService = __esm({
                       `[3X-UI Sync] Authoritative reconciliation confirmed deletion commit for ${normUuid}; releasing locks cleanly.`
                     );
                     invalidateInboundCache(inboundId);
+                    notifyClientTrafficInvalidated(normUuid, "deleted");
                     return {
                       confirmedDeleted: true,
                       applied: true,
@@ -15308,6 +15867,7 @@ var init_xuiService = __esm({
                   });
                   if (recon.status === "confirmed_committed") {
                     invalidateInboundCache(inboundId);
+                    notifyClientTrafficInvalidated(normUuid, "deleted");
                     return {
                       confirmedDeleted: true,
                       applied: true,
@@ -15351,6 +15911,7 @@ var init_xuiService = __esm({
                 const auditLogged = Boolean(row.audit_log_inserted ?? row.audit_logged);
                 const dbWrites = applied ? 1 : 0;
                 invalidateInboundCache(inboundId);
+                notifyClientTrafficInvalidated(normUuid, "deleted");
                 return {
                   confirmedDeleted: true,
                   applied,
@@ -15589,6 +16150,7 @@ var init_xuiService = __esm({
             };
           }
         }
+        const snap1CacheGeneration = inboundsCacheGeneration;
         const snap1 = await countedReadList();
         if (!snap1 || !snap1.ok || !Array.isArray(snap1.inbounds) || snap1.inbounds.length === 0) {
           console.warn(
@@ -15605,7 +16167,7 @@ var init_xuiService = __esm({
           };
         }
         if (snap1.allInboundsCleanlyParsed && snap1.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
-          setCachedInbounds(snap1.inbounds);
+          setCachedInbounds(snap1.inbounds, currentPanelIdentity, snap1CacheGeneration);
         }
         const configuredServers = options?.configuredServers !== void 0 ? options.configuredServers : await loadConfiguredXuiServers(dbClient);
         console.log(
@@ -16499,6 +17061,9 @@ var init_xuiService = __esm({
           throw failErr;
         }
         invalidateInboundCache(resolvedInboundId || inboundId || null);
+        if (resolvedUuid) {
+          notifyClientTrafficInvalidated(resolvedUuid, "reset");
+        }
         try {
           await getInboundsCall(true);
         } catch (refreshErr) {
@@ -17939,6 +18504,110 @@ init_supabase();
 init_xuiService();
 init_notificationService();
 import crypto6 from "crypto";
+var CLIENT_TRAFFIC_CACHE_TTL_MS = 30 * 60 * 1e3;
+var CLIENT_TRAFFIC_CACHE_MAX_ENTRIES = 2e3;
+var CUSTOMER_MY_CONFIGS_TOTAL_BUDGET_MS = 8500;
+var CUSTOMER_MAX_COLD_START_WAIT_MS = 4500;
+var CUSTOMER_MAX_LIVE_INBOUND_WAIT_MS = 4e3;
+var lastKnownClientTrafficByScope = /* @__PURE__ */ new Map();
+var buildCustomerTrafficCacheKey = (params) => {
+  const panelId = String(params.panelIdentity || "").trim();
+  const uid = String(params.userUid || "").trim();
+  const uuid = String(params.clientUuid || "").trim().toLowerCase();
+  if (!panelId || !uid || !uuid) return null;
+  if (params.hasVerifiedOwnership === false) return null;
+  const recPanel = String(params.recordPanelIdentity || "").trim();
+  if (recPanel && recPanel !== panelId) {
+    return null;
+  }
+  return `${panelId}::${uid}::${uuid}`;
+};
+var evictExpiredOrOverflowTrafficCacheEntries = (nowMs, maxEntries = CLIENT_TRAFFIC_CACHE_MAX_ENTRIES) => {
+  if (lastKnownClientTrafficByScope.size >= maxEntries) {
+    for (const [k, entry] of Array.from(lastKnownClientTrafficByScope.entries())) {
+      if (nowMs - entry.updatedAtMs > CLIENT_TRAFFIC_CACHE_TTL_MS) {
+        lastKnownClientTrafficByScope.delete(k);
+      }
+    }
+  }
+  while (lastKnownClientTrafficByScope.size > maxEntries) {
+    const oldestKey = lastKnownClientTrafficByScope.keys().next().value;
+    if (oldestKey === void 0) break;
+    lastKnownClientTrafficByScope.delete(oldestKey);
+  }
+};
+var setScopedClientTrafficCacheEntry = (entry, nowMs, maxEntries = CLIENT_TRAFFIC_CACHE_MAX_ENTRIES) => {
+  if (lastKnownClientTrafficByScope.has(entry.cacheKey)) {
+    lastKnownClientTrafficByScope.delete(entry.cacheKey);
+  }
+  lastKnownClientTrafficByScope.set(entry.cacheKey, entry);
+  evictExpiredOrOverflowTrafficCacheEntries(nowMs, maxEntries);
+};
+var getScopedClientTrafficCacheEntry = (cacheKey, nowMs, expectedMutationSeq, maxEvictedEpoch = 0, mutationStatePresent = false) => {
+  if (!cacheKey) return void 0;
+  const entry = lastKnownClientTrafficByScope.get(cacheKey);
+  if (!entry) return void 0;
+  if (nowMs - entry.updatedAtMs > CLIENT_TRAFFIC_CACHE_TTL_MS) {
+    lastKnownClientTrafficByScope.delete(cacheKey);
+    return void 0;
+  }
+  if (expectedMutationSeq !== void 0 && entry.mutationSeq !== expectedMutationSeq) {
+    return void 0;
+  }
+  if (!mutationStatePresent && maxEvictedEpoch > 0 && entry.mutationSeq <= maxEvictedEpoch) {
+    lastKnownClientTrafficByScope.delete(cacheKey);
+    return void 0;
+  }
+  return entry;
+};
+var purgeClientTrafficCacheByUuid = (clientUuid) => {
+  const normUuid = String(clientUuid || "").trim().toLowerCase();
+  if (!normUuid) return;
+  for (const [k, entry] of Array.from(lastKnownClientTrafficByScope.entries())) {
+    if (entry.clientUuid === normUuid) {
+      lastKnownClientTrafficByScope.delete(k);
+    }
+  }
+};
+registerClientTrafficCacheInvalidator((clientUuid, reason, state) => {
+  if (reason === "clear") {
+    lastKnownClientTrafficByScope.clear();
+    return;
+  }
+  const normUuid = String(clientUuid || "").trim().toLowerCase();
+  if (!normUuid) return;
+  if (reason === "deleted") {
+    purgeClientTrafficCacheByUuid(normUuid);
+    return;
+  }
+  if (reason === "reset") {
+    for (const [k, entry] of Array.from(lastKnownClientTrafficByScope.entries())) {
+      if (entry.clientUuid === normUuid) {
+        lastKnownClientTrafficByScope.set(k, {
+          ...entry,
+          up: 0,
+          down: 0,
+          updatedAtMs: state.lastResetAtMs || Date.now(),
+          mutationSeq: state.seq
+        });
+      }
+    }
+  }
+});
+var raceWithTimeout = async (promise, timeoutMs, onTimeout) => {
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      onTimeout();
+      resolve(null);
+    }, Math.max(50, timeoutMs));
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
 var TRAFFIC_RESET_UNLIMITED_ONLY_MESSAGE = "Traffic reset is only available for eligible unlimited VPN packages.";
 var FINITE_QUOTA_UNIT_REGEX = /(?:^|\b)(\d+(?:\.\d+)?)\s*(?:kb|mb|gb|tb|gib|mib|tib|bytes?)\b/i;
 var FINITE_PACKAGE_SHORTHAND_REGEX = /\b(?:sim|router)[_\s-]?(?:100|200|500|1000|1tb|50|20|10|5|1)\b|\b(?:100|200|500)\s*g\b/i;
@@ -18509,6 +19178,8 @@ var buildRejectedVpnDisplayConfig = (ord, grant) => {
     ord.reject_reason || ord.rejection_reason || grant?.revoke_reason || null
   );
   const expiryDate = ord.expiry_date || ord.expiryDate || "";
+  const rawTrafficLimitText = isTrialOrd ? "1GB" : ord.traffic_limit && String(ord.traffic_limit).trim() !== "" ? String(ord.traffic_limit).trim() : "Unavailable";
+  const rejectedQuotaVerified = rawTrafficLimitText !== "Unavailable";
   return {
     id: `rejected-${orderDocId || displayOrderId}`,
     orderId: displayOrderId,
@@ -18522,7 +19193,7 @@ var buildRejectedVpnDisplayConfig = (ord, grant) => {
     vlessUrl: null,
     subscriptionUrl: null,
     inboundId: null,
-    trafficLimit: isTrialOrd ? "1GB" : ord.traffic_limit || "Unlimited",
+    trafficLimit: rawTrafficLimitText,
     usedGB: 0,
     remainingGB: "Disabled",
     upBytes: 0,
@@ -18530,6 +19201,11 @@ var buildRejectedVpnDisplayConfig = (ord, grant) => {
     upload: 0,
     download: 0,
     liveUsageFound: false,
+    trafficVerified: false,
+    trafficSource: "unknown",
+    quotaVerified: rejectedQuotaVerified,
+    usedTrafficKnown: false,
+    remainingTrafficKnown: false,
     panelStatusVerified: true,
     statusReason: "payment_rejected",
     totalTrafficBytes: 0,
@@ -18567,40 +19243,162 @@ var getMyConfigs = async (uid, email, _token, options) => {
   const adminDb = options?.adminDbClient || supabaseAdmin;
   const nowMs = options?.nowMs ?? Date.now();
   if (!userUid && !userEmail) {
-    return { configs: [], deletedUuids: [], dbTime: 0 };
+    return { configs: [], deletedUuids: [], legacyReconciliationRecords: [], dbTime: 0 };
   }
+  const totalRequestBudgetMs = options?.totalRequestBudgetMs && Number.isFinite(options.totalRequestBudgetMs) && options.totalRequestBudgetMs > 0 ? Math.max(50, Math.min(Math.floor(options.totalRequestBudgetMs), 12e3)) : CUSTOMER_MY_CONFIGS_TOTAL_BUDGET_MS;
+  const customerRequestDeadlineMs = dbStart + totalRequestBudgetMs;
+  const getRemainingCustomerBudgetMs = () => Math.max(0, customerRequestDeadlineMs - Date.now());
+  let customerRequestTimedOut = false;
+  const createCustomerDeadlineError = (stage) => {
+    customerRequestTimedOut = true;
+    const err = new Error(
+      `Customer configuration lookup timed out during ${stage} (exceeded ${totalRequestBudgetMs}ms request budget).`
+    );
+    err.status = 504;
+    err.statusCode = 504;
+    err.code = "CUSTOMER_REQUEST_DEADLINE_EXCEEDED";
+    err.retryable = true;
+    return err;
+  };
+  const createCustomerQueryFailureError = (stage, cause) => {
+    if (cause?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED" || cause?.code === "AUTHORITATIVE_MUTATION_RECHECK_FAILED") {
+      return cause;
+    }
+    const msg = cause?.message || String(cause || "database query failed");
+    const err = new Error(`Customer configuration query failed during ${stage}: ${msg}`);
+    err.status = 503;
+    err.statusCode = 503;
+    err.code = "CUSTOMER_CONFIG_QUERY_FAILED";
+    err.retryable = true;
+    return err;
+  };
+  const runRequiredCustomerStage = async (stage, fn, minRequiredMs = 15) => {
+    const remainingMs = getRemainingCustomerBudgetMs();
+    if (remainingMs < minRequiredMs) {
+      throw createCustomerDeadlineError(stage);
+    }
+    let timer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(createCustomerDeadlineError(stage));
+      }, Math.max(15, remainingMs));
+    });
+    try {
+      return await Promise.race([fn(), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const inboundMap = /* @__PURE__ */ new Map();
+  const recordedInboundByUuid = /* @__PURE__ */ new Map();
+  const conflictingInboundUuids = /* @__PURE__ */ new Set();
+  const recordedOwnerUidByUuid = /* @__PURE__ */ new Map();
+  const recordedPanelByUuid = /* @__PURE__ */ new Map();
+  const conflictingOwnershipUuids = /* @__PURE__ */ new Set();
+  const recordInboundForUuidAndOrder = (normUuid, orderId, rawIbId) => {
+    const ibId = Number(rawIbId);
+    if (Number.isNaN(ibId) || ibId <= 0) return;
+    if (normUuid) {
+      const existingIb = recordedInboundByUuid.get(normUuid);
+      if (existingIb !== void 0 && existingIb !== ibId) {
+        conflictingInboundUuids.add(normUuid);
+      } else {
+        recordedInboundByUuid.set(normUuid, ibId);
+      }
+      if (!inboundMap.has(normUuid)) {
+        inboundMap.set(normUuid, ibId);
+      }
+    }
+    if (orderId) {
+      const existingOrdIb = inboundMap.get(orderId);
+      if (existingOrdIb !== void 0 && existingOrdIb !== ibId && normUuid) {
+        conflictingInboundUuids.add(normUuid);
+      } else if (existingOrdIb === void 0) {
+        inboundMap.set(orderId, ibId);
+      }
+    }
+  };
+  const recordOwnershipMetadata = (normUuid, candidateUids, rawPanelIdentity) => {
+    if (!normUuid) return;
+    const nonEmptyUids = Array.from(
+      new Set(
+        candidateUids.map((u) => String(u || "").trim()).filter(Boolean)
+      )
+    );
+    if (nonEmptyUids.length > 1) {
+      conflictingOwnershipUuids.add(normUuid);
+    }
+    for (const u of nonEmptyUids) {
+      if (userUid && u !== userUid) {
+        conflictingOwnershipUuids.add(normUuid);
+      }
+      const prevUid = recordedOwnerUidByUuid.get(normUuid);
+      if (prevUid && prevUid !== u) {
+        conflictingOwnershipUuids.add(normUuid);
+      } else if (!prevUid) {
+        recordedOwnerUidByUuid.set(normUuid, u);
+      }
+    }
+    const panelId = String(rawPanelIdentity || "").trim();
+    if (panelId) {
+      const prevPanel = recordedPanelByUuid.get(normUuid);
+      if (prevPanel && prevPanel !== panelId) {
+        conflictingOwnershipUuids.add(normUuid);
+      } else if (!prevPanel) {
+        recordedPanelByUuid.set(normUuid, panelId);
+      }
+    }
+  };
   const vpnConfigsMap = /* @__PURE__ */ new Map();
   if (userUid) {
     try {
-      const [byCustomerUidRes, byUserIdRes] = await Promise.all([
-        db.from("vpn_configs").select("*").eq("customer_uid", userUid),
-        db.from("vpn_configs").select("*").eq("user_id", userUid)
-      ]);
+      const [byCustomerUidRes, byUserIdRes] = await runRequiredCustomerStage(
+        "vpn_configs_query",
+        () => Promise.all([
+          db.from("vpn_configs").select("*").eq("customer_uid", userUid),
+          db.from("vpn_configs").select("*").eq("user_id", userUid)
+        ])
+      );
+      if (byCustomerUidRes?.error) {
+        throw createCustomerQueryFailureError("vpn_configs_customer_uid", byCustomerUidRes.error);
+      }
+      if (byUserIdRes?.error) {
+        throw createCustomerQueryFailureError("vpn_configs_user_id", byUserIdRes.error);
+      }
       const combinedCfgs = [
-        ...Array.isArray(byCustomerUidRes.data) ? byCustomerUidRes.data : [],
-        ...Array.isArray(byUserIdRes.data) ? byUserIdRes.data : []
+        ...Array.isArray(byCustomerUidRes?.data) ? byCustomerUidRes.data : [],
+        ...Array.isArray(byUserIdRes?.data) ? byUserIdRes.data : []
       ];
       combinedCfgs.forEach((cfg) => {
         const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
         vpnConfigsMap.set(key, cfg);
       });
-    } catch (_e) {
+    } catch (e) {
+      throw createCustomerQueryFailureError("vpn_configs_query", e);
     }
   }
   const vpnConfigsData = Array.from(vpnConfigsMap.values());
-  const inboundMap = /* @__PURE__ */ new Map();
   const confirmedDeletedUuids = /* @__PURE__ */ new Set();
   const blockedNonActiveUuids = /* @__PURE__ */ new Set();
   const vpnConfigOrderIds = /* @__PURE__ */ new Set();
   const vpnConfigByUuid = /* @__PURE__ */ new Map();
   vpnConfigsData.forEach((cfg) => {
     const normUuid = cfg.uuid ? String(cfg.uuid).trim().toLowerCase() : "";
+    const ordIdStr = cfg.order_id ? String(cfg.order_id).trim() : "";
     if (normUuid) {
+      if (vpnConfigByUuid.has(normUuid)) {
+        const prevCfg = vpnConfigByUuid.get(normUuid);
+        if (prevCfg && prevCfg.id !== cfg.id) {
+          recordInboundForUuidAndOrder(normUuid, ordIdStr, prevCfg.inbound_id);
+          recordOwnershipMetadata(normUuid, [prevCfg.user_id, prevCfg.customer_uid], prevCfg.panel_identity);
+        }
+      }
       vpnConfigByUuid.set(normUuid, cfg);
     }
-    if (cfg.order_id) {
-      vpnConfigOrderIds.add(String(cfg.order_id).trim());
+    if (ordIdStr) {
+      vpnConfigOrderIds.add(ordIdStr);
     }
+    recordOwnershipMetadata(normUuid, [cfg.user_id, cfg.customer_uid], cfg.panel_identity);
     const cfgStatus = String(cfg.status || "").toLowerCase().trim();
     const isDeleted = cfgStatus === "deleted" || Boolean(cfg.deleted_from_panel_at);
     if (isDeleted && normUuid) {
@@ -18610,38 +19408,55 @@ var getMyConfigs = async (uid, email, _token, options) => {
     if (cfgStatus === "deleted" || cfgStatus === "rejected" || cfgStatus === "cancelled" || cfgStatus === "pending" || cfgStatus === "revoked") {
       if (normUuid) blockedNonActiveUuids.add(normUuid);
     }
-    const ibId = Number(cfg.inbound_id);
-    if (!isNaN(ibId) && ibId > 0) {
-      if (cfg.order_id) inboundMap.set(String(cfg.order_id), ibId);
-      if (normUuid) inboundMap.set(normUuid, ibId);
-    }
+    recordInboundForUuidAndOrder(normUuid, ordIdStr, cfg.inbound_id);
   });
   const ordersById = /* @__PURE__ */ new Map();
   if (userUid) {
     try {
-      const { data: ordersByUid } = await db.from("orders").select("*").eq("customer_id", userUid);
+      const ordersByUidRes = await runRequiredCustomerStage(
+        "orders_by_uid_query",
+        () => db.from("orders").select("*").eq("customer_id", userUid)
+      );
+      if (ordersByUidRes?.error) {
+        throw createCustomerQueryFailureError("orders_by_uid_query", ordersByUidRes.error);
+      }
+      const ordersByUid = ordersByUidRes?.data;
       if (Array.isArray(ordersByUid)) {
         ordersByUid.forEach((ord) => {
           const key = String(ord.id || ord.order_id || Math.random());
           ordersById.set(key, ord);
         });
       }
-    } catch (_e) {
+    } catch (e) {
+      throw createCustomerQueryFailureError("orders_by_uid_query", e);
     }
   }
   if (userEmail) {
     try {
-      const { data: ordersByEmail } = await db.from("orders").select("*").ilike("email", userEmail);
+      const ordersByEmailRes = await runRequiredCustomerStage(
+        "orders_by_email_query",
+        () => db.from("orders").select("*").ilike("email", userEmail)
+      );
+      if (ordersByEmailRes?.error) {
+        throw createCustomerQueryFailureError("orders_by_email_query", ordersByEmailRes.error);
+      }
+      const ordersByEmail = ordersByEmailRes?.data;
       if (Array.isArray(ordersByEmail)) {
         ordersByEmail.forEach((ord) => {
           const docUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || "").trim();
+          const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || "").trim().toLowerCase();
+          if (userUid && docUid && docUid !== userUid) {
+            if (cUuid) conflictingOwnershipUuids.add(cUuid);
+            return;
+          }
           if (!userUid || !docUid || docUid === userUid) {
             const key = String(ord.id || ord.order_id || Math.random());
             ordersById.set(key, ord);
           }
         });
       }
-    } catch (_e) {
+    } catch (e) {
+      throw createCustomerQueryFailureError("orders_by_email_query", e);
     }
   }
   const allOrders = Array.from(ordersById.values());
@@ -18672,11 +19487,8 @@ var getMyConfigs = async (uid, email, _token, options) => {
     const gStatus = String(g.status || "").toLowerCase().trim();
     const gUuid = String(g.client_uuid || "").trim().toLowerCase();
     const gOrderId = String(g.order_id || "").trim();
-    const gIbId = Number(g.inbound_id);
-    if (!Number.isNaN(gIbId) && gIbId > 0) {
-      if (gOrderId && !inboundMap.has(gOrderId)) inboundMap.set(gOrderId, gIbId);
-      if (gUuid && !inboundMap.has(gUuid)) inboundMap.set(gUuid, gIbId);
-    }
+    recordInboundForUuidAndOrder(gUuid, gOrderId, g.inbound_id);
+    recordOwnershipMetadata(gUuid, [g.user_id, g.customer_id], g.panel_identity);
     if (gUuid) {
       const existing = grantsByUuid.get(gUuid) || [];
       if (!existing.some((x) => x.id && g.id ? x.id === g.id : x === g)) {
@@ -18705,16 +19517,27 @@ var getMyConfigs = async (uid, email, _token, options) => {
   const customerOrderRowIds = allOrders.map((ord) => ord?.id ? String(ord.id).trim() : "").filter(Boolean);
   if (customerOrderRowIds.length > 0 && adminDb) {
     try {
-      const grantsRes = await adminDb.from("vpn_entitlement_grants").select("*").in("order_id", customerOrderRowIds);
-      const grants = grantsRes.data;
+      const grantsRes = await runRequiredCustomerStage(
+        "vpn_entitlement_grants_by_order_query",
+        () => adminDb.from("vpn_entitlement_grants").select("*").in("order_id", customerOrderRowIds)
+      );
+      const grants = grantsRes?.data;
       if (Array.isArray(grants)) {
         grants.forEach(registerGrantRow);
       }
-    } catch (_grantErr) {
+    } catch (grantErr) {
+      if (grantErr?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED") {
+        throw grantErr;
+      }
     }
   }
   allOrders.forEach((ord) => {
     const rawStatus = String(ord.status || "").toLowerCase().trim();
+    const ordUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || "").trim();
+    const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || "").trim().toLowerCase();
+    const ordIdStr = String(ord.id || ord.order_id || "").trim();
+    recordOwnershipMetadata(cUuid, [ordUid], ord.panel_identity);
+    recordInboundForUuidAndOrder(cUuid, ordIdStr, ord.inbound_id);
     if (isOrderProvisionallyActive(ord)) {
       return;
     }
@@ -18722,7 +19545,6 @@ var getMyConfigs = async (uid, email, _token, options) => {
     if (rawStatus === "pending" || rawStatus === "rejected" || rawStatus === "cancelled" || rawStatus === "deleted" || rawStatus === "provisioning" || provStatus === "revoked" || provStatus === "revoke_failed" || provStatus === "rejected") {
       if (ord.id) nonApprovedOrderIds.add(String(ord.id).trim());
       if (ord.order_id) nonApprovedOrderIds.add(String(ord.order_id).trim());
-      const cUuid = String(ord.client_uuid || ord.vpn_credentials?.password || ord.uuid || "").trim().toLowerCase();
       if (cUuid) nonApprovedOrderUuids.add(cUuid);
     }
   });
@@ -18731,14 +19553,32 @@ var getMyConfigs = async (uid, email, _token, options) => {
   try {
     let vpnAccs = [];
     if (userUid) {
-      const { data: byUid } = await db.from("vpn_accounts").select("*").eq("user_id", userUid).order("created_at", { ascending: false });
-      if (Array.isArray(byUid)) vpnAccs = byUid;
+      const byUidRes = await runRequiredCustomerStage(
+        "vpn_accounts_by_uid_query",
+        () => db.from("vpn_accounts").select("*").eq("user_id", userUid).order("created_at", { ascending: false })
+      );
+      if (byUidRes?.error) {
+        throw createCustomerQueryFailureError("vpn_accounts_by_uid_query", byUidRes.error);
+      }
+      if (Array.isArray(byUidRes?.data)) vpnAccs = byUidRes.data;
     }
     if (vpnAccs.length === 0 && userEmail) {
-      const { data: byEmail } = await db.from("vpn_accounts").select("*").eq("email", userEmail).order("created_at", { ascending: false });
+      const byEmailRes = await runRequiredCustomerStage(
+        "vpn_accounts_by_email_query",
+        () => db.from("vpn_accounts").select("*").eq("email", userEmail).order("created_at", { ascending: false })
+      );
+      if (byEmailRes?.error) {
+        throw createCustomerQueryFailureError("vpn_accounts_by_email_query", byEmailRes.error);
+      }
+      const byEmail = byEmailRes?.data;
       if (Array.isArray(byEmail)) {
         vpnAccs = byEmail.filter((acc) => {
           const docUserId = String(acc.user_id || "").trim();
+          const accUuid = String(acc.uuid || "").trim().toLowerCase();
+          if (userUid && docUserId && docUserId !== userUid) {
+            if (accUuid) conflictingOwnershipUuids.add(accUuid);
+            return false;
+          }
           return !userUid || !docUserId || docUserId === userUid;
         });
       }
@@ -18747,12 +19587,14 @@ var getMyConfigs = async (uid, email, _token, options) => {
       vpnAccs.forEach((acc) => {
         const docUserId = String(acc.user_id || "").trim();
         const docEmail = String(acc.email || "").toLowerCase().trim();
+        const configUuid = String(acc.uuid || "").trim();
+        const normUuid = configUuid.toLowerCase();
+        recordOwnershipMetadata(normUuid, [docUserId], acc.panel_identity);
+        const orderId = String(acc.order_id || acc.id || "").trim();
+        recordInboundForUuidAndOrder(normUuid, orderId, acc.inbound_id);
         const matchesUser = userUid ? docUserId === userUid || !docUserId && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
         if (!matchesUser) return;
         const accStatus = String(acc.status || "active").toLowerCase().trim();
-        const configUuid = String(acc.uuid || "").trim();
-        const normUuid = configUuid.toLowerCase();
-        const orderId = String(acc.order_id || acc.id || "").trim();
         if (normUuid) {
           vpnAccountByUuid.set(normUuid, acc);
         }
@@ -18767,8 +19609,14 @@ var getMyConfigs = async (uid, email, _token, options) => {
         const isBlockedByOrder = orderId && nonApprovedOrderIds.has(orderId) || normUuid && nonApprovedOrderUuids.has(normUuid) || normUuid && blockedNonActiveUuids.has(normUuid);
         if (isDisplayableStatus && !isBlockedByOrder && configUuid && acc.vless_url) {
           const isTrialAcc = !!(acc.is_trial || orderId.startsWith("TRIAL-"));
-          const inboundId = inboundMap.get(orderId) || inboundMap.get(normUuid) || null;
           const cfgRow = vpnConfigByUuid.get(normUuid);
+          const accPanelId = String(acc.panel_identity || "").trim();
+          const cfgPanelId = String(cfgRow?.panel_identity || "").trim();
+          if (accPanelId && cfgPanelId && accPanelId !== cfgPanelId) {
+            conflictingOwnershipUuids.add(normUuid);
+          }
+          const hasConflictIb = conflictingInboundUuids.has(normUuid);
+          const inboundId = hasConflictIb ? null : inboundMap.get(orderId) || inboundMap.get(normUuid) || null;
           configs.push({
             orderId: acc.order_id || acc.id,
             packageName: acc.remark || "FIREVPN Package",
@@ -18786,6 +19634,21 @@ var getMyConfigs = async (uid, email, _token, options) => {
             _dbStatus: accStatus,
             _recordPanelIdentity: acc.panel_identity || cfgRow?.panel_identity || null,
             _recordServerId: acc.server_id || cfgRow?.server_id || null,
+            _persistedInboundId: inboundId,
+            _persistedHasUserId: Boolean(docUserId) && !conflictingOwnershipUuids.has(normUuid),
+            _hasConflictingInboundId: hasConflictIb,
+            _hasConflictingOwnership: conflictingOwnershipUuids.has(normUuid),
+            _legacySource: "vpn_accounts",
+            _storedUpBytes: Math.max(0, Number(acc.up_bytes ?? 0) || 0),
+            _storedDownBytes: Math.max(0, Number(acc.down_bytes ?? 0) || 0),
+            _storedUsedBytes: Math.max(0, Number(acc.used_bytes ?? 0) || 0),
+            _hasExplicitStoredCounters: Boolean(
+              acc.up_bytes !== null && acc.up_bytes !== void 0 || acc.down_bytes !== null && acc.down_bytes !== void 0 || acc.used_bytes !== null && acc.used_bytes !== void 0
+            ),
+            _initialStoredUpBytes: Math.max(0, Number(acc.up_bytes ?? 0) || 0),
+            _initialStoredDownBytes: Math.max(0, Number(acc.down_bytes ?? 0) || 0),
+            _initialStoredUsedBytes: Math.max(0, Number(acc.used_bytes ?? 0) || 0),
+            _initialLastResetAtMs: parseTimestampToMsSafe(acc.last_traffic_reset_at || acc.traffic_reset_at) || 0,
             _createdAt: acc.created_at || cfgRow?.created_at || null,
             _ownerUid: docUserId || userUid || null,
             _ownerEmail: docEmail || userEmail || null
@@ -18794,6 +19657,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
       });
     }
   } catch (err) {
+    throw createCustomerQueryFailureError("vpn_accounts_query", err);
   }
   const matchedDocs = allOrders.filter((doc) => {
     const data = doc;
@@ -18826,7 +19690,8 @@ var getMyConfigs = async (uid, email, _token, options) => {
         const isTrialOrd = !!(pmJson.is_trial || pmJson.isTrial || pmJson.paymentMethod === "Free Trial" || String(data.order_id || data.id || "").startsWith("TRIAL-"));
         const tplId = data.template_id || pmJson.template_id || pmJson.templateId || null;
         const orderId = data.id || data.order_id;
-        const inboundId = inboundMap.get(String(orderId)) || inboundMap.get(normUuid) || data.inbound_id || null;
+        const hasConflictIb = conflictingInboundUuids.has(normUuid);
+        const inboundId = hasConflictIb ? null : inboundMap.get(String(orderId)) || inboundMap.get(normUuid) || data.inbound_id || null;
         const cfgRow = vpnConfigByUuid.get(normUuid);
         const accRow = vpnAccountByUuid.get(normUuid);
         configs.push({
@@ -18848,6 +19713,21 @@ var getMyConfigs = async (uid, email, _token, options) => {
           _dbStatus: String(accRow?.status || cfgRow?.status || "active").toLowerCase().trim(),
           _recordPanelIdentity: accRow?.panel_identity || cfgRow?.panel_identity || null,
           _recordServerId: accRow?.server_id || cfgRow?.server_id || null,
+          _persistedInboundId: inboundId,
+          _persistedHasUserId: Boolean(String(accRow?.user_id || cfgRow?.user_id || data.customer_id || "").trim()) && !conflictingOwnershipUuids.has(normUuid),
+          _hasConflictingInboundId: hasConflictIb,
+          _hasConflictingOwnership: conflictingOwnershipUuids.has(normUuid),
+          _legacySource: "orders",
+          _storedUpBytes: Math.max(0, Number(accRow?.up_bytes ?? 0) || 0),
+          _storedDownBytes: Math.max(0, Number(accRow?.down_bytes ?? 0) || 0),
+          _storedUsedBytes: Math.max(0, Number(accRow?.used_bytes ?? 0) || 0),
+          _hasExplicitStoredCounters: Boolean(
+            accRow && (accRow.up_bytes !== null && accRow.up_bytes !== void 0 || accRow.down_bytes !== null && accRow.down_bytes !== void 0 || accRow.used_bytes !== null && accRow.used_bytes !== void 0)
+          ),
+          _initialStoredUpBytes: Math.max(0, Number(accRow?.up_bytes ?? 0) || 0),
+          _initialStoredDownBytes: Math.max(0, Number(accRow?.down_bytes ?? 0) || 0),
+          _initialStoredUsedBytes: Math.max(0, Number(accRow?.used_bytes ?? 0) || 0),
+          _initialLastResetAtMs: parseTimestampToMsSafe(accRow?.last_traffic_reset_at || accRow?.traffic_reset_at) || 0,
           _createdAt: accRow?.created_at || cfgRow?.created_at || data.created_at || null,
           _ownerUid: String(data.customer_id || userUid || "").trim() || null,
           _ownerEmail: String(data.email || userEmail || "").trim().toLowerCase() || null
@@ -18862,13 +19742,33 @@ var getMyConfigs = async (uid, email, _token, options) => {
   );
   if (customerConfigUuids.length > 0 && adminDb) {
     try {
-      const { data: uuidGrants } = await adminDb.from("vpn_entitlement_grants").select("*").in("client_uuid", customerConfigUuids);
+      const uuidGrantsRes = await runRequiredCustomerStage(
+        "vpn_entitlement_grants_by_uuid_query",
+        () => adminDb.from("vpn_entitlement_grants").select("*").in("client_uuid", customerConfigUuids)
+      );
+      const uuidGrants = uuidGrantsRes?.data;
       if (Array.isArray(uuidGrants)) {
         uuidGrants.forEach(registerGrantRow);
       }
-    } catch (_uuidGrantErr) {
+    } catch (uuidGrantErr) {
+      if (uuidGrantErr?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED") {
+        throw uuidGrantErr;
+      }
     }
   }
+  configs.forEach((c) => {
+    const normUuid = String(c.uuid || "").trim().toLowerCase();
+    if (!normUuid) return;
+    if (conflictingInboundUuids.has(normUuid)) {
+      c._hasConflictingInboundId = true;
+      c._persistedInboundId = null;
+      c.inboundId = null;
+    }
+    if (conflictingOwnershipUuids.has(normUuid)) {
+      c._hasConflictingOwnership = true;
+      c._persistedHasUserId = false;
+    }
+  });
   const ordersByUuidMap = /* @__PURE__ */ new Map();
   const ordersByAnyIdMap = /* @__PURE__ */ new Map();
   allOrders.forEach((ord) => {
@@ -18898,353 +19798,893 @@ var getMyConfigs = async (uid, email, _token, options) => {
       ordersByAnyIdMap.set(pubId, list);
     }
   });
-  const fetchCachedInbounds = options?.getCachedInboundsFn || getCachedInbounds;
-  const fetchLiveInbound = options?.getLiveInboundFn || getLiveInbound;
-  const fetchInboundsList = options?.getInboundsFn || getInbounds;
-  const cached = await fetchCachedInbounds();
-  const resolveMissingInboundIds = (inboundList) => {
-    if (!Array.isArray(inboundList) || inboundList.length === 0) return;
-    configs.forEach((config) => {
-      if (config.uuid && (config.inboundId === null || config.inboundId === void 0 || Number(config.inboundId) <= 0)) {
-        for (const ib of inboundList) {
-          const parsed = parseInboundSettingsClientsStrict(ib);
-          if (!parsed.ok) continue;
-          if (parsed.clientUuidSet.has(String(config.uuid).trim().toLowerCase())) {
-            config.inboundId = parsed.inboundId;
-            console.log(`[Live Traffic Engine] Found missing inboundId ${parsed.inboundId} for UUID ${config.uuid} from inbound list.`);
-            break;
-          }
+  confirmedDeletedUuids.forEach((delUuid) => {
+    purgeClientTrafficCacheByUuid(delUuid);
+  });
+  const initialTrafficEpochSnap = getTrafficMutationEpochSnapshot();
+  const initialMutationStateByUuid = /* @__PURE__ */ new Map();
+  const inFlightObservedResetByUuid = /* @__PURE__ */ new Set();
+  const inFlightObservedDeletedByUuid = /* @__PURE__ */ new Set();
+  configs.forEach((c) => {
+    const normUuid = String(c.uuid || "").trim().toLowerCase();
+    if (normUuid) {
+      const st = getClientTrafficMutationState(normUuid);
+      initialMutationStateByUuid.set(normUuid, st);
+      if (st.deletedAtMs > 0) {
+        confirmedDeletedUuids.add(normUuid);
+        blockedNonActiveUuids.add(normUuid);
+        purgeClientTrafficCacheByUuid(normUuid);
+      }
+    }
+  });
+  const inFlightMutationListener = (mutatedUuid, reason, _state) => {
+    const normMutated = String(mutatedUuid || "").trim().toLowerCase();
+    if (!normMutated || !initialMutationStateByUuid.has(normMutated)) return;
+    if (reason === "deleted") {
+      inFlightObservedDeletedByUuid.add(normMutated);
+      inFlightObservedResetByUuid.delete(normMutated);
+    } else if (reason === "reset" && !inFlightObservedDeletedByUuid.has(normMutated)) {
+      inFlightObservedResetByUuid.add(normMutated);
+    }
+  };
+  registerClientTrafficCacheInvalidator(inFlightMutationListener);
+  try {
+    const fetchCachedInbounds = options?.getCachedInboundsFn || getCachedInbounds;
+    const fetchLiveInbound = options?.getLiveInboundFn || getLiveInbound;
+    const fetchInboundsList = options?.getInboundsFn || getInbounds;
+    let resolvedPanelIdentity = String(options?.currentPanelIdentity || "").trim();
+    if (!resolvedPanelIdentity && options?.currentPanelIdentity === void 0 && !options?.getCachedInboundsFn && !options?.getLiveInboundFn && !options?.getInboundsFn) {
+      const remainingForPanelIdMs = getRemainingCustomerBudgetMs();
+      if (remainingForPanelIdMs >= 100) {
+        try {
+          const panelIdRes = await raceWithTimeout(
+            getCurrentPanelIdentity(),
+            Math.min(1500, remainingForPanelIdMs),
+            () => {
+              console.warn("[Live Traffic Engine] getCurrentPanelIdentity exceeded deadline budget; continuing without shared panel identity.");
+            }
+          );
+          resolvedPanelIdentity = String(panelIdRes || "").trim();
+        } catch {
+          resolvedPanelIdentity = "";
         }
       }
-    });
-  };
-  resolveMissingInboundIds(cached);
-  const liveInboundsMap = /* @__PURE__ */ new Map();
-  const cleanlyParsedLiveInboundIds = /* @__PURE__ */ new Set();
-  let liveFullListFetched = false;
-  let liveFullListCleanlyParsed = false;
-  const hasMissingInboundId = configs.some(
-    (c) => c.uuid && (c.inboundId === null || c.inboundId === void 0 || Number(c.inboundId) <= 0)
-  );
-  if (hasMissingInboundId && configs.length > 0) {
-    try {
-      const freshList = await Promise.race([
-        fetchInboundsList(true),
-        new Promise(
-          (resolve) => setTimeout(() => {
-            console.warn("[Live Traffic Engine] Fresh full inbound list fetch timed out after 5s.");
-            resolve(null);
-          }, 5e3)
-        )
-      ]);
-      if (Array.isArray(freshList) && freshList.length > 0) {
-        liveFullListFetched = true;
-        let allClean = true;
-        freshList.forEach((ib) => {
-          const parsed = parseInboundSettingsClientsStrict(ib);
-          if (parsed.ok) {
-            liveInboundsMap.set(parsed.inboundId, ib);
-            cleanlyParsedLiveInboundIds.add(parsed.inboundId);
-          } else {
-            allClean = false;
-          }
-        });
-        liveFullListCleanlyParsed = allClean;
-        resolveMissingInboundIds(freshList);
-      }
-    } catch (err) {
-      console.warn("[Live Traffic Engine] Cold-start inbound lookup failed:", err?.message || err);
     }
-  }
-  const userInboundIds = Array.from(new Set(
-    configs.map((c) => c.inboundId).filter((id) => id !== null && id !== void 0 && Number(id) > 0).map((id) => Number(id))
-  )).filter((id) => !liveInboundsMap.has(id));
-  if (userInboundIds.length > 0) {
-    try {
-      console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds from 3X-UI...`);
-      const liveResults = await Promise.race([
-        Promise.all(userInboundIds.map((id) => fetchLiveInbound(id))),
-        new Promise(
-          (resolve) => setTimeout(() => {
-            console.warn("[Live Traffic Engine] Live inbound fetch timed out after 5s; panel status unverified.");
-            resolve([]);
-          }, 5e3)
-        )
-      ]);
-      liveResults.forEach((ib) => {
-        if (ib && ib.id) {
-          const parsed = parseInboundSettingsClientsStrict(ib);
-          if (parsed.ok) {
-            liveInboundsMap.set(parsed.inboundId, ib);
-            cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+    let cachedFallbackInbounds = [];
+    const remainingForCachedInboundsMs = getRemainingCustomerBudgetMs();
+    if (remainingForCachedInboundsMs >= 20) {
+      try {
+        const cached = await raceWithTimeout(
+          fetchCachedInbounds(resolvedPanelIdentity || void 0),
+          remainingForCachedInboundsMs,
+          () => {
+            console.warn("[Live Traffic Engine] fetchCachedInbounds exceeded customer deadline budget.");
           }
+        );
+        cachedFallbackInbounds = Array.isArray(cached) ? cached : [];
+      } catch {
+        cachedFallbackInbounds = [];
+      }
+    }
+    const resolveMissingInboundIds = (inboundList) => {
+      if (!Array.isArray(inboundList) || inboundList.length === 0) return;
+      const inboundIdsByUuid = /* @__PURE__ */ new Map();
+      for (const ib of inboundList) {
+        const parsed = parseInboundSettingsClientsStrict(ib);
+        if (!parsed.ok) continue;
+        for (const cUuid of parsed.clientUuidSet) {
+          const set = inboundIdsByUuid.get(cUuid) || /* @__PURE__ */ new Set();
+          set.add(parsed.inboundId);
+          inboundIdsByUuid.set(cUuid, set);
+        }
+      }
+      configs.forEach((config) => {
+        if (config._hasConflictingInboundId || config._hasConflictingOwnership) return;
+        if (config.uuid && (config.inboundId === null || config.inboundId === void 0 || Number(config.inboundId) <= 0)) {
+          const normUuid = String(config.uuid).trim().toLowerCase();
+          const candidateInboundIds = inboundIdsByUuid.get(normUuid);
+          if (!candidateInboundIds || candidateInboundIds.size !== 1) {
+            return;
+          }
+          const resolvedIbId = Array.from(candidateInboundIds)[0];
+          config.inboundId = resolvedIbId;
+          console.log(`[Live Traffic Engine] Resolved inboundId ${resolvedIbId} in memory for UUID ${config.uuid}.`);
         }
       });
-    } catch (err) {
-      console.warn(`[Live Traffic Engine] Error fetching live customer inbounds:`, err.message || err);
+    };
+    resolveMissingInboundIds(cachedFallbackInbounds);
+    const liveInboundsMap = /* @__PURE__ */ new Map();
+    const cleanlyParsedLiveInboundIds = /* @__PURE__ */ new Set();
+    let liveFullListFetched = false;
+    let liveFullListCleanlyParsed = false;
+    const hasMissingInboundId = configs.some(
+      (c) => c.uuid && !c._hasConflictingInboundId && !c._hasConflictingOwnership && (c.inboundId === null || c.inboundId === void 0 || Number(c.inboundId) <= 0)
+    );
+    const hasKnownInboundId = configs.some(
+      (c) => c.uuid && c.inboundId !== null && c.inboundId !== void 0 && Number(c.inboundId) > 0
+    );
+    if (hasMissingInboundId && configs.length > 0) {
+      const remainingForColdStartMs = getRemainingCustomerBudgetMs();
+      const requestedColdStartMs = options?.coldStartTimeoutMs && Number.isFinite(options.coldStartTimeoutMs) && options.coldStartTimeoutMs > 0 ? Math.floor(options.coldStartTimeoutMs) : CUSTOMER_MAX_COLD_START_WAIT_MS;
+      const coldStartBudgetCapMs = options?.coldStartTimeoutMs !== void 0 ? remainingForColdStartMs : hasKnownInboundId ? Math.max(0, remainingForColdStartMs - Math.min(1200, Math.floor(remainingForColdStartMs * 0.35))) : remainingForColdStartMs;
+      const coldStartWaitMs = Math.min(requestedColdStartMs, coldStartBudgetCapMs);
+      if (coldStartWaitMs >= 20) {
+        const cacheTsBefore = getInboundsSnapshotTimestamp();
+        try {
+          const freshList = await raceWithTimeout(
+            fetchInboundsList(false, resolvedPanelIdentity ? { panelIdentity: resolvedPanelIdentity } : void 0),
+            coldStartWaitMs,
+            () => {
+              console.warn(`[Live Traffic Engine] Cold-start full inbound list wait exceeded ${coldStartWaitMs}ms; continuing with shared warm-up.`);
+            }
+          );
+          if (Array.isArray(freshList) && freshList.length > 0) {
+            cachedFallbackInbounds = freshList;
+            resolveMissingInboundIds(freshList);
+            const cacheTsAfter = getInboundsSnapshotTimestamp();
+            const isFreshLiveFetch = Boolean(options?.getInboundsFn) || cacheTsAfter > cacheTsBefore || cacheTsAfter > 0 && Date.now() - cacheTsAfter < 1e4;
+            if (isFreshLiveFetch) {
+              liveFullListFetched = true;
+              let allClean = true;
+              freshList.forEach((ib) => {
+                const parsed = parseInboundSettingsClientsStrict(ib);
+                if (parsed.ok) {
+                  liveInboundsMap.set(parsed.inboundId, ib);
+                  cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+                } else {
+                  allClean = false;
+                }
+              });
+              liveFullListCleanlyParsed = allClean;
+            }
+          }
+        } catch (err) {
+          console.warn("[Live Traffic Engine] Cold-start inbound lookup failed:", err?.message || err);
+        }
+      } else {
+        console.warn(
+          `[Live Traffic Engine] Skipping cold-start wait: customer request deadline budget exhausted (${remainingForColdStartMs}ms remaining).`
+        );
+      }
     }
-  }
-  const liveInbounds = Array.from(liveInboundsMap.values());
-  const liveClientByUuid = /* @__PURE__ */ new Map();
-  for (const ib of liveInbounds) {
-    const parsed = parseInboundSettingsClientsStrict(ib);
-    if (!parsed.ok) continue;
-    for (const c of parsed.clients) {
-      const cUuid = String(c?.id || "").trim().toLowerCase();
-      if (cUuid) {
+    const userInboundIds = Array.from(new Set(
+      configs.filter((c) => !c._hasConflictingInboundId && !c._hasConflictingOwnership).map((c) => c.inboundId).filter((id) => id !== null && id !== void 0 && Number(id) > 0).map((id) => Number(id))
+    )).filter((id) => !liveInboundsMap.has(id));
+    if (userInboundIds.length > 0) {
+      const remainingForLiveInboundMs = getRemainingCustomerBudgetMs();
+      const requestedLiveInboundMs = options?.liveInboundTimeoutMs && Number.isFinite(options.liveInboundTimeoutMs) && options.liveInboundTimeoutMs > 0 ? Math.floor(options.liveInboundTimeoutMs) : CUSTOMER_MAX_LIVE_INBOUND_WAIT_MS;
+      const liveInboundWaitMs = Math.min(requestedLiveInboundMs, remainingForLiveInboundMs);
+      if (liveInboundWaitMs >= 20) {
+        try {
+          console.log(`[Live Traffic Engine] Fetching ${userInboundIds.length} customer inbounds from 3X-UI (budget ${liveInboundWaitMs}ms)...`);
+          const liveResults = await raceWithTimeout(
+            Promise.all(userInboundIds.map((id) => fetchLiveInbound(id))),
+            liveInboundWaitMs,
+            () => {
+              console.warn(`[Live Traffic Engine] Live inbound fetch timed out after ${liveInboundWaitMs}ms; panel status unverified.`);
+            }
+          ) || [];
+          liveResults.forEach((ib) => {
+            if (ib && ib.id) {
+              const parsed = parseInboundSettingsClientsStrict(ib);
+              if (parsed.ok) {
+                liveInboundsMap.set(parsed.inboundId, ib);
+                cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+              }
+            }
+          });
+        } catch (err) {
+          console.warn(`[Live Traffic Engine] Error fetching live customer inbounds:`, err.message || err);
+        }
+      } else {
+        console.warn(
+          `[Live Traffic Engine] Skipping live inbound fetch: customer request deadline budget exhausted (${remainingForLiveInboundMs}ms remaining); returning safe Status Unavailable fallback.`
+        );
+      }
+    }
+    const liveInbounds = Array.from(liveInboundsMap.values());
+    const liveClientByUuid = /* @__PURE__ */ new Map();
+    const duplicateLiveUuids = /* @__PURE__ */ new Set();
+    for (const ib of liveInbounds) {
+      const parsed = parseInboundSettingsClientsStrict(ib);
+      if (!parsed.ok) continue;
+      for (const c of parsed.clients) {
+        const cUuid = String(c?.id || "").trim().toLowerCase();
+        if (!cUuid) continue;
+        if (duplicateLiveUuids.has(cUuid)) {
+          continue;
+        }
+        if (liveClientByUuid.has(cUuid)) {
+          liveClientByUuid.delete(cUuid);
+          duplicateLiveUuids.add(cUuid);
+          continue;
+        }
         liveClientByUuid.set(cUuid, { inbound: ib, client: c });
       }
     }
-  }
-  let resolvedPanelIdentity = String(options?.currentPanelIdentity || "").trim();
-  if (!resolvedPanelIdentity && liveInbounds.length > 0) {
-    try {
-      resolvedPanelIdentity = await getCurrentPanelIdentity();
-    } catch {
-      resolvedPanelIdentity = "";
-    }
-  }
-  const finalConfigs = [];
-  for (const config of configs) {
-    let up = 0;
-    let down = 0;
-    let total = config._rawLimit || 0;
-    let expiryTime = 0;
-    let lastOnline = 0;
-    let inboundId = config.inboundId ? Number(config.inboundId) : null;
-    const normUuid = String(config.uuid || "").trim().toLowerCase();
-    let clientEmail = userEmail;
-    let matchedInbound = null;
-    let stat = null;
-    let foundClient = null;
-    if (normUuid && liveClientByUuid.has(normUuid)) {
-      const hit = liveClientByUuid.get(normUuid);
-      matchedInbound = hit.inbound;
-      foundClient = hit.client;
-    }
-    if (matchedInbound && foundClient) {
-      if (!inboundId) {
-        inboundId = Number(matchedInbound.id);
-      }
-      clientEmail = foundClient.email || userEmail;
-      expiryTime = foundClient.expiryTime || 0;
-      if (foundClient.totalGB !== void 0 && Number(foundClient.totalGB) >= 0) {
-        total = Number(foundClient.totalGB) || 0;
-      } else if (foundClient.totalBytes !== void 0) {
-        total = Number(foundClient.totalBytes) || 0;
-      } else if (foundClient.total !== void 0) {
-        total = Number(foundClient.total) || 0;
-      }
-      const clientStats = matchedInbound.clientStats || [];
-      if (config.uuid) {
-        stat = clientStats.find((s) => String(s.id || "").toLowerCase() === normUuid) || clientStats.find((s) => String(s.email || "").toLowerCase() === String(clientEmail).toLowerCase());
-      }
-      const extractTraffic = (obj, type) => {
-        if (!obj) return 0;
-        const val = obj[type] || obj[`${type}load`] || 0;
-        return typeof val === "number" ? val : parseFloat(val) || 0;
-      };
-      const clientUp = extractTraffic(foundClient, "up");
-      const clientDown = extractTraffic(foundClient, "down");
-      if (stat) {
-        const statUp = extractTraffic(stat, "up");
-        const statDown = extractTraffic(stat, "down");
-        up = Math.max(statUp, clientUp, up);
-        down = Math.max(statDown, clientDown, down);
-        if (stat.total !== void 0 && Number(stat.total) > 0) {
-          total = Number(stat.total);
+    const cachedTrafficByUuid = /* @__PURE__ */ new Map();
+    const duplicateCachedUuids = /* @__PURE__ */ new Set();
+    for (const ib of cachedFallbackInbounds) {
+      const parsed = parseInboundSettingsClientsStrict(ib);
+      if (!parsed.ok) continue;
+      for (const c of parsed.clients) {
+        const cUuid = String(c?.id || "").trim().toLowerCase();
+        if (!cUuid) continue;
+        if (duplicateCachedUuids.has(cUuid)) {
+          continue;
         }
-        if (stat.expiryTime !== void 0 && Number(stat.expiryTime) > 0) {
-          expiryTime = Number(stat.expiryTime);
+        if (cachedTrafficByUuid.has(cUuid)) {
+          cachedTrafficByUuid.delete(cUuid);
+          duplicateCachedUuids.add(cUuid);
+          continue;
         }
-        lastOnline = stat.lastOnline || stat.online || stat.time || 0;
-      } else {
-        up = Math.max(clientUp, up);
-        down = Math.max(clientDown, down);
-        lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
+        cachedTrafficByUuid.set(cUuid, { inbound: ib, client: c });
       }
-    } else {
-      console.log(`[Provisioning Audit] No live 3X-UI state verified for UUID: ${config.uuid}.`);
     }
-    let lastOnlineMs = lastOnline;
-    if (lastOnlineMs > 0 && lastOnlineMs < 1e10) {
-      lastOnlineMs = lastOnlineMs * 1e3;
+    const verifyClientOwnershipAndInboundMatch = (params) => {
+      const { inbound, client, config, requireSharedFallbackVerification } = params;
+      if (!inbound || !client || !config) return false;
+      if (config._hasConflictingOwnership || config._hasConflictingInboundId) {
+        return false;
+      }
+      const recPanel = String(config._recordPanelIdentity || "").trim();
+      if (recPanel && resolvedPanelIdentity && recPanel !== resolvedPanelIdentity) {
+        return false;
+      }
+      const persistedIbId = config._persistedInboundId !== null && config._persistedInboundId !== void 0 && Number(config._persistedInboundId) > 0 ? Number(config._persistedInboundId) : null;
+      const candidateIbId = Number(inbound.id);
+      if (persistedIbId !== null && candidateIbId !== persistedIbId) {
+        return false;
+      }
+      const cliEmail = String(client.email || "").trim().toLowerCase();
+      const ownerEmail = String(config._ownerEmail || userEmail || "").trim().toLowerCase();
+      const expectedRemark = String(config.packageName || "").trim().toLowerCase();
+      const expectedOrderId = String(config.orderId || "").trim().toLowerCase();
+      if (requireSharedFallbackVerification) {
+        if (!resolvedPanelIdentity || !recPanel || recPanel !== resolvedPanelIdentity) {
+          return false;
+        }
+        if (!cliEmail) {
+          return false;
+        }
+        if (cliEmail.includes("@") && ownerEmail && cliEmail !== ownerEmail) {
+          return false;
+        }
+        const matchesEmail = Boolean(ownerEmail && cliEmail === ownerEmail);
+        const matchesRemark = Boolean(expectedRemark && cliEmail === expectedRemark);
+        const matchesOrderId = Boolean(expectedOrderId && cliEmail.includes(expectedOrderId));
+        const matchesEmailLocalPart = Boolean(
+          ownerEmail && !cliEmail.includes("@") && ownerEmail.includes("@") && cliEmail.startsWith(ownerEmail.split("@")[0])
+        );
+        if (!matchesEmail && !matchesRemark && !matchesOrderId && !matchesEmailLocalPart) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const legacyReconciliationRecords = [];
+    for (const config of configs) {
+      const missingFields = [];
+      if (!config._persistedInboundId) missingFields.push("inbound_id");
+      if (!config._recordPanelIdentity && !config._recordServerId) missingFields.push("panel_identity");
+      if (!config._persistedHasUserId) missingFields.push("user_id");
+      if (missingFields.length > 0 && config.uuid) {
+        legacyReconciliationRecords.push({
+          uuid: String(config.uuid).trim(),
+          orderId: String(config.orderId || "").trim(),
+          missingFields,
+          source: config._legacySource || "vpn_accounts"
+        });
+      }
     }
-    const totalUsed = up + down;
-    const remainingTraffic = total > 0 ? Math.max(total - totalUsed, 0) : 0;
-    const usedGB = parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2));
-    const remainingGB = total > 0 ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : "Unlimited";
-    let expTimeMs = expiryTime;
-    if (expTimeMs > 0 && expTimeMs < 1e10) {
-      expTimeMs = expTimeMs * 1e3;
+    if (legacyReconciliationRecords.length > 0) {
+      console.warn(
+        `[Legacy Reconciliation] ${legacyReconciliationRecords.length} customer record(s) require separate metadata reconciliation: ${legacyReconciliationRecords.map((r) => `${r.uuid}(missing:${r.missingFields.join(",")})`).join(", ")}`
+      );
     }
-    if ((!expTimeMs || expTimeMs <= 0) && config.expiryDate) {
-      const parsed = new Date(config.expiryDate).getTime();
-      if (!isNaN(parsed)) expTimeMs = parsed;
-    }
-    const expectedInboundCleanlyFetched = Boolean(
-      inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId)) || liveFullListFetched && liveFullListCleanlyParsed
-    );
-    const evaluated = evaluateVpnClientStatus({
-      panelReachable: expectedInboundCleanlyFetched || Boolean(matchedInbound),
-      inboundFound: Boolean(matchedInbound),
-      inboundEnable: matchedInbound ? matchedInbound.enable : null,
-      clientFound: Boolean(foundClient),
-      clientEnable: foundClient ? foundClient.enable : null,
-      statEnable: stat ? stat.enable : void 0,
-      upBytes: up,
-      downBytes: down,
-      totalLimitBytes: total,
-      expiryTimeMs: expTimeMs,
-      nowMs
-    });
-    if (matchedInbound && foundClient && evaluated.status === "Active" && (config._dbStatus === "disabled" || config._dbStatus === "expired") && adminDb) {
-      const canRestore = await isSafeToRestoreActiveStatus({
-        dbClient: adminDb,
+    const finalConfigs = [];
+    const maxCacheEntries = options?.maxTrafficCacheEntries ?? CLIENT_TRAFFIC_CACHE_MAX_ENTRIES;
+    const afterTrafficEpochSnap = getTrafficMutationEpochSnapshot();
+    for (const config of configs) {
+      let up = 0;
+      let down = 0;
+      let total = config._rawLimit || 0;
+      let expiryTime = 0;
+      let lastOnline = 0;
+      let inboundId = config.inboundId ? Number(config.inboundId) : null;
+      const normUuid = String(config.uuid || "").trim().toLowerCase();
+      let clientEmail = userEmail;
+      let matchedInbound = null;
+      let stat = null;
+      let foundClient = null;
+      let trafficSource = "unknown";
+      let trafficVerified = false;
+      let usedTrafficKnown = false;
+      let postEvictionConfirmedResetInDb = false;
+      let postEvictionFreshLiveVerified = false;
+      let postEvictionFreshLiveInbound = null;
+      let postEvictionFreshLiveClient = null;
+      const currentMutationState = normUuid ? getClientTrafficMutationState(normUuid) : { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false };
+      const initialMutationState = normUuid ? initialMutationStateByUuid.get(normUuid) : void 0;
+      const startedMutationSeq = initialMutationState?.seq ?? 0;
+      const mutationStateEvictedMidFlight = Boolean(
+        normUuid && !currentMutationState.present && (initialMutationState?.present || afterTrafficEpochSnap.maxEvictedEpoch > initialTrafficEpochSnap.currentEpoch || afterTrafficEpochSnap.maxEvictedEpoch > initialTrafficEpochSnap.maxEvictedEpoch)
+      );
+      const mutationOccurredMidFlight = currentMutationState.seq !== startedMutationSeq || mutationStateEvictedMidFlight;
+      if (mutationStateEvictedMidFlight && normUuid) {
+        purgeClientTrafficCacheByUuid(normUuid);
+        const [freshAccRes, freshCfgRes] = await runRequiredCustomerStage(
+          "authoritative_post_eviction_recheck",
+          async () => {
+            const accPromise = db.from("vpn_accounts").select("*").eq("uuid", config.uuid);
+            const cfgPromise = db.from("vpn_configs").select("*").eq("uuid", config.uuid);
+            return Promise.all([accPromise, cfgPromise]);
+          }
+        ).catch((recheckErr) => {
+          if (recheckErr?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED") {
+            throw recheckErr;
+          }
+          const failClosedErr = new Error(
+            `Authoritative database recheck after traffic mutation eviction failed for UUID ${config.uuid}: ${recheckErr?.message || recheckErr}`
+          );
+          failClosedErr.status = 503;
+          failClosedErr.statusCode = 503;
+          failClosedErr.code = "AUTHORITATIVE_MUTATION_RECHECK_FAILED";
+          failClosedErr.retryable = true;
+          throw failClosedErr;
+        });
+        if (freshAccRes?.error || freshCfgRes?.error) {
+          const dbErr = freshAccRes?.error || freshCfgRes?.error;
+          const failClosedErr = new Error(
+            `Authoritative database recheck returned error for UUID ${config.uuid}: ${dbErr?.message || dbErr}`
+          );
+          failClosedErr.status = 503;
+          failClosedErr.statusCode = 503;
+          failClosedErr.code = "AUTHORITATIVE_MUTATION_RECHECK_FAILED";
+          failClosedErr.retryable = true;
+          throw failClosedErr;
+        }
+        const freshAccRows = Array.isArray(freshAccRes?.data) ? freshAccRes.data : [];
+        const freshCfgRows = Array.isArray(freshCfgRes?.data) ? freshCfgRes.data : [];
+        const customerFreshAccs = freshAccRows.filter((acc) => {
+          const docUserId = String(acc.user_id || "").trim();
+          const docEmail = String(acc.email || "").toLowerCase().trim();
+          return userUid ? docUserId === userUid || !docUserId && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
+        });
+        const customerFreshCfgs = freshCfgRows.filter((cfg) => {
+          const docUserId = String(cfg.user_id || cfg.customer_uid || "").trim();
+          return !userUid || !docUserId || docUserId === userUid;
+        });
+        const isRecheckDeleted = customerFreshAccs.some(
+          (acc) => String(acc.status || "").toLowerCase().trim() === "deleted" || Boolean(acc.deleted_from_panel_at)
+        ) || customerFreshCfgs.some((cfg) => {
+          const st = String(cfg.status || "").toLowerCase().trim();
+          return st === "deleted" || st === "rejected" || st === "cancelled" || st === "revoked" || Boolean(cfg.deleted_from_panel_at);
+        }) || config._legacySource === "vpn_accounts" && customerFreshAccs.length === 0;
+        if (isRecheckDeleted) {
+          confirmedDeletedUuids.add(normUuid);
+          blockedNonActiveUuids.add(normUuid);
+          purgeClientTrafficCacheByUuid(normUuid);
+          continue;
+        }
+        if (customerFreshAccs.length > 0) {
+          const latestAcc = customerFreshAccs[0];
+          config._storedUpBytes = Math.max(0, Number(latestAcc.up_bytes ?? 0) || 0);
+          config._storedDownBytes = Math.max(0, Number(latestAcc.down_bytes ?? 0) || 0);
+          config._storedUsedBytes = Math.max(0, Number(latestAcc.used_bytes ?? 0) || 0);
+          config._dbStatus = String(latestAcc.status || config._dbStatus || "active").toLowerCase().trim();
+          const latestResetAtMs = parseTimestampToMsSafe(latestAcc.last_traffic_reset_at || latestAcc.traffic_reset_at) || 0;
+          postEvictionConfirmedResetInDb = Boolean(
+            inFlightObservedResetByUuid.has(normUuid) || latestResetAtMs > 0 && (latestResetAtMs >= dbStart || latestResetAtMs > (config._initialLastResetAtMs || 0))
+          );
+        } else if (inFlightObservedResetByUuid.has(normUuid)) {
+          postEvictionConfirmedResetInDb = true;
+        }
+        if (customerFreshCfgs.length > 0 && (!customerFreshAccs.length || config._dbStatus === "active")) {
+          const latestCfgSt = String(customerFreshCfgs[0].status || "").toLowerCase().trim();
+          if (latestCfgSt === "disabled" || latestCfgSt === "expired") {
+            config._dbStatus = latestCfgSt;
+          }
+        }
+        if (!postEvictionConfirmedResetInDb && inboundId && Number(inboundId) > 0 && !config._hasConflictingInboundId && !config._hasConflictingOwnership) {
+          const remainingForPostEvictLiveMs = getRemainingCustomerBudgetMs();
+          const requestedLiveMs = options?.liveInboundTimeoutMs && Number.isFinite(options.liveInboundTimeoutMs) && options.liveInboundTimeoutMs > 0 ? Math.floor(options.liveInboundTimeoutMs) : CUSTOMER_MAX_LIVE_INBOUND_WAIT_MS;
+          const postEvictLiveWaitMs = Math.min(requestedLiveMs, remainingForPostEvictLiveMs);
+          if (postEvictLiveWaitMs >= 20) {
+            const epochBeforeRefetch = getTrafficMutationEpochSnapshot();
+            const mutStateBeforeRefetch = getClientTrafficMutationState(normUuid);
+            try {
+              invalidateInboundCache(Number(inboundId));
+              const freshIb = await raceWithTimeout(
+                fetchLiveInbound(Number(inboundId), {
+                  forceRefresh: true,
+                  timeoutMs: postEvictLiveWaitMs
+                }),
+                postEvictLiveWaitMs,
+                () => {
+                  console.warn(
+                    `[Live Traffic Engine] Post-eviction fresh live inbound read timed out after ${postEvictLiveWaitMs}ms for UUID ${normUuid}.`
+                  );
+                }
+              );
+              if (freshIb && freshIb.id) {
+                const parsedFresh = parseInboundSettingsClientsStrict(freshIb);
+                const epochAfterRefetch = getTrafficMutationEpochSnapshot();
+                const mutStateAfterRefetch = getClientTrafficMutationState(normUuid);
+                const noMutationDuringRefetch = mutStateAfterRefetch.deletedAtMs === 0 && mutStateAfterRefetch.seq === mutStateBeforeRefetch.seq && epochAfterRefetch.maxEvictedEpoch === epochBeforeRefetch.maxEvictedEpoch;
+                if (parsedFresh.ok && noMutationDuringRefetch) {
+                  const matchingClients = parsedFresh.clients.filter(
+                    (c) => String(c?.id || "").trim().toLowerCase() === normUuid
+                  );
+                  if (matchingClients.length === 1 && verifyClientOwnershipAndInboundMatch({
+                    inbound: freshIb,
+                    client: matchingClients[0],
+                    config,
+                    requireSharedFallbackVerification: false
+                  })) {
+                    postEvictionFreshLiveInbound = freshIb;
+                    postEvictionFreshLiveClient = matchingClients[0];
+                    postEvictionFreshLiveVerified = true;
+                    liveInboundsMap.set(parsedFresh.inboundId, freshIb);
+                    cleanlyParsedLiveInboundIds.add(parsedFresh.inboundId);
+                  }
+                }
+              }
+            } catch {
+            }
+          }
+        }
+      }
+      if (normUuid && (currentMutationState.deletedAtMs > 0 || inFlightObservedDeletedByUuid.has(normUuid) || confirmedDeletedUuids.has(normUuid) || blockedNonActiveUuids.has(normUuid) || nonApprovedOrderUuids.has(normUuid))) {
+        purgeClientTrafficCacheByUuid(normUuid);
+        if (currentMutationState.deletedAtMs > 0 || inFlightObservedDeletedByUuid.has(normUuid)) {
+          confirmedDeletedUuids.add(normUuid);
+        }
+        continue;
+      }
+      const hasVerifiedUidOwnership = Boolean(
+        userUid && config._persistedHasUserId && !config._hasConflictingOwnership && !config._hasConflictingInboundId && config._ownerUid && String(config._ownerUid).trim() === userUid
+      );
+      const scopedTrafficCacheKey = buildCustomerTrafficCacheKey({
+        panelIdentity: resolvedPanelIdentity,
+        userUid,
         clientUuid: normUuid,
-        orderId: config.orderId,
-        currentDbStatus: config._dbStatus,
-        deletedFromPanelAt: null,
+        hasVerifiedOwnership: hasVerifiedUidOwnership,
+        recordPanelIdentity: config._recordPanelIdentity
+      });
+      if (postEvictionFreshLiveVerified && postEvictionFreshLiveInbound && postEvictionFreshLiveClient) {
+        matchedInbound = postEvictionFreshLiveInbound;
+        foundClient = postEvictionFreshLiveClient;
+      } else if (normUuid && !duplicateLiveUuids.has(normUuid) && liveClientByUuid.has(normUuid)) {
+        const hit = liveClientByUuid.get(normUuid);
+        if (verifyClientOwnershipAndInboundMatch({
+          inbound: hit.inbound,
+          client: hit.client,
+          config,
+          requireSharedFallbackVerification: false
+        })) {
+          matchedInbound = hit.inbound;
+          foundClient = hit.client;
+        }
+      }
+      if (matchedInbound && foundClient) {
+        if (!inboundId) {
+          inboundId = Number(matchedInbound.id);
+        }
+        clientEmail = foundClient.email || userEmail;
+        expiryTime = foundClient.expiryTime || 0;
+        if (foundClient.totalGB !== void 0 && Number(foundClient.totalGB) >= 0) {
+          total = Number(foundClient.totalGB) || 0;
+        } else if (foundClient.totalBytes !== void 0) {
+          total = Number(foundClient.totalBytes) || 0;
+        } else if (foundClient.total !== void 0) {
+          total = Number(foundClient.total) || 0;
+        }
+        const clientStats = matchedInbound.clientStats || [];
+        if (config.uuid) {
+          stat = clientStats.find((s) => String(s.id || "").toLowerCase() === normUuid) || clientStats.find((s) => String(s.email || "").toLowerCase() === String(clientEmail).toLowerCase());
+        }
+        const extractTraffic = (obj, type) => {
+          if (!obj) return 0;
+          const val = obj[type] || obj[`${type}load`] || 0;
+          return typeof val === "number" ? val : parseFloat(val) || 0;
+        };
+        const clientUp = extractTraffic(foundClient, "up");
+        const clientDown = extractTraffic(foundClient, "down");
+        if (stat) {
+          const statUp = extractTraffic(stat, "up");
+          const statDown = extractTraffic(stat, "down");
+          up = Math.max(statUp, clientUp, up);
+          down = Math.max(statDown, clientDown, down);
+          if (stat.total !== void 0 && Number(stat.total) > 0) {
+            total = Number(stat.total);
+          }
+          if (stat.expiryTime !== void 0 && Number(stat.expiryTime) > 0) {
+            expiryTime = Number(stat.expiryTime);
+          }
+          lastOnline = stat.lastOnline || stat.online || stat.time || 0;
+        } else {
+          up = Math.max(clientUp, up);
+          down = Math.max(clientDown, down);
+          lastOnline = foundClient.lastOnline || foundClient.online || foundClient.time || 0;
+        }
+        if (mutationStateEvictedMidFlight) {
+          if (postEvictionConfirmedResetInDb) {
+            up = 0;
+            down = 0;
+            trafficSource = "reset_confirmed";
+            trafficVerified = true;
+            usedTrafficKnown = true;
+          } else if (postEvictionFreshLiveVerified) {
+            trafficSource = "live";
+            trafficVerified = true;
+            usedTrafficKnown = true;
+          } else {
+            up = 0;
+            down = 0;
+            trafficSource = "unknown";
+            trafficVerified = false;
+            usedTrafficKnown = false;
+          }
+        } else if (mutationOccurredMidFlight && currentMutationState.lastResetAtMs > 0) {
+          up = 0;
+          down = 0;
+          trafficSource = "reset_confirmed";
+          trafficVerified = true;
+          usedTrafficKnown = true;
+        } else {
+          trafficSource = "live";
+          trafficVerified = true;
+          usedTrafficKnown = true;
+          if (scopedTrafficCacheKey && !mutationOccurredMidFlight && currentMutationState.deletedAtMs === 0) {
+            setScopedClientTrafficCacheEntry(
+              {
+                cacheKey: scopedTrafficCacheKey,
+                panelIdentity: resolvedPanelIdentity,
+                userUid,
+                clientUuid: normUuid,
+                up,
+                down,
+                total,
+                expiryTime,
+                lastOnline,
+                updatedAtMs: nowMs,
+                mutationSeq: currentMutationState.seq
+              },
+              nowMs,
+              maxCacheEntries
+            );
+          }
+        }
+      } else {
+        console.log(`[Provisioning Audit] No live 3X-UI state verified for UUID: ${config.uuid}.`);
+        const lastKnown = mutationStateEvictedMidFlight ? void 0 : getScopedClientTrafficCacheEntry(
+          scopedTrafficCacheKey,
+          nowMs,
+          currentMutationState.seq,
+          afterTrafficEpochSnap.maxEvictedEpoch,
+          Boolean(currentMutationState.present)
+        );
+        if (lastKnown) {
+          up = lastKnown.up;
+          down = lastKnown.down;
+          if (lastKnown.total > 0) total = lastKnown.total;
+          if (lastKnown.expiryTime > 0) expiryTime = lastKnown.expiryTime;
+          lastOnline = lastKnown.lastOnline;
+          trafficSource = "cached_scoped";
+          trafficVerified = true;
+          usedTrafficKnown = true;
+        } else if (!mutationStateEvictedMidFlight && currentMutationState.lastResetAtMs > 0 || mutationStateEvictedMidFlight && postEvictionConfirmedResetInDb) {
+          up = 0;
+          down = 0;
+          trafficSource = "reset_confirmed";
+          trafficVerified = true;
+          usedTrafficKnown = true;
+        } else {
+          const rawCachedHit = !mutationStateEvictedMidFlight && scopedTrafficCacheKey && normUuid && !duplicateCachedUuids.has(normUuid) ? cachedTrafficByUuid.get(normUuid) : void 0;
+          const cachedHit = rawCachedHit && verifyClientOwnershipAndInboundMatch({
+            inbound: rawCachedHit.inbound,
+            client: rawCachedHit.client,
+            config,
+            requireSharedFallbackVerification: true
+          }) ? rawCachedHit : void 0;
+          const extractTraffic = (obj, type) => {
+            if (!obj) return 0;
+            const val = obj[type] || obj[`${type}load`] || 0;
+            return typeof val === "number" ? val : parseFloat(val) || 0;
+          };
+          if (cachedHit) {
+            const cachedIb = cachedHit.inbound;
+            const cachedCli = cachedHit.client;
+            const cachedEmail = String(cachedCli.email || userEmail || "").trim().toLowerCase();
+            const cachedStats = Array.isArray(cachedIb?.clientStats) ? cachedIb.clientStats : [];
+            const cachedStat = cachedStats.find((s) => String(s?.id || "").toLowerCase() === normUuid) || cachedStats.find((s) => String(s?.email || "").toLowerCase() === cachedEmail);
+            up = Math.max(extractTraffic(cachedStat, "up"), extractTraffic(cachedCli, "up"));
+            down = Math.max(extractTraffic(cachedStat, "down"), extractTraffic(cachedCli, "down"));
+            if (cachedStat?.total !== void 0 && Number(cachedStat.total) > 0) {
+              total = Number(cachedStat.total);
+            } else if (cachedCli.totalGB !== void 0 && Number(cachedCli.totalGB) > 0) {
+              total = Number(cachedCli.totalGB);
+            }
+            expiryTime = Number(cachedStat?.expiryTime || cachedCli?.expiryTime || 0) || 0;
+            lastOnline = cachedStat?.lastOnline || cachedStat?.online || cachedCli?.lastOnline || 0;
+            trafficSource = "cached_inbound";
+            trafficVerified = true;
+            usedTrafficKnown = true;
+          } else if (!mutationStateEvictedMidFlight) {
+            const storedUp = Math.max(0, Number(config._storedUpBytes || 0));
+            const storedDown = Math.max(0, Number(config._storedDownBytes || 0));
+            const storedUsed = Math.max(0, Number(config._storedUsedBytes || 0));
+            const hasConfirmedResetZeroInDb = Boolean(
+              (config._initialLastResetAtMs || 0) > 0 && config._hasExplicitStoredCounters && storedUp === 0 && storedDown === 0 && storedUsed === 0
+            );
+            if (storedUp + storedDown > 0) {
+              up = storedUp;
+              down = storedDown;
+              trafficSource = "stored_db";
+              trafficVerified = true;
+              usedTrafficKnown = true;
+            } else if (storedUsed > 0) {
+              up = 0;
+              down = storedUsed;
+              trafficSource = "stored_db";
+              trafficVerified = true;
+              usedTrafficKnown = true;
+            } else if (hasConfirmedResetZeroInDb) {
+              up = 0;
+              down = 0;
+              trafficSource = "reset_confirmed";
+              trafficVerified = true;
+              usedTrafficKnown = true;
+            } else {
+              up = 0;
+              down = 0;
+              trafficSource = "unknown";
+              trafficVerified = false;
+              usedTrafficKnown = false;
+            }
+          } else {
+            up = 0;
+            down = 0;
+            trafficSource = "unknown";
+            trafficVerified = false;
+            usedTrafficKnown = false;
+          }
+        }
+      }
+      let lastOnlineMs = lastOnline;
+      if (lastOnlineMs > 0 && lastOnlineMs < 1e10) {
+        lastOnlineMs = lastOnlineMs * 1e3;
+      }
+      const accForReset = normUuid ? vpnAccountByUuid.get(normUuid) || null : null;
+      const cfgForReset = normUuid ? vpnConfigByUuid.get(normUuid) || null : null;
+      const orderIdKey = String(config.orderId || "").trim();
+      const relatedOrdersSet = /* @__PURE__ */ new Set([
+        ...normUuid ? ordersByUuidMap.get(normUuid) || [] : [],
+        ...orderIdKey ? ordersByAnyIdMap.get(orderIdKey) || [] : []
+      ]);
+      const relatedGrantsSet = /* @__PURE__ */ new Set([
+        ...normUuid ? grantsByUuid.get(normUuid) || [] : [],
+        ...orderIdKey ? grantsByOrderIdList.get(orderIdKey) || [] : []
+      ]);
+      const resetEligibility = evaluateCustomerTrafficResetEligibility({
+        vpnAccount: accForReset,
+        vpnConfig: cfgForReset,
+        orders: Array.from(relatedOrdersSet),
+        grants: Array.from(relatedGrantsSet),
+        ownershipSource: accForReset ? "vpn_accounts" : cfgForReset ? "vpn_configs" : "orders",
+        panelReachable: Boolean(matchedInbound && foundClient),
         liveInbound: matchedInbound,
         liveClient: foundClient,
         liveStat: stat,
         nowMs
       });
-      if (canRestore) {
-        const nowIso = new Date(nowMs).toISOString();
-        if (config._dbAccountId) {
-          adminDb.from("vpn_accounts").update({
-            status: "active",
-            enable: true,
-            updated_at: nowIso,
-            ...resolvedPanelIdentity && !config._recordPanelIdentity ? { panel_identity: resolvedPanelIdentity } : {}
-          }).eq("id", config._dbAccountId).then(() => {
-          }).catch(() => {
-          });
+      let hasFiniteQuotaConflict = Boolean(config.isTrial);
+      let hasExplicitUnlimitedEvidence = Boolean(resetEligibility.isUnlimitedPlan);
+      if (accForReset) {
+        if (accForReset.total_bytes !== void 0 && accForReset.total_bytes !== null && accForReset.total_bytes !== "") {
+          const cls = classifyNumericQuotaBytes(accForReset.total_bytes, { allowZeroAsUnlimited: false });
+          if (cls === "finite" || cls === "invalid") hasFiniteQuotaConflict = true;
         }
-        if (config._dbConfigId) {
-          adminDb.from("vpn_configs").update({
-            status: "active",
-            enabled: true,
-            ...resolvedPanelIdentity && !config._recordPanelIdentity ? { panel_identity: resolvedPanelIdentity } : {}
-          }).eq("id", config._dbConfigId).then(() => {
-          }).catch(() => {
-          });
+        if (accForReset.data_limit !== void 0 && accForReset.data_limit !== null && String(accForReset.data_limit).trim() !== "") {
+          const cls = classifyQuotaText(accForReset.data_limit);
+          if (cls === "finite" || cls === "invalid") hasFiniteQuotaConflict = true;
+          else if (cls === "unlimited") hasExplicitUnlimitedEvidence = true;
+        }
+        if (accForReset.package_name && classifyQuotaText(accForReset.package_name) === "finite") {
+          hasFiniteQuotaConflict = true;
         }
       }
-    }
-    let currentExpiryDate = config.expiryDate;
-    if (expTimeMs > 0) {
-      currentExpiryDate = new Date(expTimeMs).toISOString();
-    }
-    let port = 443;
-    let protocol = "vless";
-    let network = "tcp";
-    let security = "none";
-    let serverAddress = "singapore.firevpn.com";
-    if (config.configUrl) {
-      try {
-        const urlStr = config.configUrl.startsWith("vless://") ? config.configUrl.replace("vless://", "http://") : config.configUrl;
-        const urlObj = new URL(urlStr);
-        if (urlObj.port) port = Number(urlObj.port);
-        if (urlObj.hostname) serverAddress = urlObj.hostname;
-        const typeParam = urlObj.searchParams.get("type");
-        if (typeParam) network = typeParam;
-        const secParam = urlObj.searchParams.get("security");
-        if (secParam) security = secParam;
-      } catch (e) {
+      if (cfgForReset) {
+        for (const val of [cfgForReset.data_limit, cfgForReset.traffic_limit]) {
+          if (val === void 0 || val === null || String(val).trim() === "") continue;
+          const cls = typeof val === "number" ? classifyNumericQuotaBytes(val, { allowZeroAsUnlimited: false }) : classifyQuotaText(val);
+          if (cls === "finite" || cls === "invalid") hasFiniteQuotaConflict = true;
+          else if (cls === "unlimited") hasExplicitUnlimitedEvidence = true;
+        }
       }
+      for (const g of relatedGrantsSet) {
+        if (!g || typeof g !== "object") continue;
+        const gStatus = String(g.status || "active").toLowerCase().trim();
+        if (gStatus === "revoked" || gStatus === "rejected" || gStatus === "cancelled" || gStatus === "deleted") {
+          continue;
+        }
+        if (g.granted_unlimited === false) hasFiniteQuotaConflict = true;
+        if (g.granted_total_bytes !== void 0 && g.granted_total_bytes !== null && g.granted_total_bytes !== "" && Number(g.granted_total_bytes) > 0) {
+          hasFiniteQuotaConflict = true;
+        }
+        if (g.granted_unlimited === true) hasExplicitUnlimitedEvidence = true;
+      }
+      for (const ord of relatedOrdersSet) {
+        if (!ord || typeof ord !== "object") continue;
+        if (isOrderRejectedOrRevoked(ord)) continue;
+        const pm = parsePaymentMethodJsonSafe(ord.payment_method);
+        if (ord.is_unlimited === false || pm.is_unlimited === false || pm.isUnlimited === false || pm.unlimited === false) {
+          hasFiniteQuotaConflict = true;
+        }
+        if (ord.is_unlimited === true || pm.is_unlimited === true || pm.isUnlimited === true || pm.unlimited === true) {
+          hasExplicitUnlimitedEvidence = true;
+        }
+        for (const val of [
+          ord.data_limit,
+          ord.traffic_limit,
+          pm.data_limit,
+          pm.dataLimit,
+          pm.traffic_limit,
+          pm.trafficLimit,
+          pm.quota
+        ]) {
+          if (val === void 0 || val === null || String(val).trim() === "") continue;
+          const cls = classifyQuotaText(val);
+          if (cls === "finite" || cls === "invalid") hasFiniteQuotaConflict = true;
+          else if (cls === "unlimited") hasExplicitUnlimitedEvidence = true;
+        }
+      }
+      const hasExplicitLiveUnlimitedTotal = Boolean(
+        matchedInbound && foundClient && foundClient.totalGB !== void 0 && foundClient.totalGB !== null && foundClient.totalGB !== "" && Number(foundClient.totalGB) === 0 && (!stat || stat.total === void 0 || stat.total === null || Number(stat.total) === 0)
+      );
+      if (hasExplicitLiveUnlimitedTotal) {
+        hasExplicitUnlimitedEvidence = true;
+      }
+      const isConfirmedUnlimitedQuota = Boolean(
+        total <= 0 && !hasFiniteQuotaConflict && hasExplicitUnlimitedEvidence
+      );
+      const quotaVerified = total > 0 || isConfirmedUnlimitedQuota;
+      const totalUsed = usedTrafficKnown ? up + down : 0;
+      const remainingTraffic = total > 0 && usedTrafficKnown ? Math.max(total - totalUsed, 0) : 0;
+      const remainingTrafficKnown = total > 0 && usedTrafficKnown || isConfirmedUnlimitedQuota;
+      const usedGB = usedTrafficKnown ? parseFloat((totalUsed / (1024 * 1024 * 1024)).toFixed(2)) : 0;
+      const remainingGB = total > 0 ? usedTrafficKnown ? parseFloat((remainingTraffic / (1024 * 1024 * 1024)).toFixed(2)) : "Unavailable" : isConfirmedUnlimitedQuota ? "Unlimited" : "Unavailable";
+      const resolvedTrafficLimit = total > 0 ? `${parseFloat((total / (1024 * 1024 * 1024)).toFixed(2))}GB` : isConfirmedUnlimitedQuota ? "Unlimited" : "Unavailable";
+      let expTimeMs = expiryTime;
+      if (expTimeMs > 0 && expTimeMs < 1e10) {
+        expTimeMs = expTimeMs * 1e3;
+      }
+      if ((!expTimeMs || expTimeMs <= 0) && config.expiryDate) {
+        const parsed = new Date(config.expiryDate).getTime();
+        if (!isNaN(parsed)) expTimeMs = parsed;
+      }
+      const expectedInboundCleanlyFetched = Boolean(
+        !config._hasConflictingInboundId && !config._hasConflictingOwnership && !duplicateLiveUuids.has(normUuid) && (inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId)) || liveFullListFetched && liveFullListCleanlyParsed)
+      );
+      const evaluated = evaluateVpnClientStatus({
+        panelReachable: expectedInboundCleanlyFetched || Boolean(matchedInbound),
+        inboundFound: Boolean(matchedInbound),
+        inboundEnable: matchedInbound ? matchedInbound.enable : null,
+        clientFound: Boolean(foundClient),
+        clientEnable: foundClient ? foundClient.enable : null,
+        statEnable: stat ? stat.enable : void 0,
+        upBytes: up,
+        downBytes: down,
+        totalLimitBytes: total,
+        expiryTimeMs: expTimeMs,
+        nowMs
+      });
+      const hasInMemoryRevocationBlock = Array.from(relatedOrdersSet).some((ord) => isOrderRejectedOrRevoked(ord)) || Array.from(relatedGrantsSet).some((g) => {
+        const st = String(g?.status || "").toLowerCase().trim();
+        return st === "revoke_failed" || st === "uncertain";
+      });
+      const effectiveDisplayStatus = config._dbStatus === "disabled" && evaluated.status === "Active" && hasInMemoryRevocationBlock ? "Disabled" : evaluated.status;
+      const effectiveDisplayEnable = effectiveDisplayStatus === "Disabled" ? false : evaluated.effectiveEnable;
+      const effectiveDisplayEnableStatus = effectiveDisplayStatus === "Disabled" ? false : evaluated.enableStatus;
+      let currentExpiryDate = config.expiryDate;
+      if (expTimeMs > 0) {
+        currentExpiryDate = new Date(expTimeMs).toISOString();
+      }
+      let port = 443;
+      let protocol = "vless";
+      let network = "tcp";
+      let security = "none";
+      let serverAddress = "singapore.firevpn.com";
+      if (config.configUrl) {
+        try {
+          const urlStr = config.configUrl.startsWith("vless://") ? config.configUrl.replace("vless://", "http://") : config.configUrl;
+          const urlObj = new URL(urlStr);
+          if (urlObj.port) port = Number(urlObj.port);
+          if (urlObj.hostname) serverAddress = urlObj.hostname;
+          const typeParam = urlObj.searchParams.get("type");
+          if (typeParam) network = typeParam;
+          const secParam = urlObj.searchParams.get("security");
+          if (secParam) security = secParam;
+        } catch (e) {
+        }
+      }
+      finalConfigs.push({
+        orderId: config.orderId,
+        packageName: config.packageName,
+        uuid: config.uuid,
+        configUrl: config.configUrl,
+        inboundId,
+        trafficLimit: resolvedTrafficLimit,
+        usedGB,
+        remainingGB,
+        upBytes: usedTrafficKnown ? up : 0,
+        downBytes: usedTrafficKnown ? down : 0,
+        upload: usedTrafficKnown ? up : 0,
+        download: usedTrafficKnown ? down : 0,
+        liveUsageFound: !!matchedInbound && !!foundClient && trafficSource === "live",
+        trafficVerified,
+        trafficSource,
+        quotaVerified,
+        usedTrafficKnown,
+        remainingTrafficKnown,
+        panelStatusVerified: evaluated.panelStatusVerified,
+        statusReason: evaluated.statusReason,
+        totalTrafficBytes: total,
+        remainingTrafficBytes: remainingTraffic,
+        expiryDate: currentExpiryDate,
+        expiryTime: currentExpiryDate,
+        status: effectiveDisplayStatus,
+        enable: effectiveDisplayEnable,
+        enableStatus: effectiveDisplayEnableStatus,
+        onlineStatus: effectiveDisplayStatus === "Active" && (lastOnline > 0 || usedTrafficKnown && (up > 0 || down > 0)),
+        lastOnline: lastOnlineMs,
+        serverNode: config.serverNode,
+        port,
+        protocol,
+        network,
+        security,
+        serverAddress,
+        subscriptionName: config.packageName,
+        name: config.packageName,
+        isTrial: !!config.isTrial,
+        templateId: config.templateId || null,
+        paymentStatus: config.paymentStatus || null,
+        provisioningStatus: config.provisioningStatus || null,
+        trafficResetEligible: resetEligibility.eligible,
+        isUnlimitedPlan: resetEligibility.isUnlimitedPlan
+      });
     }
-    const accForReset = normUuid ? vpnAccountByUuid.get(normUuid) || null : null;
-    const cfgForReset = normUuid ? vpnConfigByUuid.get(normUuid) || null : null;
-    const orderIdKey = String(config.orderId || "").trim();
-    const relatedOrdersSet = /* @__PURE__ */ new Set([
-      ...normUuid ? ordersByUuidMap.get(normUuid) || [] : [],
-      ...orderIdKey ? ordersByAnyIdMap.get(orderIdKey) || [] : []
-    ]);
-    const relatedGrantsSet = /* @__PURE__ */ new Set([
-      ...normUuid ? grantsByUuid.get(normUuid) || [] : [],
-      ...orderIdKey ? grantsByOrderIdList.get(orderIdKey) || [] : []
-    ]);
-    const resetEligibility = evaluateCustomerTrafficResetEligibility({
-      vpnAccount: accForReset,
-      vpnConfig: cfgForReset,
-      orders: Array.from(relatedOrdersSet),
-      grants: Array.from(relatedGrantsSet),
-      ownershipSource: accForReset ? "vpn_accounts" : cfgForReset ? "vpn_configs" : "orders",
-      panelReachable: Boolean(matchedInbound && foundClient),
-      liveInbound: matchedInbound,
-      liveClient: foundClient,
-      liveStat: stat,
-      nowMs
+    const dbTime = Date.now() - dbStart;
+    const seenRejectedOrderKeys = /* @__PURE__ */ new Set();
+    const rejectedConfigs = [];
+    allOrders.forEach((ord) => {
+      const docUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || "").trim();
+      const docEmail = String(ord.email || ord.customerEmail || ord.userEmail || "").toLowerCase().trim();
+      const matchesUser = userUid ? docUid === userUid || !docUid && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
+      if (!matchesUser) return;
+      const ordRowId = String(ord.id || "").trim();
+      const ordPublicId = String(ord.order_id || "").trim();
+      const grant = ordRowId ? grantByOrderId.get(ordRowId) : void 0;
+      if (!isOrderRejectedOrRevoked(ord, grant?.status)) return;
+      const hadProvisionedVpn = Boolean(
+        ord.client_uuid || ord.vless_url || ord.vpn_credentials?.configLink || ord.vpn_credentials?.password || grant?.client_uuid || ordRowId && vpnConfigOrderIds.has(ordRowId) || ordPublicId && vpnConfigOrderIds.has(ordPublicId)
+      );
+      if (!hadProvisionedVpn) return;
+      const dedupeKey = ordRowId || ordPublicId;
+      if (!dedupeKey || seenRejectedOrderKeys.has(dedupeKey)) return;
+      seenRejectedOrderKeys.add(dedupeKey);
+      rejectedConfigs.push(buildRejectedVpnDisplayConfig(ord, grant));
     });
-    finalConfigs.push({
-      orderId: config.orderId,
-      packageName: config.packageName,
-      uuid: config.uuid,
-      configUrl: config.configUrl,
-      inboundId,
-      trafficLimit: total > 0 ? `${total / (1024 * 1024 * 1024)}GB` : "Unlimited",
-      usedGB,
-      remainingGB,
-      upBytes: up,
-      downBytes: down,
-      upload: up,
-      download: down,
-      liveUsageFound: !!matchedInbound && !!foundClient,
-      panelStatusVerified: evaluated.panelStatusVerified,
-      statusReason: evaluated.statusReason,
-      totalTrafficBytes: total,
-      remainingTrafficBytes: remainingTraffic,
-      expiryDate: currentExpiryDate,
-      expiryTime: currentExpiryDate,
-      status: evaluated.status,
-      enable: evaluated.effectiveEnable,
-      enableStatus: evaluated.enableStatus,
-      onlineStatus: evaluated.status === "Active" && (lastOnline > 0 || up > 0 || down > 0),
-      lastOnline: lastOnlineMs,
-      serverNode: config.serverNode,
-      port,
-      protocol,
-      network,
-      security,
-      serverAddress,
-      subscriptionName: config.packageName,
-      name: config.packageName,
-      isTrial: !!config.isTrial,
-      templateId: config.templateId || null,
-      paymentStatus: config.paymentStatus || null,
-      provisioningStatus: config.provisioningStatus || null,
-      trafficResetEligible: resetEligibility.eligible,
-      isUnlimitedPlan: resetEligibility.isUnlimitedPlan
-    });
+    return {
+      configs: [...finalConfigs, ...rejectedConfigs],
+      deletedUuids: Array.from(confirmedDeletedUuids),
+      legacyReconciliationRecords,
+      dbTime
+    };
+  } finally {
+    unregisterClientTrafficCacheInvalidator(inFlightMutationListener);
   }
-  const dbTime = Date.now() - dbStart;
-  const seenRejectedOrderKeys = /* @__PURE__ */ new Set();
-  const rejectedConfigs = [];
-  allOrders.forEach((ord) => {
-    const docUid = String(ord.customer_id || ord.customerUid || ord.customerId || ord.uid || ord.userId || "").trim();
-    const docEmail = String(ord.email || ord.customerEmail || ord.userEmail || "").toLowerCase().trim();
-    const matchesUser = userUid ? docUid === userUid || !docUid && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
-    if (!matchesUser) return;
-    const ordRowId = String(ord.id || "").trim();
-    const ordPublicId = String(ord.order_id || "").trim();
-    const grant = ordRowId ? grantByOrderId.get(ordRowId) : void 0;
-    if (!isOrderRejectedOrRevoked(ord, grant?.status)) return;
-    const hadProvisionedVpn = Boolean(
-      ord.client_uuid || ord.vless_url || ord.vpn_credentials?.configLink || ord.vpn_credentials?.password || grant?.client_uuid || ordRowId && vpnConfigOrderIds.has(ordRowId) || ordPublicId && vpnConfigOrderIds.has(ordPublicId)
-    );
-    if (!hadProvisionedVpn) return;
-    const dedupeKey = ordRowId || ordPublicId;
-    if (!dedupeKey || seenRejectedOrderKeys.has(dedupeKey)) return;
-    seenRejectedOrderKeys.add(dedupeKey);
-    rejectedConfigs.push(buildRejectedVpnDisplayConfig(ord, grant));
-  });
-  return {
-    configs: [...finalConfigs, ...rejectedConfigs],
-    deletedUuids: Array.from(confirmedDeletedUuids),
-    dbTime
-  };
 };
 var DEFAULT_RESET_POLICY = {
   enabled: true,
@@ -20007,6 +21447,9 @@ var resetVpnTraffic = async (userId, userEmail, configUuid, options) => {
       totalBytesBefore: totalBefore,
       status: "success"
     });
+  }
+  if (normUuid) {
+    notifyClientTrafficInvalidated(normUuid, "reset", nowMs);
   }
   if (!options?.skipUsedBytesUpdate) {
     try {
@@ -22275,6 +23718,12 @@ var getClientStatus = async (email, targetUuid, uid, token) => {
         usedGB: selectedConfig.usedGB,
         remainingGB: selectedConfig.remainingGB,
         trafficLimit: selectedConfig.trafficLimit,
+        liveUsageFound: selectedConfig.liveUsageFound === true,
+        trafficVerified: selectedConfig.trafficVerified === true,
+        trafficSource: selectedConfig.trafficSource || "unknown",
+        quotaVerified: selectedConfig.quotaVerified === true,
+        usedTrafficKnown: selectedConfig.usedTrafficKnown === true,
+        remainingTrafficKnown: selectedConfig.remainingTrafficKnown === true,
         expiryTime: selectedConfig.expiryDate || selectedConfig.expiryTime || 0,
         expiryDate: selectedConfig.expiryDate || selectedConfig.expiryTime || "",
         enable: selectedConfig.enable,
@@ -23163,32 +24612,10 @@ app.listen(PORT, "0.0.0.0", () => {
     startTelegramBotPolling().catch((err) => {
       console.warn("[TelegramService] Polling startup warning:", err?.message || err);
     });
-    setTimeout(() => {
-      try {
-        triggerBackgroundSyncIfNeeded("Server Start", true);
-      } catch (err) {
-        console.error("[Scheduler] Initial background sync error:", err);
-      }
-    }, 5e3);
-    setTimeout(() => {
-      try {
-        triggerPanelDeletionSyncIfNeeded("Server Start", false);
-      } catch (err) {
-        console.error("[Scheduler] Initial panel deletion sync error:", err);
-      }
-    }, 1e4);
-    setInterval(() => {
-      try {
-        triggerBackgroundSyncIfNeeded("Scheduled", false);
-      } catch (err) {
-        console.error("[Scheduler] Scheduled background sync error:", err);
-      }
-      try {
-        triggerPanelDeletionSyncIfNeeded("Scheduled", false);
-      } catch (err) {
-        console.error("[Scheduler] Scheduled panel deletion sync error:", err);
-      }
-    }, 6e4);
+    startBackgroundSyncScheduler({
+      triggerBackgroundSyncFn: triggerBackgroundSyncIfNeeded,
+      triggerPanelDeletionSyncFn: triggerPanelDeletionSyncIfNeeded
+    });
   }
 });
 //# sourceMappingURL=server.js.map

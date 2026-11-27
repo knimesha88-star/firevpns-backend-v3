@@ -19,6 +19,7 @@ import {
   webhookRateLimit,
 } from './src/api/middleware/rateLimitMiddleware.js';
 import {
+  startBackgroundSyncScheduler,
   triggerBackgroundSyncIfNeeded,
   triggerPanelDeletionSyncIfNeeded,
 } from './src/api/services/xuiService.js';
@@ -171,34 +172,10 @@ app.listen(PORT, '0.0.0.0', () => {
     startTelegramBotPolling().catch((err) => {
       console.warn('[TelegramService] Polling startup warning:', err?.message || err);
     });
-    setTimeout(() => {
-      try {
-        triggerBackgroundSyncIfNeeded('Server Start', true);
-      } catch (err) {
-        console.error('[Scheduler] Initial background sync error:', err);
-      }
-    }, 5000);
-
-    setTimeout(() => {
-      try {
-        triggerPanelDeletionSyncIfNeeded('Server Start', false);
-      } catch (err) {
-        console.error('[Scheduler] Initial panel deletion sync error:', err);
-      }
-    }, 10000);
-
-    setInterval(() => {
-      try {
-        triggerBackgroundSyncIfNeeded('Scheduled', false);
-      } catch (err) {
-        console.error('[Scheduler] Scheduled background sync error:', err);
-      }
-      try {
-        triggerPanelDeletionSyncIfNeeded('Scheduled', false);
-      } catch (err) {
-        console.error('[Scheduler] Scheduled panel deletion sync error:', err);
-      }
-    }, 60000);
+    startBackgroundSyncScheduler({
+      triggerBackgroundSyncFn: triggerBackgroundSyncIfNeeded,
+      triggerPanelDeletionSyncFn: triggerPanelDeletionSyncIfNeeded,
+    });
   }
 });
 

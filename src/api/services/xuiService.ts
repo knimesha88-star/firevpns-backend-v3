@@ -52,8 +52,33 @@ export interface XuiClient {
 
 // Global in-memory cache and state for 3X-UI inbounds metadata
 export let cachedInbounds: XuiInbound[] = [];
+export let cachedInboundsPanelIdentity = '';
 export let lastInboundsCacheTime = 0;
 export let isCacheRefreshing = false;
+let inboundsCacheGeneration = 0;
+let lastFailedInboundsAt = 0;
+const FAILED_INBOUNDS_COOLDOWN_MS = 10 * 1000;
+const inboundsInFlight = new Map<string, { generation: number; isForceRefresh: boolean; promise: Promise<XuiInbound[]> }>();
+
+export const getInboundsSnapshotTimestamp = (): number => lastInboundsCacheTime;
+
+export const getXuiAuthTimeoutMs = (): number => {
+  const raw = Number(process.env.XUI_AUTH_TIMEOUT_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return 6000;
+  return Math.max(2000, Math.min(Math.floor(raw), 12000));
+};
+
+export const getXuiSingleInboundTimeoutMs = (): number => {
+  const raw = Number(process.env.XUI_SINGLE_INBOUND_TIMEOUT_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return 8000;
+  return Math.max(2000, Math.min(Math.floor(raw), 15000));
+};
+
+export const getXuiFullListTimeoutMs = (): number => {
+  const raw = Number(process.env.XUI_FULL_LIST_TIMEOUT_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return 15000;
+  return Math.max(5000, Math.min(Math.floor(raw), 25000));
+};
 
 export interface XuiInbound {
   id: number;
@@ -73,14 +98,348 @@ export interface XuiInbound {
 }
 
 let cachedXuiConfig: { config: XuiConfig; expiresAt: number } | null = null;
+let xuiConfigGeneration = 0;
+let xuiConfigInFlight: { generation: number; promise: Promise<XuiConfig> } | null = null;
 const XUI_CONFIG_TTL_MS = 60 * 1000;
 
-let cachedXuiAuth: { panelUrl: string; headers: Record<string, string>; expiresAt: number } | null = null;
+export const MAX_XUI_AUTH_SCOPE_ENTRIES = 32;
+export const MAX_XUI_PANEL_CAPABILITY_ENTRIES = 64;
+export const MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES = 5000;
+
+let maxXuiAuthScopeEntriesOverride: number | null = null;
+let maxClientTrafficMutationStateEntriesOverride: number | null = null;
+
+export const getEffectiveMaxXuiAuthScopeEntries = (): number =>
+  maxXuiAuthScopeEntriesOverride !== null && maxXuiAuthScopeEntriesOverride > 0
+    ? maxXuiAuthScopeEntriesOverride
+    : MAX_XUI_AUTH_SCOPE_ENTRIES;
+
+export const setMaxXuiAuthScopeEntriesForTests = (maxEntries?: number | null): void => {
+  if (maxEntries === undefined || maxEntries === null) {
+    maxXuiAuthScopeEntriesOverride = null;
+    return;
+  }
+  const n = Math.floor(Number(maxEntries));
+  maxXuiAuthScopeEntriesOverride = Number.isFinite(n) && n > 0 ? n : null;
+};
+
+export const getEffectiveMaxClientTrafficMutationStateEntries = (): number =>
+  maxClientTrafficMutationStateEntriesOverride !== null && maxClientTrafficMutationStateEntriesOverride > 0
+    ? maxClientTrafficMutationStateEntriesOverride
+    : MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES;
+
+export const setMaxClientTrafficMutationStateEntriesForTests = (maxEntries?: number | null): void => {
+  if (maxEntries === undefined || maxEntries === null) {
+    maxClientTrafficMutationStateEntriesOverride = null;
+    return;
+  }
+  const n = Math.floor(Number(maxEntries));
+  maxClientTrafficMutationStateEntriesOverride = Number.isFinite(n) && n > 0 ? n : null;
+};
+
+const setBoundedMapEntry = <K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number,
+  onEvict?: (evictedKey: K, evictedValue: V) => void
+): void => {
+  if (map.has(key)) {
+    map.delete(key);
+  }
+  map.set(key, value);
+  while (map.size > maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldestVal = map.get(oldestKey)!;
+    map.delete(oldestKey);
+    if (onEvict) {
+      onEvict(oldestKey, oldestVal);
+    }
+  }
+};
+
+export interface CachedXuiAuthEntry {
+  scopeKey: string;
+  panelIdentity: string;
+  panelUrl: string;
+  generation: number;
+  headers: Record<string, string>;
+  expiresAt: number;
+}
+
+const cachedXuiAuthByScope = new Map<string, CachedXuiAuthEntry>();
+const xuiAuthGenerationByScope = new Map<string, number>();
+let globalXuiAuthEpoch = 0;
+let minValidAuthGenerationFloor = 0;
+let nextMonotonicAuthGeneration = 1;
+const xuiAuthInFlight = new Map<string, { generation: number; isForceRefresh: boolean; promise: Promise<Record<string, string>> }>();
+const rememberedLoginEndpointByPanel = new Map<string, string>();
+const confirmedUnsupportedCsrfByPanel = new Map<string, { scopeKey: string; generation: number; confirmedAt: number }>();
 const XUI_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes (3X-UI session cookie lasts 6 hours)
 
+const setScopeAuthGenerationEntry = (scopeKey: string, generation: number): void => {
+  const maxScopeEntries = getEffectiveMaxXuiAuthScopeEntries();
+  const maxGenEntries = maxScopeEntries * 2;
+  if (xuiAuthGenerationByScope.has(scopeKey)) {
+    xuiAuthGenerationByScope.delete(scopeKey);
+  }
+  xuiAuthGenerationByScope.set(scopeKey, generation);
+  nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, generation + 1);
+
+  while (xuiAuthGenerationByScope.size > maxGenEntries) {
+    // Prefer evicting scopes that do not currently hold an active cached session
+    let victimKey: string | undefined;
+    for (const candidateKey of xuiAuthGenerationByScope.keys()) {
+      if (candidateKey !== scopeKey && !cachedXuiAuthByScope.has(candidateKey)) {
+        victimKey = candidateKey;
+        break;
+      }
+    }
+    if (victimKey === undefined) {
+      victimKey = xuiAuthGenerationByScope.keys().next().value;
+    }
+    if (victimKey === undefined) break;
+    const evictedGen = xuiAuthGenerationByScope.get(victimKey) ?? 0;
+    xuiAuthGenerationByScope.delete(victimKey);
+    minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, evictedGen + 1);
+    nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, minValidAuthGenerationFloor + 1);
+    cachedXuiAuthByScope.delete(victimKey);
+    const victimInFlight = xuiAuthInFlight.get(victimKey);
+    if (victimInFlight && victimInFlight.generation <= evictedGen) {
+      xuiAuthInFlight.delete(victimKey);
+    }
+  }
+};
+
+export const getScopeAuthGeneration = (scopeKey: string): number => {
+  const existing = xuiAuthGenerationByScope.get(scopeKey);
+  if (existing !== undefined) return existing;
+  return Math.max(globalXuiAuthEpoch, minValidAuthGenerationFloor, nextMonotonicAuthGeneration);
+};
+
+const ensureScopeAuthGeneration = (scopeKey: string): number => {
+  const existing = xuiAuthGenerationByScope.get(scopeKey);
+  if (existing !== undefined && existing >= globalXuiAuthEpoch) {
+    return existing;
+  }
+  const allocatedGen = Math.max(
+    (existing ?? 0) + 1,
+    globalXuiAuthEpoch,
+    minValidAuthGenerationFloor,
+    nextMonotonicAuthGeneration
+  );
+  nextMonotonicAuthGeneration = allocatedGen + 1;
+  setScopeAuthGenerationEntry(scopeKey, allocatedGen);
+  return allocatedGen;
+};
+
+const bumpScopeAuthGeneration = (scopeKey: string): number => {
+  const existing = xuiAuthGenerationByScope.get(scopeKey);
+  const currentGen = existing !== undefined ? existing : 0;
+  const nextGen = Math.max(
+    currentGen + 1,
+    globalXuiAuthEpoch + 1,
+    minValidAuthGenerationFloor + 1,
+    nextMonotonicAuthGeneration
+  );
+  nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, nextGen + 1);
+  setScopeAuthGenerationEntry(scopeKey, nextGen);
+  return nextGen;
+};
+
+export interface ClientTrafficMutationState {
+  seq: number;
+  lastResetAtMs: number;
+  deletedAtMs: number;
+  epoch?: number;
+  present?: boolean;
+}
+
+const clientTrafficMutationStateByUuid = new Map<string, ClientTrafficMutationState>();
+let globalTrafficMutationEpoch = 0;
+let maxEvictedTrafficMutationEpoch = 0;
+
+const clientTrafficInvalidationListeners = new Set<
+  (clientUuid: string, reason: 'deleted' | 'reset' | 'clear', state: ClientTrafficMutationState) => void
+>();
+
+export const getClientTrafficMutationState = (clientUuid: string): ClientTrafficMutationState => {
+  const normUuid = String(clientUuid || '').trim().toLowerCase();
+  if (!normUuid) {
+    return { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false };
+  }
+  const existing = clientTrafficMutationStateByUuid.get(normUuid);
+  return existing
+    ? { ...existing, present: true }
+    : { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false };
+};
+
+export const getTrafficMutationEpochSnapshot = (): {
+  currentEpoch: number;
+  maxEvictedEpoch: number;
+  trackedUuidsCount: number;
+} => ({
+  currentEpoch: globalTrafficMutationEpoch,
+  maxEvictedEpoch: maxEvictedTrafficMutationEpoch,
+  trackedUuidsCount: clientTrafficMutationStateByUuid.size,
+});
+
+export const registerClientTrafficCacheInvalidator = (
+  listener: (clientUuid: string, reason: 'deleted' | 'reset' | 'clear', state: ClientTrafficMutationState) => void
+): void => {
+  clientTrafficInvalidationListeners.add(listener);
+};
+
+export const unregisterClientTrafficCacheInvalidator = (
+  listener: (clientUuid: string, reason: 'deleted' | 'reset' | 'clear', state: ClientTrafficMutationState) => void
+): void => {
+  clientTrafficInvalidationListeners.delete(listener);
+};
+
+export const notifyClientTrafficInvalidated = (
+  clientUuid: string,
+  reason: 'deleted' | 'reset',
+  timestampMs: number = Date.now()
+): ClientTrafficMutationState => {
+  const normUuid = String(clientUuid || '').trim().toLowerCase();
+  if (!normUuid) {
+    return { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: globalTrafficMutationEpoch, present: false };
+  }
+  globalTrafficMutationEpoch += 1;
+  const prev = clientTrafficMutationStateByUuid.get(normUuid);
+  const baseSeq = prev ? prev.seq : maxEvictedTrafficMutationEpoch;
+  const next: ClientTrafficMutationState = {
+    seq: Math.max(baseSeq + 1, globalTrafficMutationEpoch),
+    lastResetAtMs: reason === 'reset' ? Math.max(prev?.lastResetAtMs ?? 0, timestampMs) : (prev?.lastResetAtMs ?? 0),
+    deletedAtMs: reason === 'deleted' ? Math.max(prev?.deletedAtMs ?? 0, timestampMs) : (prev?.deletedAtMs ?? 0),
+    epoch: globalTrafficMutationEpoch,
+    present: true,
+  };
+  setBoundedMapEntry(
+    clientTrafficMutationStateByUuid,
+    normUuid,
+    next,
+    getEffectiveMaxClientTrafficMutationStateEntries(),
+    (_evictedUuid, evictedState) => {
+      maxEvictedTrafficMutationEpoch = Math.max(
+        maxEvictedTrafficMutationEpoch,
+        evictedState.epoch ?? evictedState.seq
+      );
+    }
+  );
+  for (const listener of clientTrafficInvalidationListeners) {
+    try {
+      listener(normUuid, reason, next);
+    } catch {
+      // Ignore listener errors
+    }
+  }
+  return { ...next };
+};
+
+export const getXuiAuthCacheStatsForTests = (): {
+  cachedScopes: string[];
+  inFlightScopes: string[];
+  generationsByScope: Record<string, number>;
+  minValidAuthGenerationFloor: number;
+  rememberedLoginEndpointsSize: number;
+  confirmedUnsupportedCsrfSize: number;
+} => ({
+  cachedScopes: Array.from(cachedXuiAuthByScope.keys()),
+  inFlightScopes: Array.from(xuiAuthInFlight.keys()),
+  generationsByScope: Object.fromEntries(xuiAuthGenerationByScope.entries()),
+  minValidAuthGenerationFloor,
+  rememberedLoginEndpointsSize: rememberedLoginEndpointByPanel.size,
+  confirmedUnsupportedCsrfSize: confirmedUnsupportedCsrfByPanel.size,
+});
+
 export const invalidateXuiConfigCache = (): void => {
+  xuiConfigGeneration += 1;
+  globalXuiAuthEpoch = Math.max(globalXuiAuthEpoch + 1, minValidAuthGenerationFloor + 1, nextMonotonicAuthGeneration);
+  minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, globalXuiAuthEpoch);
+  nextMonotonicAuthGeneration = globalXuiAuthEpoch + 1;
+  for (const [k, gen] of Array.from(xuiAuthGenerationByScope.entries())) {
+    const bumped = Math.max(gen + 1, globalXuiAuthEpoch);
+    xuiAuthGenerationByScope.set(k, bumped);
+    nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, bumped + 1);
+  }
+  inboundsCacheGeneration += 1;
   cachedXuiConfig = null;
-  cachedXuiAuth = null;
+  xuiConfigInFlight = null;
+  cachedXuiAuthByScope.clear();
+  xuiAuthInFlight.clear();
+  rememberedLoginEndpointByPanel.clear();
+  confirmedUnsupportedCsrfByPanel.clear();
+  lastInboundsCacheTime = 0;
+  lastFailedInboundsAt = 0;
+  inboundsInFlight.clear();
+};
+
+export const invalidateXuiAuthCache = (scopeKey?: string, expectedGeneration?: number): number => {
+  if (!scopeKey) {
+    if (expectedGeneration !== undefined && expectedGeneration !== globalXuiAuthEpoch) {
+      return globalXuiAuthEpoch;
+    }
+    globalXuiAuthEpoch = Math.max(globalXuiAuthEpoch + 1, minValidAuthGenerationFloor + 1, nextMonotonicAuthGeneration);
+    minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, globalXuiAuthEpoch);
+    nextMonotonicAuthGeneration = globalXuiAuthEpoch + 1;
+    for (const [k, gen] of Array.from(xuiAuthGenerationByScope.entries())) {
+      const bumped = Math.max(gen + 1, globalXuiAuthEpoch);
+      xuiAuthGenerationByScope.set(k, bumped);
+      nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, bumped + 1);
+    }
+    cachedXuiAuthByScope.clear();
+    xuiAuthInFlight.clear();
+    confirmedUnsupportedCsrfByPanel.clear();
+    return globalXuiAuthEpoch;
+  }
+
+  const currentScopeGen = getScopeAuthGeneration(scopeKey);
+  if (expectedGeneration !== undefined && expectedGeneration !== currentScopeGen) {
+    return currentScopeGen;
+  }
+
+  const nextGen = bumpScopeAuthGeneration(scopeKey);
+  const existingCached = cachedXuiAuthByScope.get(scopeKey);
+  if (existingCached) {
+    confirmedUnsupportedCsrfByPanel.delete(existingCached.panelIdentity);
+    cachedXuiAuthByScope.delete(scopeKey);
+  } else {
+    const panelPart = scopeKey.split('::')[0];
+    if (panelPart) confirmedUnsupportedCsrfByPanel.delete(panelPart);
+  }
+  xuiAuthInFlight.delete(scopeKey);
+  return nextGen;
+};
+
+export const resetXuiServiceCachesForTests = (): void => {
+  maxXuiAuthScopeEntriesOverride = null;
+  maxClientTrafficMutationStateEntriesOverride = null;
+  invalidateXuiConfigCache();
+  xuiAuthGenerationByScope.clear();
+  globalXuiAuthEpoch = 0;
+  minValidAuthGenerationFloor = 0;
+  nextMonotonicAuthGeneration = 1;
+  clientTrafficMutationStateByUuid.clear();
+  globalTrafficMutationEpoch = 0;
+  maxEvictedTrafficMutationEpoch = 0;
+  for (const listener of clientTrafficInvalidationListeners) {
+    try {
+      listener('', 'clear', { seq: 0, lastResetAtMs: 0, deletedAtMs: 0, epoch: 0, present: false });
+    } catch {
+      // Ignore listener errors
+    }
+  }
+  cachedInbounds = [];
+  cachedInboundsPanelIdentity = '';
+  liveInboundCache.clear();
+  liveInboundInFlight.clear();
+  liveInboundCacheGeneration += 1;
+  isSyncInProgress = false;
+  lastSyncAt = 0;
+  isPanelDeletionSyncInProgress = false;
+  lastPanelDeletionSyncAt = 0;
 };
 
 /**
@@ -159,35 +518,53 @@ export const getXuiConfig = async (forceRefresh = false): Promise<XuiConfig> => 
     return cachedXuiConfig.config;
   }
 
-  const db = supabaseAdmin || supabase;
-  const { data: doc } = await db.from('settings').select('*').eq('id', 'xui').maybeSingle();
-  const data = (doc && typeof doc.data === 'object' ? doc.data : {}) as Record<string, any>;
-
-  const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || '').trim();
-  const username = String(data.username || process.env.XUI_USERNAME || 'admin').trim();
-  const password = String(
-    data.password ||
-      data.apiToken ||
-      process.env.XUI_PASSWORD ||
-      process.env.XUI_API_TOKEN ||
-      ''
-  ).trim();
-  const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
-
-  if (!panelUrl) {
-    throw new Error('3X-UI settings not configured');
+  if (!forceRefresh && xuiConfigInFlight && xuiConfigInFlight.generation === xuiConfigGeneration) {
+    return xuiConfigInFlight.promise;
   }
 
-  const config: XuiConfig = {
-    panelUrl,
-    username,
-    password,
-    apiToken,
-    panelName: String(data.panelName || 'Primary Node'),
-  };
+  const capturedGeneration = xuiConfigGeneration;
+  const fetchPromise = (async (): Promise<XuiConfig> => {
+    const db = supabaseAdmin || supabase;
+    const { data: doc } = await db.from('settings').select('*').eq('id', 'xui').maybeSingle();
+    const data = (doc && typeof doc.data === 'object' ? doc.data : {}) as Record<string, any>;
 
-  cachedXuiConfig = { config, expiresAt: now + XUI_CONFIG_TTL_MS };
-  return config;
+    const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || '').trim();
+    const username = String(data.username || process.env.XUI_USERNAME || 'admin').trim();
+    const password = String(
+      data.password ||
+        data.apiToken ||
+        process.env.XUI_PASSWORD ||
+        process.env.XUI_API_TOKEN ||
+        ''
+    ).trim();
+    const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
+
+    if (!panelUrl) {
+      throw new Error('3X-UI settings not configured');
+    }
+
+    const config: XuiConfig = {
+      panelUrl,
+      username,
+      password,
+      apiToken,
+      panelName: String(data.panelName || 'Primary Node'),
+    };
+
+    if (capturedGeneration === xuiConfigGeneration) {
+      cachedXuiConfig = { config, expiresAt: Date.now() + XUI_CONFIG_TTL_MS };
+    }
+    return config;
+  })();
+
+  xuiConfigInFlight = { generation: capturedGeneration, promise: fetchPromise };
+  try {
+    return await fetchPromise;
+  } finally {
+    if (xuiConfigInFlight && xuiConfigInFlight.promise === fetchPromise) {
+      xuiConfigInFlight = null;
+    }
+  }
 };
 
 export const getMaskedXuiSettings = async (): Promise<{
@@ -287,93 +664,318 @@ const createAxiosInstance = (baseUrl: string, timeoutMs: number = 10000) => {
   });
 };
 
-const getXuiAuthHeaders = async (
+export const computeXuiCredentialScopeKey = (
+  config: XuiConfig
+): { panelIdentity: string; credentialFingerprint: string; scopeKey: string } => {
+  const panelIdentity = computePanelIdentity(config.panelUrl) || String(config.panelUrl || '').trim();
+  const secretMaterial = `${String(config.username || 'admin').trim()}\0${String(config.password || '')}\0${String(config.apiToken || '')}`;
+  const credentialFingerprint = crypto.createHash('sha256').update(secretMaterial).digest('hex').slice(0, 16);
+  return {
+    panelIdentity,
+    credentialFingerprint,
+    scopeKey: `${panelIdentity}::${credentialFingerprint}`,
+  };
+};
+
+export interface GetXuiAuthHeadersOptions {
+  loginPostFn?: (
+    url: string,
+    body: string,
+    headers: Record<string, string>,
+    timeoutMs: number
+  ) => Promise<{ status: number; headers: Record<string, any>; data?: any }>;
+  csrfGetFn?: (
+    url: string,
+    headers: Record<string, string>,
+    timeoutMs: number
+  ) => Promise<{ status: number; headers: Record<string, any>; data?: any }>;
+}
+
+export const getXuiAuthHeaders = async (
   config: XuiConfig,
   forceRefresh = false,
-  timeoutMs: number = 6000
+  timeoutMs: number = getXuiAuthTimeoutMs(),
+  authOptions?: GetXuiAuthHeadersOptions
 ): Promise<Record<string, string>> => {
+  const { panelIdentity, scopeKey } = computeXuiCredentialScopeKey(config);
   const now = Date.now();
+
+  // If credentials changed on the same panelIdentity, invalidate older credential scopes for that panel
+  const panelPrefix = `${panelIdentity}::`;
+  for (const existingScopeKey of Array.from(cachedXuiAuthByScope.keys())) {
+    if (existingScopeKey !== scopeKey && existingScopeKey.startsWith(panelPrefix)) {
+      invalidateXuiAuthCache(existingScopeKey);
+    }
+  }
+  for (const existingInFlightKey of Array.from(xuiAuthInFlight.keys())) {
+    if (existingInFlightKey !== scopeKey && existingInFlightKey.startsWith(panelPrefix)) {
+      invalidateXuiAuthCache(existingInFlightKey);
+    }
+  }
+
+  const hasExistingScopeGen = xuiAuthGenerationByScope.has(scopeKey);
+  const currentScopeGen = getScopeAuthGeneration(scopeKey);
+  const cachedEntry = cachedXuiAuthByScope.get(scopeKey);
   if (
     !forceRefresh &&
-    cachedXuiAuth &&
-    cachedXuiAuth.panelUrl === config.panelUrl &&
-    cachedXuiAuth.expiresAt > now
+    hasExistingScopeGen &&
+    cachedEntry &&
+    cachedEntry.generation === currentScopeGen &&
+    cachedEntry.generation >= globalXuiAuthEpoch &&
+    cachedEntry.expiresAt > now
   ) {
-    return { ...cachedXuiAuth.headers };
+    setScopeAuthGenerationEntry(scopeKey, currentScopeGen);
+    return { ...cachedEntry.headers };
   }
+
+  const existingInFlight = xuiAuthInFlight.get(scopeKey);
+  if (
+    hasExistingScopeGen &&
+    existingInFlight &&
+    existingInFlight.generation === currentScopeGen &&
+    existingInFlight.generation >= globalXuiAuthEpoch &&
+    (!forceRefresh || existingInFlight.isForceRefresh)
+  ) {
+    return { ...(await existingInFlight.promise) };
+  }
+
+  if (forceRefresh) {
+    // Supersede any existing cached session or non-forced in-flight login with a new monotonic generation
+    invalidateXuiAuthCache(scopeKey);
+  }
+
+  const capturedGeneration = ensureScopeAuthGeneration(scopeKey);
 
   const username = config.username || 'admin';
   const password = config.password || config.apiToken;
-  
+
   if (!password) {
     throw new Error('API token or password is missing in 3X-UI settings');
   }
 
-  const { baseUrl } = parseUrl(config.panelUrl);
-  const authTimeoutMs = Math.max(1000, Math.min(timeoutMs, 6000));
-  const client = createAxiosInstance(baseUrl, authTimeoutMs);
+  let authPromise: Promise<Record<string, string>> | null = null;
+  authPromise = (async (): Promise<Record<string, string>> => {
+    const authTimeoutMs = Math.max(
+      200,
+      Math.min(Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : getXuiAuthTimeoutMs(), 12000)
+    );
+    const authDeadlineMs = Date.now() + authTimeoutMs;
+    const { baseUrl } = parseUrl(config.panelUrl);
+    const client = authOptions?.loginPostFn && authOptions?.csrfGetFn ? null : createAxiosInstance(baseUrl, authTimeoutMs);
 
-  const headers: Record<string, string> = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'X-Requested-With': 'XMLHttpRequest'
-  };
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'X-Requested-With': 'XMLHttpRequest',
+    };
 
-  const loginEndpoints = ['/login', '/panel/login'];
-  let cookieHeader = '';
+    const defaultLoginEndpoints = ['/login', '/panel/login'];
+    const rememberedEndpoint = rememberedLoginEndpointByPanel.get(panelIdentity);
+    const loginEndpoints =
+      rememberedEndpoint && defaultLoginEndpoints.includes(rememberedEndpoint)
+        ? [rememberedEndpoint, ...defaultLoginEndpoints.filter((ep) => ep !== rememberedEndpoint)]
+        : defaultLoginEndpoints;
 
-  for (const loginEp of loginEndpoints) {
-    try {
-      const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
-      const res = await client.post(
-        fullPath,
-        `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+    let cookieHeader = '';
+    let lastLoginErr: any = null;
+
+    for (let idx = 0; idx < loginEndpoints.length; idx++) {
+      const loginEp = loginEndpoints[idx];
+      const remainingBeforeLoginMs = authDeadlineMs - Date.now();
+      if (remainingBeforeLoginMs <= 40) {
+        break;
+      }
+      const endpointsRemaining = loginEndpoints.length - idx;
+      const attemptTimeoutMs =
+        endpointsRemaining > 1
+          ? Math.max(60, Math.min(remainingBeforeLoginMs, Math.floor(authTimeoutMs * 0.6)))
+          : Math.max(60, remainingBeforeLoginMs);
+
+      try {
+        const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
+        const body = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+        const reqHeaders = {
+          ...headers,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        };
+        const res = authOptions?.loginPostFn
+          ? await authOptions.loginPostFn(fullPath, body, reqHeaders, attemptTimeoutMs)
+          : await client!.post(fullPath, body, { headers: reqHeaders, timeout: attemptTimeoutMs });
+        const setCookie = res.headers?.['set-cookie'];
+        const loginPayloadOk = !res.data || res.data.success !== false;
+        if (
+          res.status >= 200 &&
+          res.status < 400 &&
+          loginPayloadOk &&
+          setCookie &&
+          Array.isArray(setCookie) &&
+          setCookie.length > 0
+        ) {
+          cookieHeader = setCookie.map((c: string) => c.split(';')[0]).join('; ');
+          if (xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration && capturedGeneration >= globalXuiAuthEpoch) {
+            setBoundedMapEntry(
+              rememberedLoginEndpointByPanel,
+              panelIdentity,
+              loginEp,
+              MAX_XUI_PANEL_CAPABILITY_ENTRIES
+            );
+          }
+          console.log(`[xuiService] Successfully authenticated via ${fullPath} session login`);
+          break;
+        }
+      } catch (loginErr: any) {
+        lastLoginErr = loginErr;
+        // Continue to next login endpoint within remaining authDeadlineMs
+      }
+    }
+
+    if (!cookieHeader && lastLoginErr && Date.now() >= authDeadlineMs) {
+      const msg = String(lastLoginErr?.message || '').toLowerCase();
+      const code = String(lastLoginErr?.code || '').toUpperCase();
+      if (code === 'ETIMEDOUT' || code === 'ECONNABORTED' || msg.includes('timeout') || msg.includes('timed out')) {
+        throw lastLoginErr;
+      }
+    }
+
+    if (cookieHeader) {
+      headers['Cookie'] = cookieHeader;
+    }
+    headers['Authorization'] = `Bearer ${password}`;
+
+    // Skip /csrf-token ONLY if definitively confirmed unsupported (404/405/501) on this panel in the current scope generation
+    const confirmedUnsupported = confirmedUnsupportedCsrfByPanel.get(panelIdentity);
+    const shouldSkipCsrf = Boolean(
+      !forceRefresh &&
+        confirmedUnsupported &&
+        confirmedUnsupported.scopeKey === scopeKey &&
+        confirmedUnsupported.generation === capturedGeneration
+    );
+
+    const remainingForCsrfMs = authDeadlineMs - Date.now();
+    if (!shouldSkipCsrf && remainingForCsrfMs > 60) {
+      try {
+        const csrfTimeoutMs = Math.max(60, Math.min(2500, remainingForCsrfMs));
+        const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, '/csrf-token');
+        const csrfRes = authOptions?.csrfGetFn
+          ? await authOptions.csrfGetFn(csrfPath, headers, csrfTimeoutMs)
+          : await client!.get(csrfPath, { headers, timeout: csrfTimeoutMs });
+
+        if (csrfRes.status === 404 || csrfRes.status === 405 || csrfRes.status === 501) {
+          if (
+            cookieHeader &&
+            xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration &&
+            capturedGeneration >= globalXuiAuthEpoch
+          ) {
+            setBoundedMapEntry(
+              confirmedUnsupportedCsrfByPanel,
+              panelIdentity,
+              {
+                scopeKey,
+                generation: capturedGeneration,
+                confirmedAt: Date.now(),
+              },
+              MAX_XUI_PANEL_CAPABILITY_ENTRIES
+            );
+          }
+        } else {
+          if (
+            csrfRes.status >= 200 &&
+            csrfRes.status < 300 &&
+            xuiAuthGenerationByScope.get(scopeKey) === capturedGeneration &&
+            capturedGeneration >= globalXuiAuthEpoch
+          ) {
+            confirmedUnsupportedCsrfByPanel.delete(panelIdentity);
+          }
+          if (csrfRes.data?.obj) {
+            headers['X-CSRF-Token'] = csrfRes.data.obj;
+          }
+          if (Array.isArray(csrfRes.headers?.['set-cookie']) && csrfRes.headers['set-cookie'].length > 0) {
+            const csrfCookie = csrfRes.headers['set-cookie'].map((c: string) => c.split(';')[0]).join('; ');
+            headers['Cookie'] = headers['Cookie'] ? `${headers['Cookie']}; ${csrfCookie}` : csrfCookie;
+          }
+        }
+      } catch {
+        // Non-fatal if csrf endpoint times out or fails transiently (do NOT mark unsupported on transient errors)
+      }
+    }
+
+    const hasActiveScopeAtFinish = xuiAuthGenerationByScope.has(scopeKey);
+    const currentGenAtFinish = hasActiveScopeAtFinish ? xuiAuthGenerationByScope.get(scopeKey)! : -1;
+    const existingCachedAtFinish = cachedXuiAuthByScope.get(scopeKey);
+    const isCurrentValidGeneration =
+      hasActiveScopeAtFinish &&
+      capturedGeneration >= globalXuiAuthEpoch &&
+      capturedGeneration === currentGenAtFinish &&
+      (!existingCachedAtFinish || existingCachedAtFinish.generation <= capturedGeneration);
+
+    if (!isCurrentValidGeneration) {
+      // Never cache or return a stale in-flight authentication response after generation invalidation or scope eviction
+      if (
+        hasActiveScopeAtFinish &&
+        existingCachedAtFinish &&
+        existingCachedAtFinish.generation === currentGenAtFinish &&
+        existingCachedAtFinish.generation >= globalXuiAuthEpoch &&
+        existingCachedAtFinish.expiresAt > Date.now()
+      ) {
+        return { ...existingCachedAtFinish.headers };
+      }
+      const activeInFlight = xuiAuthInFlight.get(scopeKey);
+      if (
+        hasActiveScopeAtFinish &&
+        activeInFlight &&
+        activeInFlight.promise !== authPromise &&
+        activeInFlight.generation === currentGenAtFinish &&
+        activeInFlight.generation >= globalXuiAuthEpoch
+      ) {
+        return { ...(await activeInFlight.promise) };
+      }
+      const staleErr: any = new Error(
+        `Stale 3X-UI authentication response rejected for scope ${scopeKey} (captured generation ${capturedGeneration}, current generation ${currentGenAtFinish}).`
+      );
+      staleErr.code = 'XUI_AUTH_STALE_GENERATION';
+      staleErr.staleGeneration = true;
+      throw staleErr;
+    }
+
+    if (cookieHeader) {
+      setScopeAuthGenerationEntry(scopeKey, capturedGeneration);
+      setBoundedMapEntry(
+        cachedXuiAuthByScope,
+        scopeKey,
         {
-          headers: {
-            ...headers,
-            'Content-Type': 'application/x-www-form-urlencoded'
+          scopeKey,
+          panelIdentity,
+          panelUrl: config.panelUrl,
+          generation: capturedGeneration,
+          headers: { ...headers },
+          expiresAt: Date.now() + XUI_AUTH_TTL_MS,
+        },
+        getEffectiveMaxXuiAuthScopeEntries(),
+        (evictedScopeKey, evictedEntry) => {
+          if (!xuiAuthGenerationByScope.has(evictedScopeKey)) {
+            minValidAuthGenerationFloor = Math.max(minValidAuthGenerationFloor, evictedEntry.generation + 1);
+            nextMonotonicAuthGeneration = Math.max(nextMonotonicAuthGeneration, minValidAuthGenerationFloor + 1);
           }
         }
       );
-      const setCookie = res.headers['set-cookie'];
-      if (setCookie && Array.isArray(setCookie)) {
-        cookieHeader = setCookie.map(c => c.split(';')[0]).join('; ');
-        console.log(`[xuiService] Successfully authenticated via ${fullPath} session login`);
-        break;
-      }
-    } catch (e: any) {
-      // Continue to next login endpoint or fallback
     }
-  }
 
-  if (cookieHeader) {
-    headers['Cookie'] = cookieHeader;
-  }
-  headers['Authorization'] = `Bearer ${password}`;
+    return { ...headers };
+  })();
 
-  // Fetch CSRF token if available (short 4s timeout)
+  xuiAuthInFlight.set(scopeKey, {
+    generation: capturedGeneration,
+    isForceRefresh: Boolean(forceRefresh),
+    promise: authPromise,
+  });
+
   try {
-    const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, '/csrf-token');
-    const csrfRes = await client.get(csrfPath, { headers, timeout: 4000 });
-    if (csrfRes.data?.obj) {
-      headers['X-CSRF-Token'] = csrfRes.data.obj;
+    return await authPromise;
+  } finally {
+    const active = xuiAuthInFlight.get(scopeKey);
+    if (active && active.promise === authPromise) {
+      xuiAuthInFlight.delete(scopeKey);
     }
-    if (csrfRes.headers['set-cookie']) {
-      const csrfCookie = csrfRes.headers['set-cookie'].map((c: string) => c.split(';')[0]).join('; ');
-      headers['Cookie'] = headers['Cookie'] ? `${headers['Cookie']}; ${csrfCookie}` : csrfCookie;
-    }
-  } catch (e: any) {
-    // Non-fatal if csrf endpoint fails
   }
-
-  if (cookieHeader) {
-    cachedXuiAuth = {
-      panelUrl: config.panelUrl,
-      headers: { ...headers },
-      expiresAt: now + XUI_AUTH_TTL_MS
-    };
-  }
-
-  return headers;
 };
 
 export interface RequestApiOptions {
@@ -473,18 +1075,49 @@ export const requestApi = async <T>(
 ): Promise<T> => {
   const effectiveTimeoutMs =
     options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-      ? Math.max(1000, Math.min(Math.floor(options.timeoutMs), 30000))
+      ? Math.max(method === 'GET' ? 200 : 1000, Math.min(Math.floor(options.timeoutMs), 30000))
       : 10000;
+  const requestStartMs = Date.now();
+  const operationDeadlineMs = requestStartMs + effectiveTimeoutMs;
+
+  const getRemainingGetBudgetMs = (stage: string, minRequiredMs = 60): number => {
+    if (method !== 'GET') return effectiveTimeoutMs;
+    const remaining = operationDeadlineMs - Date.now();
+    if (remaining < minRequiredMs) {
+      const timeoutErr: any = new Error(
+        `3X-UI GET ${endpoint} timed out after ${effectiveTimeoutMs}ms (${stage} budget exhausted)`
+      );
+      timeoutErr.code = 'ETIMEDOUT';
+      timeoutErr.statusCode = 504;
+      throw timeoutErr;
+    }
+    return remaining;
+  };
 
   if (method === 'POST') {
     assertRequestNotTimedOutBeforeExternalMutation(options?.signal, `POST ${endpoint}`);
   }
 
   const config = options?.configOverride || (await getXuiConfig());
+  const { scopeKey } = computeXuiCredentialScopeKey(config);
   const resolveAuthHeaders = options?.authHeadersFn || getXuiAuthHeaders;
+  const authGenBeforeCall = ensureScopeAuthGeneration(scopeKey);
+
   let headers: Record<string, string>;
   try {
-    headers = await resolveAuthHeaders(config, false, effectiveTimeoutMs);
+    const initialAuthTimeoutMs =
+      method === 'GET' ? getRemainingGetBudgetMs('initial_auth') : effectiveTimeoutMs;
+    try {
+      headers = await resolveAuthHeaders(config, false, initialAuthTimeoutMs);
+    } catch (firstAuthErr: any) {
+      if (firstAuthErr?.code === 'XUI_AUTH_STALE_GENERATION') {
+        const retryInitialAuthMs =
+          method === 'GET' ? getRemainingGetBudgetMs('initial_auth_stale_retry') : effectiveTimeoutMs;
+        headers = await resolveAuthHeaders(config, false, retryInitialAuthMs);
+      } else {
+        throw firstAuthErr;
+      }
+    }
   } catch (authErr: any) {
     if (method === 'POST' && authErr && typeof authErr === 'object') {
       if (authErr.beforeExternalWrite === undefined) authErr.beforeExternalWrite = true;
@@ -506,20 +1139,24 @@ export const requestApi = async <T>(
   }
 
   const { baseUrl, fullPath, fullUrl } = getApiEndpointUrl(config.panelUrl, endpoint);
-  const client = options?.httpRequestFn ? null : createAxiosInstance(baseUrl, effectiveTimeoutMs);
-  const executeHttp = (reqHeaders: Record<string, string>) =>
-    options?.httpRequestFn
-      ? options.httpRequestFn({ url: fullPath, method, data, headers: reqHeaders })
-      : client!.request({
-          url: fullPath,
-          method,
-          data,
-          headers: reqHeaders,
-          ...(method === 'POST' ? { maxRedirects: 0 } : {}),
-        });
+  const executeHttp = (reqHeaders: Record<string, string>, stageLabel: string) => {
+    const reqTimeoutMs = method === 'GET' ? getRemainingGetBudgetMs(stageLabel) : effectiveTimeoutMs;
+    if (options?.httpRequestFn) {
+      return options.httpRequestFn({ url: fullPath, method, data, headers: reqHeaders });
+    }
+    const client = createAxiosInstance(baseUrl, reqTimeoutMs);
+    return client.request({
+      url: fullPath,
+      method,
+      data,
+      headers: reqHeaders,
+      timeout: reqTimeoutMs,
+      ...(method === 'POST' ? { maxRedirects: 0 } : {}),
+    });
+  };
 
   try {
-    let response = await executeHttp(headers);
+    let response = await executeHttp(headers, 'initial_get');
     let attemptedAuthenticatedRetry = false;
 
     const locationHeader = String(
@@ -532,10 +1169,46 @@ export const requestApi = async <T>(
         (method !== 'POST' || /(?:^|\/)(?:login|auth)(?:[/?#]|$)|login|signin/i.test(locationHeader)));
 
     // If session cookie expired or returned 401/403 (or explicit login redirect), refresh auth once
+    // with per-scope generation isolation and single-flight deduplication across both default and custom authHeadersFn
     if (isUnauthenticatedRejection) {
-      cachedXuiAuth = null;
       try {
-        headers = await resolveAuthHeaders(config, true, effectiveTimeoutMs);
+        const retryAuthBudgetMs =
+          method === 'GET' ? getRemainingGetBudgetMs('reauth_after_401') : effectiveTimeoutMs;
+        const currentScopeGen = getScopeAuthGeneration(scopeKey);
+
+        if (options?.authHeadersFn) {
+          if (currentScopeGen === authGenBeforeCall) {
+            const nextGen = invalidateXuiAuthCache(scopeKey, authGenBeforeCall);
+            const customReauthPromise = resolveAuthHeaders(config, true, retryAuthBudgetMs);
+            xuiAuthInFlight.set(scopeKey, {
+              generation: nextGen,
+              isForceRefresh: true,
+              promise: customReauthPromise,
+            });
+            try {
+              headers = { ...(await customReauthPromise) };
+            } finally {
+              const active = xuiAuthInFlight.get(scopeKey);
+              if (active && active.promise === customReauthPromise) {
+                xuiAuthInFlight.delete(scopeKey);
+              }
+            }
+          } else {
+            const activeInFlight = xuiAuthInFlight.get(scopeKey);
+            if (activeInFlight && activeInFlight.generation === currentScopeGen) {
+              headers = { ...(await activeInFlight.promise) };
+            } else {
+              headers = await resolveAuthHeaders(config, false, retryAuthBudgetMs);
+            }
+          }
+        } else {
+          if (currentScopeGen === authGenBeforeCall) {
+            headers = await getXuiAuthHeaders(config, true, retryAuthBudgetMs);
+          } else {
+            // Another concurrent request for this same scopeKey already invalidated & started/completed a newer session generation
+            headers = await getXuiAuthHeaders(config, false, retryAuthBudgetMs);
+          }
+        }
       } catch (reauthErr: any) {
         if (method === 'POST' && reauthErr && typeof reauthErr === 'object') {
           if (reauthErr.beforeExternalWrite === undefined) reauthErr.beforeExternalWrite = true;
@@ -558,7 +1231,7 @@ export const requestApi = async <T>(
         }
       }
       attemptedAuthenticatedRetry = true;
-      response = await executeHttp(headers);
+      response = await executeHttp(headers, 'retry_get_after_401');
     }
 
     if (response.status !== 200) {
@@ -618,26 +1291,110 @@ export const testApiConnection = async (config: XuiConfig): Promise<boolean> => 
   throw lastError || new Error('Connection test failed on all endpoints');
 };
 
-export const getInbounds = async (forceRefresh: boolean = false): Promise<XuiInbound[]> => {
+export interface GetInboundsOptions {
+  timeoutMs?: number;
+  fetcher?: () => Promise<XuiInbound[]>;
+  panelIdentity?: string;
+  skipFailureCooldown?: boolean;
+}
+
+export const getInbounds = async (
+  forceRefresh: boolean = false,
+  options?: GetInboundsOptions
+): Promise<XuiInbound[]> => {
+  let panelIdentity = String(options?.panelIdentity || '').trim();
+  if (!panelIdentity && !options?.fetcher) {
+    try {
+      const cfg = await getXuiConfig();
+      panelIdentity = computePanelIdentity(cfg.panelUrl) || 'default';
+    } catch {
+      panelIdentity = 'default';
+    }
+  }
+  if (!panelIdentity) {
+    panelIdentity = 'default';
+  }
+
   const now = Date.now();
   const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache TTL
+  const samePanelCache =
+    !cachedInboundsPanelIdentity ||
+    panelIdentity === 'default' ||
+    cachedInboundsPanelIdentity === panelIdentity;
 
-  if (!forceRefresh && cachedInbounds.length > 0 && (now - lastInboundsCacheTime < CACHE_TTL_MS)) {
+  if (
+    !forceRefresh &&
+    samePanelCache &&
+    cachedInbounds.length > 0 &&
+    now - lastInboundsCacheTime < CACHE_TTL_MS
+  ) {
     return cachedInbounds;
   }
 
-  // Use only the supported endpoint
+  const existingInFlight = inboundsInFlight.get(panelIdentity);
+  if (
+    existingInFlight &&
+    existingInFlight.generation === inboundsCacheGeneration &&
+    (!forceRefresh || existingInFlight.isForceRefresh)
+  ) {
+    return existingInFlight.promise;
+  }
+
+  if (
+    !forceRefresh &&
+    !options?.skipFailureCooldown &&
+    samePanelCache &&
+    lastFailedInboundsAt > 0 &&
+    now - lastFailedInboundsAt < FAILED_INBOUNDS_COOLDOWN_MS
+  ) {
+    return cachedInbounds;
+  }
+
   const endpoint = '/panel/api/inbounds/list';
-  try {
-    const inboundsData = await requestApi<XuiInbound[]>(endpoint);
-    if (Array.isArray(inboundsData)) {
-      setCachedInbounds(inboundsData);
-      return inboundsData;
+  const capturedGeneration = inboundsCacheGeneration;
+  const timeoutMs =
+    options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.max(2000, Math.min(Math.floor(options.timeoutMs), 25000))
+      : getXuiFullListTimeoutMs();
+
+  const fetchPromise = (async (): Promise<XuiInbound[]> => {
+    isCacheRefreshing = true;
+    try {
+      const inboundsData = options?.fetcher
+        ? await options.fetcher()
+        : await requestApi<XuiInbound[]>(endpoint, 'GET', undefined, { timeoutMs });
+      if (Array.isArray(inboundsData)) {
+        if (capturedGeneration === inboundsCacheGeneration) {
+          setCachedInbounds(inboundsData, panelIdentity, capturedGeneration);
+          lastFailedInboundsAt = 0;
+        }
+        return inboundsData;
+      }
+      return samePanelCache ? cachedInbounds : [];
+    } catch (error: any) {
+      if (capturedGeneration === inboundsCacheGeneration) {
+        lastFailedInboundsAt = Date.now();
+      }
+      console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
+      return samePanelCache ? cachedInbounds : [];
+    } finally {
+      isCacheRefreshing = false;
     }
-    return cachedInbounds;
-  } catch (error: any) {
-    console.error(`[XUI Service] Failed to retrieve inbounds from ${endpoint}:`, error.message);
-    return cachedInbounds;
+  })();
+
+  inboundsInFlight.set(panelIdentity, {
+    generation: capturedGeneration,
+    isForceRefresh: Boolean(forceRefresh),
+    promise: fetchPromise,
+  });
+
+  try {
+    return await fetchPromise;
+  } finally {
+    const active = inboundsInFlight.get(panelIdentity);
+    if (active && active.promise === fetchPromise) {
+      inboundsInFlight.delete(panelIdentity);
+    }
   }
 };
 
@@ -652,6 +1409,9 @@ let liveInboundCacheGeneration = 0;
  */
 export const invalidateInboundCache = (inboundId?: number | null): void => {
   liveInboundCacheGeneration += 1;
+  inboundsCacheGeneration += 1;
+  lastFailedInboundsAt = 0;
+  inboundsInFlight.clear();
   const numericId = inboundId !== undefined && inboundId !== null ? Number(inboundId) : NaN;
   if (!Number.isNaN(numericId) && numericId > 0) {
     liveInboundCache.delete(numericId);
@@ -666,7 +1426,7 @@ export const invalidateInboundCache = (inboundId?: number | null): void => {
 
 export const getLiveInbound = async (
   inboundId: number,
-  options?: boolean | { forceRefresh?: boolean; fetcher?: (id: number) => Promise<XuiInbound | null> }
+  options?: boolean | { forceRefresh?: boolean; fetcher?: (id: number) => Promise<XuiInbound | null>; timeoutMs?: number }
 ): Promise<XuiInbound | null> => {
   const normalizedId = Number(inboundId);
   if (Number.isNaN(normalizedId) || normalizedId <= 0) {
@@ -675,9 +1435,13 @@ export const getLiveInbound = async (
 
   const forceRefresh = typeof options === 'boolean' ? options : Boolean(options?.forceRefresh);
   const customFetcher = typeof options === 'object' ? options?.fetcher : undefined;
+  const timeoutMs = typeof options === 'object' && options?.timeoutMs ? options.timeoutMs : getXuiSingleInboundTimeoutMs();
   const now = Date.now();
 
-  if (!forceRefresh) {
+  if (forceRefresh) {
+    liveInboundCacheGeneration += 1;
+    liveInboundCache.delete(normalizedId);
+  } else {
     const cachedEntry = liveInboundCache.get(normalizedId);
     if (cachedEntry && now - cachedEntry.fetchedAt < LIVE_INBOUND_CACHE_TTL_MS) {
       return cachedEntry.inbound;
@@ -698,7 +1462,7 @@ export const getLiveInbound = async (
         inbound = await customFetcher(normalizedId);
       } else {
         console.log(`[XUI Service] Fetching live inbound ${normalizedId} directly for dashboard query...`);
-        const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET');
+        const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET', undefined, { timeoutMs });
         inbound = res?.obj || res;
       }
 
@@ -5042,14 +5806,28 @@ export const cleanupExpiredTrials = async (inboundsList?: XuiInbound[]): Promise
 
 // In-memory cache for 3X-UI inbounds metadata to avoid 3X-UI network calls on user HTTP requests
 
-export const setCachedInbounds = (inbounds: XuiInbound[]): void => {
+export const setCachedInbounds = (
+  inbounds: XuiInbound[],
+  panelIdentity?: string,
+  expectedGeneration?: number
+): void => {
+  if (expectedGeneration !== undefined && expectedGeneration !== inboundsCacheGeneration) {
+    return;
+  }
   if (Array.isArray(inbounds)) {
     cachedInbounds = inbounds;
     lastInboundsCacheTime = Date.now();
+    if (panelIdentity !== undefined) {
+      cachedInboundsPanelIdentity = panelIdentity;
+    }
   }
 };
 
-export const getCachedInbounds = async (): Promise<XuiInbound[]> => {
+export const getCachedInbounds = async (panelIdentity?: string): Promise<XuiInbound[]> => {
+  const requestedPanel = String(panelIdentity || '').trim();
+  if (requestedPanel && cachedInboundsPanelIdentity && cachedInboundsPanelIdentity !== 'default' && requestedPanel !== cachedInboundsPanelIdentity) {
+    return [];
+  }
   return cachedInbounds;
 };
 
@@ -5653,7 +6431,53 @@ export const triggerBackgroundSyncIfNeeded = (reason: string = 'Scheduled', forc
   });
 };
 
-export const runBackgroundSync = async (reason: string = 'Scheduled', force: boolean = false): Promise<void> => {
+export const startBackgroundSyncScheduler = (deps?: {
+  triggerBackgroundSyncFn?: (reason?: string, force?: boolean) => void;
+  triggerPanelDeletionSyncFn?: (reason?: string, force?: boolean) => void;
+  startupDelayMs?: number;
+  intervalMs?: number;
+}): { startupTimer: ReturnType<typeof setTimeout>; intervalTimer: ReturnType<typeof setInterval> } => {
+  const triggerBg = deps?.triggerBackgroundSyncFn || triggerBackgroundSyncIfNeeded;
+  const triggerDel = deps?.triggerPanelDeletionSyncFn || triggerPanelDeletionSyncIfNeeded;
+  const startupDelayMs = deps?.startupDelayMs ?? 5000;
+  const intervalMs = deps?.intervalMs ?? 60000;
+
+  // Single non-overlapping startup warmup (runs getInbounds -> cleanupExpiredTrials -> syncDeleted3XUiClients cleanly)
+  const startupTimer = setTimeout(() => {
+    try {
+      triggerBg('Server Start', true);
+    } catch (err) {
+      console.error('[Scheduler] Initial background sync error:', err);
+    }
+  }, startupDelayMs);
+
+  // Periodic scheduled sync (includes triggerPanelDeletionSyncIfNeeded so deletion sync still runs if startup failed)
+  const intervalTimer = setInterval(() => {
+    try {
+      triggerBg('Scheduled', false);
+    } catch (err) {
+      console.error('[Scheduler] Scheduled background sync error:', err);
+    }
+    try {
+      triggerDel('Scheduled', false);
+    } catch (err) {
+      console.error('[Scheduler] Scheduled panel deletion sync error:', err);
+    }
+  }, intervalMs);
+
+  return { startupTimer, intervalTimer };
+};
+
+export const runBackgroundSync = async (
+  reason: string = 'Scheduled',
+  force: boolean = false,
+  deps?: {
+    getInboundsFn?: (forceRefresh?: boolean) => Promise<XuiInbound[]>;
+    cleanupExpiredTrialsFn?: () => Promise<{ count: number }>;
+    syncDeleted3XUiClientsFn?: (opts?: SyncDeletedClientsOptions) => Promise<SyncDeletedClientsResult>;
+    runScheduledExpiryEmailCheckFn?: () => Promise<any>;
+  }
+): Promise<void> => {
   if (isSyncInProgress) {
     console.log('[Background Sync] Skipped (sync already in progress)');
     return;
@@ -5664,33 +6488,53 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
 
   try {
     // 1. Fetch live 3X-UI inbounds once and cache them in memory for metadata/stats.
-    const inbounds = await getInbounds(force);
+    let inbounds: XuiInbound[] = [];
+    try {
+      const fetchInbounds = deps?.getInboundsFn || getInbounds;
+      inbounds = await fetchInbounds(force);
+    } catch (inbErr: any) {
+      console.error('[Background Sync] Initial inbound warmup failed (continuing cleanup/deletion sync):', inbErr?.message || inbErr);
+    }
 
-    // 2. Run trial cleanup & authoritative uncached deleted-client sync
+    // 2. Run trial cleanup & authoritative uncached deleted-client sync independently
     // NEVER pass cached inbounds into syncDeleted3XUiClients — it always performs fresh uncached panel reads.
-    const trialCleanupResult = await cleanupExpiredTrials();
+    let trialCleanupResult = { count: 0 };
+    try {
+      const runTrialCleanup = deps?.cleanupExpiredTrialsFn || cleanupExpiredTrials;
+      trialCleanupResult = await runTrialCleanup();
+    } catch (trialErr: any) {
+      console.error('[Background Sync] Expired trial cleanup failed (continuing deletion sync):', trialErr?.message || trialErr);
+    }
 
     let deletedCount = 0;
-    const syncResult = await syncDeleted3XUiClients({ enforceCrossInstanceLease: true });
-    deletedCount = syncResult.deletedCount;
+    try {
+      const runDeletionSync = deps?.syncDeleted3XUiClientsFn || syncDeleted3XUiClients;
+      const syncResult = await runDeletionSync({ enforceCrossInstanceLease: true });
+      deletedCount = syncResult.deletedCount;
+    } catch (delErr: any) {
+      console.error('[Background Sync] Panel deletion sync failed:', delErr?.message || delErr);
+    }
 
     // 3. Run scheduled VPN expiry reminder & expiration email check (non-blocking)
-    runScheduledExpiryEmailCheck().catch(expErr => {
+    const runExpiryCheck = deps?.runScheduledExpiryEmailCheckFn || runScheduledExpiryEmailCheck;
+    runExpiryCheck().catch((expErr: any) => {
       console.warn('[Background Sync] Scheduled expiry email check warning:', expErr?.message || expErr);
     });
 
     lastSyncAt = Date.now();
     const durationSec = ((Date.now() - syncStartTime) / 1000).toFixed(1);
-    
+
     // Fetch total active orders count from orders for the summary
     let ordersCount = 0;
-    try {
-      const { count } = await supabaseAdmin
-        .from('orders')
-        .select('*', { count: 'exact', head: true })
-        .in('status', ['active', 'trial', 'pending']);
-      ordersCount = count || 0;
-    } catch (e) {}
+    if (!deps) {
+      try {
+        const { count } = await supabaseAdmin
+          .from('orders')
+          .select('*', { count: 'exact', head: true })
+          .in('status', ['active', 'trial', 'pending']);
+        ordersCount = count || 0;
+      } catch {}
+    }
 
     // Count client stats in inbounds
     let clientsCount = 0;
@@ -5699,7 +6543,7 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
         let settingsObj: any = {};
         try {
           if (ib.settings) settingsObj = typeof ib.settings === 'string' ? JSON.parse(ib.settings) : ib.settings;
-        } catch (e) {}
+        } catch {}
         const clients = settingsObj.clients || [];
         clientsCount += clients.length;
       }
@@ -5712,7 +6556,6 @@ export const runBackgroundSync = async (reason: string = 'Scheduled', force: boo
     console.log(`Expired clients: ${trialCleanupResult.count}`);
     console.log(`Database updates: ${trialCleanupResult.count + deletedCount}`);
     console.log(`Completed in: ${durationSec} seconds`);
-
   } catch (error: any) {
     console.error('[Background Sync] Failed:', error.message || error);
   } finally {
@@ -5922,7 +6765,11 @@ export const fetchUncachedLiveInboundById = async (
   }
 
   try {
-    const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET', undefined, options);
+    const effectiveOptions = {
+      ...options,
+      timeoutMs: options?.timeoutMs ?? getXuiSingleInboundTimeoutMs(),
+    };
+    const res = await requestApi<any>(`/panel/api/inbounds/get/${normalizedId}`, 'GET', undefined, effectiveOptions);
     const inbound = res && typeof res === 'object' && 'obj' in res ? res.obj : res;
 
     if (inbound === null || inbound === undefined) {
@@ -5964,7 +6811,11 @@ export const fetchUncachedLiveInboundsList = async (
   options?: { timeoutMs?: number }
 ): Promise<UncachedInboundsListReadResult> => {
   try {
-    const rawList = await requestApi<XuiInbound[]>('/panel/api/inbounds/list', 'GET', undefined, options);
+    const effectiveOptions = {
+      ...options,
+      timeoutMs: options?.timeoutMs ?? getXuiFullListTimeoutMs(),
+    };
+    const rawList = await requestApi<XuiInbound[]>('/panel/api/inbounds/list', 'GET', undefined, effectiveOptions);
     if (!Array.isArray(rawList)) {
       return {
         ok: false,
@@ -7186,6 +8037,7 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
                   `[3X-UI Sync] Authoritative reconciliation confirmed deletion commit for ${normUuid}; releasing locks cleanly.`
                 );
                 invalidateInboundCache(inboundId);
+                notifyClientTrafficInvalidated(normUuid, 'deleted');
                 return {
                   confirmedDeleted: true,
                   applied: true,
@@ -7221,6 +8073,7 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
 
               if (recon.status === 'confirmed_committed') {
                 invalidateInboundCache(inboundId);
+                notifyClientTrafficInvalidated(normUuid, 'deleted');
                 return {
                   confirmedDeleted: true,
                   applied: true,
@@ -7268,8 +8121,9 @@ export const verifyAndMarkClientDeletedIfConfirmed = async (
             const auditLogged = Boolean(row.audit_log_inserted ?? row.audit_logged);
             const dbWrites = applied ? 1 : 0;
 
-            // Invalidate in-memory inbound cache so subsequent reads reflect the confirmed deletion immediately
+            // Invalidate in-memory inbound and client traffic caches so subsequent reads reflect the confirmed deletion immediately
             invalidateInboundCache(inboundId);
+            notifyClientTrafficInvalidated(normUuid, 'deleted');
 
             return {
               confirmedDeleted: true,
@@ -7606,6 +8460,7 @@ export const syncDeleted3XUiClients = async (
     }
 
     // Step 1: Fresh, uncached live panel-wide Snapshot 1 (NEVER uses cachedInbounds)
+    const snap1CacheGeneration = inboundsCacheGeneration;
     const snap1 = await countedReadList();
     if (!snap1 || !snap1.ok || !Array.isArray(snap1.inbounds) || snap1.inbounds.length === 0) {
       console.warn(
@@ -7623,7 +8478,7 @@ export const syncDeleted3XUiClients = async (
     }
 
     if (snap1.allInboundsCleanlyParsed && snap1.inbounds.length > 0 && !options?.fetchUncachedInboundsList) {
-      setCachedInbounds(snap1.inbounds);
+      setCachedInbounds(snap1.inbounds, currentPanelIdentity, snap1CacheGeneration);
     }
 
     const configuredServers =
@@ -8880,6 +9735,9 @@ export const resetClientTraffic = async (
     }
 
     invalidateInboundCache(resolvedInboundId || inboundId || null);
+    if (resolvedUuid) {
+      notifyClientTrafficInvalidated(resolvedUuid, 'reset');
+    }
     try {
       await getInboundsCall(true);
     } catch (refreshErr: any) {
