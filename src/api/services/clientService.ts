@@ -5,9 +5,20 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-export const getClientStatus = async (email: string, targetUuid?: string, uid?: string, token?: string): Promise<any | null> => {
+export interface GetClientStatusOptions {
+  dbClient?: any;
+  getMyConfigsOptions?: vpnService.GetMyConfigsOptions;
+}
+
+export const getClientStatus = async (
+  email: string,
+  targetUuid?: string,
+  uid?: string,
+  token?: string,
+  options?: GetClientStatusOptions
+): Promise<any | null> => {
   let activeUuid = targetUuid;
-  const db = getSupabaseClient(token);
+  const db = options?.dbClient || getSupabaseClient(token);
 
   if (!activeUuid && uid) {
     try {
@@ -23,7 +34,7 @@ export const getClientStatus = async (email: string, targetUuid?: string, uid?: 
   }
 
   // Fetch all real user configs from Supabase
-  const myConfigsRes = await vpnService.getMyConfigs(uid || '', email, token);
+  const myConfigsRes = await vpnService.getMyConfigs(uid || '', email, token, options?.getMyConfigsOptions);
   const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : (myConfigsRes.configs || []);
   const deletedUuids: string[] = Array.isArray((myConfigsRes as any)?.deletedUuids)
     ? (myConfigsRes as any).deletedUuids.map((u: string) => String(u || '').trim().toLowerCase()).filter(Boolean)

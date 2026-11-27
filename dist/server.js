@@ -19261,7 +19261,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
     return err;
   };
   const createCustomerQueryFailureError = (stage, cause) => {
-    if (cause?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED" || cause?.code === "AUTHORITATIVE_MUTATION_RECHECK_FAILED") {
+    if (cause?.code === "CUSTOMER_REQUEST_DEADLINE_EXCEEDED" || cause?.code === "AUTHORITATIVE_MUTATION_RECHECK_FAILED" || cause?.code === "CUSTOMER_CONFIG_QUERY_FAILED") {
       return cause;
     }
     const msg = cause?.message || String(cause || "database query failed");
@@ -19271,6 +19271,24 @@ var getMyConfigs = async (uid, email, _token, options) => {
     err.code = "CUSTOMER_CONFIG_QUERY_FAILED";
     err.retryable = true;
     return err;
+  };
+  const isConfirmedMissingColumnError = (err, tableName, columnName) => {
+    if (!err) return false;
+    const code = String(err?.code || "").trim().toUpperCase();
+    const message = String(err?.message || err?.details || err?.hint || "").toLowerCase();
+    const normTable = tableName.toLowerCase();
+    const normCol = columnName.toLowerCase();
+    if (code === "42501" || code === "28000" || code === "28P01" || code === "57014" || /permission denied|row-level security|rls|unauthorized|forbidden|timeout|timed out|network|econnrefused|enotfound|fetch failed/i.test(
+      message
+    )) {
+      return false;
+    }
+    const mentionsExactColumn = message.includes(`${normTable}.${normCol}`) || message.includes(`"${normCol}" of relation "${normTable}"`) || message.includes(`'${normCol}' column of '${normTable}'`) || message.includes(`column "${normCol}" does not exist`) || message.includes(`column ${normCol} does not exist`);
+    if (!mentionsExactColumn) return false;
+    if (code === "42703" || code === "PGRST204") {
+      return true;
+    }
+    return message.includes("does not exist") || message.includes("could not find the");
   };
   const runRequiredCustomerStage = async (stage, fn, minRequiredMs = 15) => {
     const remainingMs = getRemainingCustomerBudgetMs();
@@ -19362,12 +19380,15 @@ var getMyConfigs = async (uid, email, _token, options) => {
       if (byCustomerUidRes?.error) {
         throw createCustomerQueryFailureError("vpn_configs_customer_uid", byCustomerUidRes.error);
       }
-      if (byUserIdRes?.error) {
+      const userIdMissingColumnOnly = Boolean(
+        byUserIdRes?.error && isConfirmedMissingColumnError(byUserIdRes.error, "vpn_configs", "user_id")
+      );
+      if (byUserIdRes?.error && !userIdMissingColumnOnly) {
         throw createCustomerQueryFailureError("vpn_configs_user_id", byUserIdRes.error);
       }
       const combinedCfgs = [
         ...Array.isArray(byCustomerUidRes?.data) ? byCustomerUidRes.data : [],
-        ...Array.isArray(byUserIdRes?.data) ? byUserIdRes.data : []
+        ...!userIdMissingColumnOnly && Array.isArray(byUserIdRes?.data) ? byUserIdRes.data : []
       ];
       combinedCfgs.forEach((cfg) => {
         const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
@@ -19714,7 +19735,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
           _recordPanelIdentity: accRow?.panel_identity || cfgRow?.panel_identity || null,
           _recordServerId: accRow?.server_id || cfgRow?.server_id || null,
           _persistedInboundId: inboundId,
-          _persistedHasUserId: Boolean(String(accRow?.user_id || cfgRow?.user_id || data.customer_id || "").trim()) && !conflictingOwnershipUuids.has(normUuid),
+          _persistedHasUserId: Boolean(String(accRow?.user_id || cfgRow?.customer_uid || cfgRow?.user_id || data.customer_id || "").trim()) && !conflictingOwnershipUuids.has(normUuid),
           _hasConflictingInboundId: hasConflictIb,
           _hasConflictingOwnership: conflictingOwnershipUuids.has(normUuid),
           _legacySource: "orders",
@@ -20152,7 +20173,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
           return userUid ? docUserId === userUid || !docUserId && userEmail && docEmail === userEmail : userEmail && docEmail === userEmail;
         });
         const customerFreshCfgs = freshCfgRows.filter((cfg) => {
-          const docUserId = String(cfg.user_id || cfg.customer_uid || "").trim();
+          const docUserId = String(cfg.customer_uid || cfg.user_id || "").trim();
           return !userUid || !docUserId || docUserId === userUid;
         });
         const isRecheckDeleted = customerFreshAccs.some(
@@ -23642,9 +23663,9 @@ init_xuiService();
 init_supabase();
 import dotenv from "dotenv";
 dotenv.config();
-var getClientStatus = async (email, targetUuid, uid, token) => {
+var getClientStatus = async (email, targetUuid, uid, token, options) => {
   let activeUuid = targetUuid;
-  const db = getSupabaseClient(token);
+  const db = options?.dbClient || getSupabaseClient(token);
   if (!activeUuid && uid) {
     try {
       const { data: profile } = await db.from("profiles").select("active_vpn_uuid, uuid").eq("id", uid).maybeSingle();
@@ -23657,7 +23678,7 @@ var getClientStatus = async (email, targetUuid, uid, token) => {
       console.warn("[clientService] Error reading active_vpn_uuid from profile:", e);
     }
   }
-  const myConfigsRes = await getMyConfigs(uid || "", email, token);
+  const myConfigsRes = await getMyConfigs(uid || "", email, token, options?.getMyConfigsOptions);
   const rawConfigs = Array.isArray(myConfigsRes) ? myConfigsRes : myConfigsRes.configs || [];
   const deletedUuids = Array.isArray(myConfigsRes?.deletedUuids) ? myConfigsRes.deletedUuids.map((u) => String(u || "").trim().toLowerCase()).filter(Boolean) : [];
   const deletedUuidSet = new Set(deletedUuids);

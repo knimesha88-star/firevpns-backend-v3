@@ -43,6 +43,7 @@ import {
   resetLastKnownClientTrafficCacheForTests,
   resetVpnTraffic,
 } from '../vpnService.js';
+import { getClientStatus } from '../clientService.js';
 
 const PANEL_A_URL = 'https://panel-a.firevpn.example:2053/subpath';
 const PANEL_B_URL = 'https://panel-b.firevpn.example:2053/subpath';
@@ -4935,4 +4936,552 @@ test('53. Post-eviction fresh panel read genuinely bypasses liveInboundCache (10
     resetLastKnownClientTrafficCacheForTests();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Helper: Production-schema mock DB wrapper where vpn_configs has customer_uid
+// and does NOT have user_id (reproducing exact Supabase Postgres 42703 / PGRST204 error)
+// ---------------------------------------------------------------------------
+function createProductionSchemaCustomerDb(
+  baseDb: ReturnType<typeof createMockCustomerDb>,
+  opts?: {
+    vpnConfigsUserIdError?: { code?: string; message: string } | null;
+    vpnConfigsCustomerUidError?: { code?: string; message: string } | null;
+    profiles?: any[];
+  }
+) {
+  const userIdErr =
+    opts?.vpnConfigsUserIdError !== undefined
+      ? opts.vpnConfigsUserIdError
+      : { code: '42703', message: 'column vpn_configs.user_id does not exist' };
+  const customerUidErr = opts?.vpnConfigsCustomerUidError ?? null;
+  const profiles = opts?.profiles ?? [];
+
+  return {
+    state: baseDb.state,
+    from(table: string) {
+      if (table === 'profiles') {
+        const filters: Array<{ col: string; val: any }> = [];
+        const builder: any = {
+          select: () => builder,
+          eq: (col: string, val: any) => {
+            filters.push({ col, val });
+            return builder;
+          },
+          maybeSingle: async () => {
+            const match = profiles.find((row) =>
+              filters.every((f) => String(row?.[f.col] ?? '') === String(f.val ?? ''))
+            );
+            return { data: match || null, error: null };
+          },
+        };
+        return builder;
+      }
+
+      const inner = baseDb.from(table);
+      if (table !== 'vpn_configs') {
+        return inner;
+      }
+
+      let queriedUserId = false;
+      let queriedCustomerUid = false;
+      const wrappedSelect = (cols?: string) => {
+        const q = inner.select(cols);
+        const origEq = q.eq.bind(q);
+        q.eq = (col: string, val: any) => {
+          if (col === 'user_id') queriedUserId = true;
+          if (col === 'customer_uid') queriedCustomerUid = true;
+          return origEq(col, val);
+        };
+        const origThen = q.then.bind(q);
+        q.then = (resolve: any, reject: any) => {
+          if (queriedUserId && userIdErr) {
+            return Promise.resolve({ data: null, error: userIdErr }).then(resolve, reject);
+          }
+          if (queriedCustomerUid && customerUidErr) {
+            return Promise.resolve({ data: null, error: customerUidErr }).then(resolve, reject);
+          }
+          return origThen(resolve, reject);
+        };
+        return q;
+      };
+
+      return {
+        ...inner,
+        select: wrappedSelect,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 54. Production schema (vpn_configs.customer_uid exists, vpn_configs.user_id does NOT exist)
+//     succeeds cleanly for both /api/vpn/my-configs (getMyConfigs) and /api/client/status (getClientStatus)
+//     with strict customer ownership isolation
+// ---------------------------------------------------------------------------
+test('54. Production schema without vpn_configs.user_id succeeds for getMyConfigs (/api/vpn/my-configs) and getClientStatus (/api/client/status) with strict customer isolation', async () => {
+  resetXuiServiceCachesForTests();
+  resetLastKnownClientTrafficCacheForTests();
+
+  const uidAlice = 'uid-prod-alice';
+  const emailAlice = 'alice@example.com';
+  const uuidAlice = 'uuid-prod-alice-1';
+
+  const uidBob = 'uid-prod-bob';
+  const emailBob = 'bob@example.com';
+  const uuidBob = 'uuid-prod-bob-1';
+
+  const fiftyGb = 50 * 1024 * 1024 * 1024;
+  const threeGb = 3 * 1024 * 1024 * 1024;
+  const sevenGb = 7 * 1024 * 1024 * 1024;
+
+  const baseDb = createMockCustomerDb({
+    vpn_accounts: [
+      {
+        id: 'acc-alice-1',
+        user_id: uidAlice,
+        email: emailAlice,
+        uuid: uuidAlice,
+        order_id: 'ORD-ALICE-1',
+        vless_url: `vless://${uuidAlice}@example.com:443#AliceSG`,
+        status: 'active',
+        enable: true,
+        total_bytes: fiftyGb,
+        data_limit: '50GB',
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+      {
+        id: 'acc-bob-1',
+        user_id: uidBob,
+        email: emailBob,
+        uuid: uuidBob,
+        order_id: 'ORD-BOB-1',
+        vless_url: `vless://${uuidBob}@example.com:443#BobSG`,
+        status: 'active',
+        enable: true,
+        total_bytes: fiftyGb,
+        data_limit: '50GB',
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+    ],
+    // Exact production vpn_configs rows: customer_uid ONLY (no user_id column)
+    vpn_configs: [
+      {
+        id: 'cfg-alice-1',
+        customer_uid: uidAlice,
+        uuid: uuidAlice,
+        order_id: 'ORD-ALICE-1',
+        inbound_id: 5,
+        data_limit: '50GB',
+        status: 'active',
+        enabled: true,
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+      {
+        id: 'cfg-bob-1',
+        customer_uid: uidBob,
+        uuid: uuidBob,
+        order_id: 'ORD-BOB-1',
+        inbound_id: 5,
+        data_limit: '50GB',
+        status: 'active',
+        enabled: true,
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+    ],
+    orders: [
+      {
+        id: 'ORD-ALICE-1',
+        order_id: 'ORD-ALICE-1',
+        customer_id: uidAlice,
+        email: emailAlice,
+        client_uuid: uuidAlice,
+        vless_url: `vless://${uuidAlice}@example.com:443#AliceSG`,
+        status: 'approved',
+        payment_status: 'Paid',
+        provisioning_status: 'completed',
+        traffic_limit: '50GB',
+      },
+      {
+        id: 'ORD-BOB-1',
+        order_id: 'ORD-BOB-1',
+        customer_id: uidBob,
+        email: emailBob,
+        client_uuid: uuidBob,
+        vless_url: `vless://${uuidBob}@example.com:443#BobSG`,
+        status: 'approved',
+        payment_status: 'Paid',
+        provisioning_status: 'completed',
+        traffic_limit: '50GB',
+      },
+    ],
+  });
+
+  // Test both PostgreSQL 42703 and PostgREST PGRST204 missing-column error variants
+  const missingColumnVariants = [
+    { code: '42703', message: 'column vpn_configs.user_id does not exist' },
+    { code: 'PGRST204', message: "Could not find the 'user_id' column of 'vpn_configs' in the schema cache" },
+  ];
+
+  const liveIb = makeInbound(5, [
+    { id: uuidAlice, email: emailAlice, enable: true, up: threeGb, down: 0, totalGB: fiftyGb },
+    { id: uuidBob, email: emailBob, enable: true, up: sevenGb, down: 0, totalGB: fiftyGb },
+  ]);
+
+  for (const variantErr of missingColumnVariants) {
+    const prodDb = createProductionSchemaCustomerDb(baseDb, {
+      vpnConfigsUserIdError: variantErr,
+      profiles: [{ id: uidAlice, active_vpn_uuid: uuidAlice }],
+    });
+
+    // 1. Verify /api/vpn/my-configs (getMyConfigs) for Alice
+    const myConfigsRes = await getMyConfigs(uidAlice, emailAlice, undefined, {
+      dbClient: prodDb,
+      adminDbClient: prodDb,
+      currentPanelIdentity: PANEL_A_ID,
+      getCachedInboundsFn: async () => [],
+      getLiveInboundFn: async () => liveIb,
+      getInboundsFn: async () => [],
+    });
+
+    assert.equal(myConfigsRes.configs.length, 1, 'Alice must see strictly her own 1 VPN configuration');
+    assert.equal(myConfigsRes.configs[0].uuid, uuidAlice);
+    assert.equal(myConfigsRes.configs[0].inboundId, 5, 'inbound_id must resolve from vpn_configs.customer_uid');
+    assert.equal(myConfigsRes.configs[0].status, 'Active');
+    assert.equal(myConfigsRes.configs[0].usedGB, 3);
+    assert.equal(myConfigsRes.configs[0].remainingGB, 47);
+    assert.equal(myConfigsRes.configs[0].trafficVerified, true);
+    assert.equal(myConfigsRes.configs[0].trafficSource, 'live');
+    assert.equal(myConfigsRes.configs[0].quotaVerified, true);
+    assert.equal(myConfigsRes.configs[0].usedTrafficKnown, true);
+    assert.equal(myConfigsRes.configs[0].remainingTrafficKnown, true);
+    assert.equal(
+      myConfigsRes.configs.some((c) => c.uuid === uuidBob),
+      false,
+      'Must NEVER expose another customer VPN configuration'
+    );
+    assert.equal(prodDb.state.writes.length, 0, 'getMyConfigs must remain strictly read-only');
+
+    // 2. Verify /api/client/status (getClientStatus) for Alice on the exact same production schema
+    const statusRes = await getClientStatus(emailAlice, undefined, uidAlice, undefined, {
+      dbClient: prodDb,
+      getMyConfigsOptions: {
+        dbClient: prodDb,
+        adminDbClient: prodDb,
+        currentPanelIdentity: PANEL_A_ID,
+        getCachedInboundsFn: async () => [],
+        getLiveInboundFn: async () => liveIb,
+        getInboundsFn: async () => [],
+      },
+    });
+
+    assert.ok(statusRes, 'getClientStatus must return Alice active VPN status on production schema');
+    assert.equal(statusRes.uuid, uuidAlice);
+    assert.equal(statusRes.status, 'Active');
+    assert.equal(statusRes.usedGB, 3);
+    assert.equal(statusRes.remainingGB, 47);
+    assert.equal(statusRes.trafficVerified, true);
+    assert.equal(statusRes.trafficSource, 'live');
+    assert.equal(statusRes.usedTrafficKnown, true);
+    assert.equal(statusRes.remainingTrafficKnown, true);
+    assert.notEqual(statusRes.uuid, uuidBob);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 55. Post-eviction authoritative DB recheck succeeds cleanly on production schema (no vpn_configs.user_id)
+// ---------------------------------------------------------------------------
+test('55. Post-eviction authoritative DB recheck succeeds on production schema without vpn_configs.user_id and preserves fresh panel read', async () => {
+  resetXuiServiceCachesForTests();
+  resetLastKnownClientTrafficCacheForTests();
+  setMaxClientTrafficMutationStateEntriesForTests(3);
+
+  try {
+    const uid = 'uid-prod-recheck';
+    const email = 'prodrecheck@example.com';
+    const uuidTarget = 'uuid-prod-recheck-1';
+    const fiftyGb = 50 * 1024 * 1024 * 1024;
+    const fourGb = 4 * 1024 * 1024 * 1024;
+    const eightGb = 8 * 1024 * 1024 * 1024;
+
+    const baseDb = createMockCustomerDb({
+      vpn_accounts: [
+        {
+          id: 'acc-pr-1',
+          user_id: uid,
+          email,
+          uuid: uuidTarget,
+          vless_url: `vless://${uuidTarget}@example.com:443#SG`,
+          status: 'active',
+          enable: true,
+          total_bytes: fiftyGb,
+          data_limit: '50GB',
+          panel_identity: PANEL_A_ID,
+          created_at: PAST_CREATED_AT,
+        },
+      ],
+      vpn_configs: [
+        {
+          id: 'cfg-pr-1',
+          customer_uid: uid, // Production schema: customer_uid only
+          uuid: uuidTarget,
+          inbound_id: 5,
+          data_limit: '50GB',
+          status: 'active',
+          enabled: true,
+          panel_identity: PANEL_A_ID,
+          created_at: PAST_CREATED_AT,
+        },
+      ],
+    });
+    const prodDb = createProductionSchemaCustomerDb(baseDb);
+
+    let releaseFirstFetch!: () => void;
+    const firstGate = new Promise<void>((r) => {
+      releaseFirstFetch = r;
+    });
+    let fetchCount = 0;
+
+    const inFlightRead = getMyConfigs(uid, email, undefined, {
+      dbClient: prodDb,
+      adminDbClient: prodDb,
+      currentPanelIdentity: PANEL_A_ID,
+      getCachedInboundsFn: async () => [],
+      getLiveInboundFn: async (_id, opts) => {
+        fetchCount++;
+        if (fetchCount === 1) {
+          await firstGate;
+          return makeInbound(5, [{ id: uuidTarget, email, up: fourGb, down: 0, totalGB: fiftyGb }]);
+        }
+        assert.equal(typeof opts === 'object' && opts?.forceRefresh, true);
+        return makeInbound(5, [{ id: uuidTarget, email, up: eightGb, down: 0, totalGB: fiftyGb }]);
+      },
+      getInboundsFn: async () => [],
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    for (let i = 0; i < 5; i++) {
+      notifyClientTrafficInvalidated(`uuid-pr-unrelated-${i}`, 'reset');
+    }
+
+    releaseFirstFetch();
+    const res = await inFlightRead;
+
+    assert.equal(res.configs.length, 1);
+    assert.equal(res.configs[0].uuid, uuidTarget);
+    assert.equal(res.configs[0].usedGB, 8);
+    assert.equal(res.configs[0].remainingGB, 42);
+    assert.equal(res.configs[0].trafficSource, 'live');
+    assert.equal(res.configs[0].trafficVerified, true);
+    assert.equal(prodDb.state.writes.length, 0);
+  } finally {
+    resetXuiServiceCachesForTests();
+    resetLastKnownClientTrafficCacheForTests();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 56. Genuine database errors (permission denied, network error, timeout, customer_uid error)
+//     on vpn_configs are NEVER suppressed and fail closed
+// ---------------------------------------------------------------------------
+test('56. Genuine database, permission, network, timeout, and customer_uid errors on vpn_configs are NEVER suppressed', async () => {
+  resetXuiServiceCachesForTests();
+  resetLastKnownClientTrafficCacheForTests();
+
+  const uid = 'uid-genuine-err';
+  const email = 'genuineerr@example.com';
+
+  const makeBase = () =>
+    createMockCustomerDb({
+      vpn_accounts: [
+        {
+          id: 'acc-ge-1',
+          user_id: uid,
+          email,
+          uuid: 'uuid-ge-1',
+          vless_url: 'vless://uuid-ge-1@example.com:443#SG',
+          status: 'active',
+          enable: true,
+          panel_identity: PANEL_A_ID,
+          created_at: PAST_CREATED_AT,
+        },
+      ],
+      vpn_configs: [
+        {
+          id: 'cfg-ge-1',
+          customer_uid: uid,
+          uuid: 'uuid-ge-1',
+          inbound_id: 5,
+          status: 'active',
+          enabled: true,
+          panel_identity: PANEL_A_ID,
+          created_at: PAST_CREATED_AT,
+        },
+      ],
+    });
+
+  // Case A: Permission denied (42501) on optional user_id query MUST NOT be suppressed
+  const permDeniedDb = createProductionSchemaCustomerDb(makeBase(), {
+    vpnConfigsUserIdError: { code: '42501', message: 'permission denied for table vpn_configs' },
+  });
+  await assert.rejects(
+    () =>
+      getMyConfigs(uid, email, undefined, {
+        dbClient: permDeniedDb,
+        adminDbClient: permDeniedDb,
+        currentPanelIdentity: PANEL_A_ID,
+        getCachedInboundsFn: async () => [],
+        getLiveInboundFn: async () => null,
+        getInboundsFn: async () => [],
+      }),
+    (err: any) =>
+      err?.code === 'CUSTOMER_CONFIG_QUERY_FAILED' &&
+      err?.status === 503 &&
+      /permission denied/i.test(String(err?.message || ''))
+  );
+
+  // Case B: Network failure on optional user_id query MUST NOT be suppressed
+  const networkFailDb = createProductionSchemaCustomerDb(makeBase(), {
+    vpnConfigsUserIdError: { message: 'TypeError: fetch failed: ECONNREFUSED' },
+  });
+  await assert.rejects(
+    () =>
+      getMyConfigs(uid, email, undefined, {
+        dbClient: networkFailDb,
+        adminDbClient: networkFailDb,
+        currentPanelIdentity: PANEL_A_ID,
+        getCachedInboundsFn: async () => [],
+        getLiveInboundFn: async () => null,
+        getInboundsFn: async () => [],
+      }),
+    (err: any) =>
+      err?.code === 'CUSTOMER_CONFIG_QUERY_FAILED' &&
+      err?.status === 503 &&
+      /fetch failed/i.test(String(err?.message || ''))
+  );
+
+  // Case C: Statement timeout (57014) on optional user_id query MUST NOT be suppressed
+  const timeoutDb = createProductionSchemaCustomerDb(makeBase(), {
+    vpnConfigsUserIdError: { code: '57014', message: 'canceling statement due to statement timeout' },
+  });
+  await assert.rejects(
+    () =>
+      getMyConfigs(uid, email, undefined, {
+        dbClient: timeoutDb,
+        adminDbClient: timeoutDb,
+        currentPanelIdentity: PANEL_A_ID,
+        getCachedInboundsFn: async () => [],
+        getLiveInboundFn: async () => null,
+        getInboundsFn: async () => [],
+      }),
+    (err: any) =>
+      err?.code === 'CUSTOMER_CONFIG_QUERY_FAILED' &&
+      err?.status === 503 &&
+      /statement timeout/i.test(String(err?.message || ''))
+  );
+
+  // Case D: Error on primary customer_uid query MUST NEVER be suppressed (even if missing-column)
+  const primaryFailDb = createProductionSchemaCustomerDb(makeBase(), {
+    vpnConfigsCustomerUidError: { code: '42703', message: 'column vpn_configs.customer_uid does not exist' },
+    vpnConfigsUserIdError: null,
+  });
+  await assert.rejects(
+    () =>
+      getMyConfigs(uid, email, undefined, {
+        dbClient: primaryFailDb,
+        adminDbClient: primaryFailDb,
+        currentPanelIdentity: PANEL_A_ID,
+        getCachedInboundsFn: async () => [],
+        getLiveInboundFn: async () => null,
+        getInboundsFn: async () => [],
+      }),
+    (err: any) =>
+      err?.code === 'CUSTOMER_CONFIG_QUERY_FAILED' &&
+      err?.status === 503 &&
+      /vpn_configs_customer_uid/i.test(String(err?.message || ''))
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 57. Alternative schema where vpn_configs.user_id exists continues to work with strict customer isolation
+// ---------------------------------------------------------------------------
+test('57. Alternative schema where vpn_configs.user_id exists continues to resolve customer configs with strict ownership isolation', async () => {
+  resetXuiServiceCachesForTests();
+  resetLastKnownClientTrafficCacheForTests();
+
+  const uid = 'uid-alt-schema';
+  const email = 'altschema@example.com';
+  const uuidMine = 'uuid-alt-mine-1';
+  const uuidOther = 'uuid-alt-other-1';
+  const fiftyGb = 50 * 1024 * 1024 * 1024;
+  const twoGb = 2 * 1024 * 1024 * 1024;
+
+  const baseDb = createMockCustomerDb({
+    vpn_accounts: [
+      {
+        id: 'acc-alt-1',
+        user_id: uid,
+        email,
+        uuid: uuidMine,
+        vless_url: `vless://${uuidMine}@example.com:443#SG`,
+        status: 'active',
+        enable: true,
+        total_bytes: fiftyGb,
+        data_limit: '50GB',
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+    ],
+    vpn_configs: [
+      {
+        id: 'cfg-alt-1',
+        user_id: uid, // Alternative schema row using user_id
+        uuid: uuidMine,
+        inbound_id: 7,
+        status: 'active',
+        enabled: true,
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+      {
+        id: 'cfg-alt-other',
+        user_id: 'uid-someone-else',
+        uuid: uuidOther,
+        inbound_id: 8,
+        status: 'active',
+        enabled: true,
+        panel_identity: PANEL_A_ID,
+        created_at: PAST_CREATED_AT,
+      },
+    ],
+  });
+
+  const altDb = createProductionSchemaCustomerDb(baseDb, {
+    vpnConfigsUserIdError: null,
+  });
+
+  const liveIb7 = makeInbound(7, [
+    { id: uuidMine, email, enable: true, up: twoGb, down: 0, totalGB: fiftyGb },
+  ]);
+
+  const res = await getMyConfigs(uid, email, undefined, {
+    dbClient: altDb,
+    adminDbClient: altDb,
+    currentPanelIdentity: PANEL_A_ID,
+    getCachedInboundsFn: async () => [],
+    getLiveInboundFn: async (id) => (id === 7 ? liveIb7 : null),
+    getInboundsFn: async () => [],
+  });
+
+  assert.equal(res.configs.length, 1);
+  assert.equal(res.configs[0].uuid, uuidMine);
+  assert.equal(res.configs[0].inboundId, 7);
+  assert.equal(res.configs[0].usedGB, 2);
+  assert.equal(res.configs[0].remainingGB, 48);
+  assert.equal(res.configs.some((c) => c.uuid === uuidOther), false);
+});
+
 

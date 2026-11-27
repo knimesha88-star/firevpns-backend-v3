@@ -1225,7 +1225,11 @@ export const getMyConfigs = async (
   };
 
   const createCustomerQueryFailureError = (stage: string, cause?: any): Error => {
-    if (cause?.code === 'CUSTOMER_REQUEST_DEADLINE_EXCEEDED' || cause?.code === 'AUTHORITATIVE_MUTATION_RECHECK_FAILED') {
+    if (
+      cause?.code === 'CUSTOMER_REQUEST_DEADLINE_EXCEEDED' ||
+      cause?.code === 'AUTHORITATIVE_MUTATION_RECHECK_FAILED' ||
+      cause?.code === 'CUSTOMER_CONFIG_QUERY_FAILED'
+    ) {
       return cause;
     }
     const msg = cause?.message || String(cause || 'database query failed');
@@ -1235,6 +1239,42 @@ export const getMyConfigs = async (
     err.code = 'CUSTOMER_CONFIG_QUERY_FAILED';
     err.retryable = true;
     return err;
+  };
+
+  const isConfirmedMissingColumnError = (err: any, tableName: string, columnName: string): boolean => {
+    if (!err) return false;
+    const code = String(err?.code || '').trim().toUpperCase();
+    const message = String(err?.message || err?.details || err?.hint || '').toLowerCase();
+    const normTable = tableName.toLowerCase();
+    const normCol = columnName.toLowerCase();
+
+    // Never suppress permission, auth, RLS, timeout, or network errors
+    if (
+      code === '42501' ||
+      code === '28000' ||
+      code === '28P01' ||
+      code === '57014' ||
+      /permission denied|row-level security|rls|unauthorized|forbidden|timeout|timed out|network|econnrefused|enotfound|fetch failed/i.test(
+        message
+      )
+    ) {
+      return false;
+    }
+
+    const mentionsExactColumn =
+      message.includes(`${normTable}.${normCol}`) ||
+      message.includes(`"${normCol}" of relation "${normTable}"`) ||
+      message.includes(`'${normCol}' column of '${normTable}'`) ||
+      message.includes(`column "${normCol}" does not exist`) ||
+      message.includes(`column ${normCol} does not exist`);
+
+    if (!mentionsExactColumn) return false;
+
+    if (code === '42703' || code === 'PGRST204') {
+      return true;
+    }
+
+    return message.includes('does not exist') || message.includes('could not find the');
   };
 
   const runRequiredCustomerStage = async <T>(
@@ -1324,7 +1364,10 @@ export const getMyConfigs = async (
     }
   };
 
-  // Query vpn_configs scoped strictly to this customer by customer_uid and user_id (no full-table scan)
+  // Query vpn_configs scoped strictly to this customer using the production customer_uid column.
+  // Optional user_id compatibility is retained for alternative schemas ONLY when it succeeds or
+  // fails with a specifically confirmed missing-column error (42703/PGRST204 for vpn_configs.user_id).
+  // Genuine database, permission, network, or timeout errors are never suppressed.
   const vpnConfigsMap = new Map<string, any>();
   if (userUid) {
     try {
@@ -1337,12 +1380,15 @@ export const getMyConfigs = async (
       if (byCustomerUidRes?.error) {
         throw createCustomerQueryFailureError('vpn_configs_customer_uid', byCustomerUidRes.error);
       }
-      if (byUserIdRes?.error) {
+      const userIdMissingColumnOnly = Boolean(
+        byUserIdRes?.error && isConfirmedMissingColumnError(byUserIdRes.error, 'vpn_configs', 'user_id')
+      );
+      if (byUserIdRes?.error && !userIdMissingColumnOnly) {
         throw createCustomerQueryFailureError('vpn_configs_user_id', byUserIdRes.error);
       }
       const combinedCfgs = [
         ...(Array.isArray(byCustomerUidRes?.data) ? byCustomerUidRes.data : []),
-        ...(Array.isArray(byUserIdRes?.data) ? byUserIdRes.data : []),
+        ...(!userIdMissingColumnOnly && Array.isArray(byUserIdRes?.data) ? byUserIdRes.data : []),
       ];
       combinedCfgs.forEach((cfg: any) => {
         const key = String(cfg.id || cfg.uuid || cfg.order_id || Math.random());
@@ -1791,7 +1837,7 @@ export const getMyConfigs = async (
           _recordServerId: accRow?.server_id || cfgRow?.server_id || null,
           _persistedInboundId: inboundId,
           _persistedHasUserId:
-            Boolean(String(accRow?.user_id || cfgRow?.user_id || data.customer_id || '').trim()) &&
+            Boolean(String(accRow?.user_id || cfgRow?.customer_uid || cfgRow?.user_id || data.customer_id || '').trim()) &&
             !conflictingOwnershipUuids.has(normUuid),
           _hasConflictingInboundId: hasConflictIb,
           _hasConflictingOwnership: conflictingOwnershipUuids.has(normUuid),
@@ -2358,7 +2404,7 @@ export const getMyConfigs = async (
           : (userEmail && docEmail === userEmail);
       });
       const customerFreshCfgs = freshCfgRows.filter((cfg) => {
-        const docUserId = String(cfg.user_id || cfg.customer_uid || '').trim();
+        const docUserId = String(cfg.customer_uid || cfg.user_id || '').trim();
         return !userUid || !docUserId || docUserId === userUid;
       });
 
