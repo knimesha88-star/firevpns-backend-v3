@@ -89,6 +89,15 @@ import {
 router.get('/ai-settings', getAdminAiSettingsHandler);
 router.post('/ai-settings', saveAdminAiSettingsHandler);
 
+// Admin Read-Only Synchronization Diagnostics routes (strictly read-only, opt-in direct probes)
+import { adminDiagnosticRateLimit } from '../middleware/rateLimitMiddleware.js';
+import {
+  getSyncDiagnosticsHandler,
+  getSyncDiagnosticsCsvHandler,
+} from '../controllers/syncDiagnosticsController.js';
+router.get('/sync-diagnostics', adminDiagnosticRateLimit, getSyncDiagnosticsHandler);
+router.get('/sync-diagnostics/csv', adminDiagnosticRateLimit, getSyncDiagnosticsCsvHandler);
+
 export default router;
 
 

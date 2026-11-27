@@ -122,3 +122,15 @@ export const webhookRateLimit = createRateLimiter({
   max: 60,
   keyPrefix: 'webhook',
 });
+
+/**
+ * Per-instance in-memory rate limiter for admin read-only synchronization diagnostics.
+ * NOTE: Enforced per backend instance (not distributed across multiple replicas).
+ */
+export const adminDiagnosticRateLimit = createRateLimiter({
+  windowMs: 5 * 60 * 1000,
+  max: 6,
+  keyPrefix: 'admin_sync_diagnostics',
+  message: 'Too many synchronization diagnostic requests. Please wait before running another diagnostic scan.',
+});
+

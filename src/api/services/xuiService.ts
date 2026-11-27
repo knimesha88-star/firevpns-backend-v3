@@ -12228,6 +12228,1175 @@ export async function revokeProvisionalRenewal(
   );
 }
 
+// ==============================================================================
+// STRICTLY READ-ONLY ADMIN DIAGNOSTIC PANEL HELPERS
+// Zero writes, zero customer inbound cache mutation, zero shared auth mutation,
+// strictly bounded and AbortSignal-cancellable GET/login/config only.
+// ==============================================================================
+
+export type DiagnosticPanelErrorCode =
+  | 'diagnostic_aborted'
+  | 'diagnostic_deadline_exceeded'
+  | 'panel_config_unavailable'
+  | 'panel_auth_failed'
+  | 'panel_timeout'
+  | 'panel_http_4xx'
+  | 'panel_http_5xx'
+  | 'panel_network_error'
+  | 'panel_rejected_response'
+  | 'panel_non_array_response'
+  | 'panel_empty_inbounds'
+  | 'panel_malformed_inbound'
+  | 'panel_null_or_empty_obj'
+  | 'panel_inbound_id_mismatch'
+  | 'panel_invalid_response';
+
+export interface DiagnosticIsolatedSessionState {
+  config: XuiConfig | null;
+  panelIdentity: string | null;
+  scopeKey: string | null;
+  headers: Record<string, string> | null;
+  inFlightAuth: Promise<{
+    ok: boolean;
+    headers: Record<string, string> | null;
+    errorCode: DiagnosticPanelErrorCode | null;
+  }> | null;
+}
+
+export const createDiagnosticIsolatedSessionState = (): DiagnosticIsolatedSessionState => ({
+  config: null,
+  panelIdentity: null,
+  scopeKey: null,
+  headers: null,
+  inFlightAuth: null,
+});
+
+export interface DiagnosticReadOnlyListResult {
+  ok: boolean;
+  inbounds: XuiInbound[];
+  latencyMs: number;
+  panelIdentity: string | null;
+  errorCode: DiagnosticPanelErrorCode | null;
+}
+
+export type DiagnosticDirectInboundOutcome =
+  | 'ok_valid_inbound'
+  | 'http_200_null_or_empty_obj'
+  | 'malformed_settings_clients'
+  | 'inbound_id_mismatch'
+  | 'timeout'
+  | 'aborted'
+  | 'auth_failed'
+  | 'http_4xx'
+  | 'http_5xx'
+  | 'network_error'
+  | 'invalid_response';
+
+export interface DiagnosticDirectInboundProbeResult {
+  inboundId: number;
+  outcome: DiagnosticDirectInboundOutcome;
+  latencyMs: number;
+  httpStatus: number | null;
+  hasObj: boolean;
+  clientCount: number | null;
+  errorCode: DiagnosticPanelErrorCode | null;
+}
+
+export interface DiagnosticPanelAuthHooks {
+  loginPostFn?: (
+    url: string,
+    body: string,
+    headers: Record<string, string>,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ) => Promise<{ status: number; headers: Record<string, any>; data?: any }>;
+  csrfGetFn?: (
+    url: string,
+    headers: Record<string, string>,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ) => Promise<{ status: number; headers: Record<string, any>; data?: any }>;
+}
+
+function classifyDiagnosticAbortSignalReason(signal?: AbortSignal): DiagnosticPanelErrorCode {
+  const reasonMsg = String((signal as any)?.reason?.message || (signal as any)?.reason || '').toLowerCase();
+  if (reasonMsg.includes('deadline')) {
+    return 'diagnostic_deadline_exceeded';
+  }
+  if (reasonMsg.includes('timeout')) {
+    return 'panel_timeout';
+  }
+  return 'diagnostic_aborted';
+}
+
+function createLinkedDiagnosticAbortController(
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): { controller: AbortController; cleanup: () => void; timedOut: () => boolean } {
+  const controller = new AbortController();
+  let localTimedOut = false;
+
+  const onParentAbort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort((parentSignal as any)?.reason ?? new Error('diagnostic_aborted'));
+    }
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onParentAbort();
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+
+  const effectiveMs = Math.max(10, Math.floor(timeoutMs));
+  const timer = setTimeout(() => {
+    localTimedOut = true;
+    if (!controller.signal.aborted) {
+      controller.abort(new Error('panel_timeout'));
+    }
+  }, effectiveMs);
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  };
+
+  return {
+    controller,
+    cleanup,
+    timedOut: () => localTimedOut,
+  };
+}
+
+function classifyDiagnosticAxiosError(err: any, signal?: AbortSignal): DiagnosticPanelErrorCode {
+  if (signal?.aborted) {
+    return classifyDiagnosticAbortSignalReason(signal);
+  }
+  const code = String(err?.code || '').toUpperCase();
+  const name = String(err?.name || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  const status = Number(err?.response?.status ?? err?.statusCode ?? 0);
+
+  if (code === 'ERR_CANCELED' || name === 'cancelederror' || name === 'aborterror') {
+    return 'diagnostic_aborted';
+  }
+  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || msg.includes('timeout') || msg.includes('timed out')) {
+    return 'panel_timeout';
+  }
+  if (status === 401 || status === 403 || msg.includes('auth') || msg.includes('login')) {
+    return 'panel_auth_failed';
+  }
+  if (status >= 400 && status < 500) {
+    return 'panel_http_4xx';
+  }
+  if (status >= 500 && status < 600) {
+    return 'panel_http_5xx';
+  }
+  return 'panel_network_error';
+}
+
+/**
+ * Diagnostic-only, strictly read-only, bounded & AbortSignal-cancellable 3X-UI config resolver.
+ * - Keeps existing getXuiConfig() strictly untouched and NEVER mutates cachedXuiConfig or xuiConfigInFlight.
+ * - Reuses warm cachedXuiConfig read-only when valid; on cold cache queries Supabase `settings` with abortSignal.
+ * - NEVER silently falls back to environment variables following a genuine database error.
+ */
+export const resolveDiagnosticXuiConfigReadOnly = async (options?: {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  dbClient?: any;
+  sessionState?: DiagnosticIsolatedSessionState;
+  bypassWarmCache?: boolean;
+}): Promise<{
+  ok: boolean;
+  config: XuiConfig | null;
+  panelIdentity: string | null;
+  errorCode: DiagnosticPanelErrorCode | null;
+}> => {
+  const signal = options?.signal;
+  const sessionState = options?.sessionState;
+
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      config: null,
+      panelIdentity: null,
+      errorCode: classifyDiagnosticAbortSignalReason(signal),
+    };
+  }
+
+  const effectiveTimeoutMs = Math.max(50, Math.min(Math.floor(options?.timeoutMs ?? 4000), 15000));
+
+  if (sessionState?.config) {
+    const pid = sessionState.panelIdentity || computePanelIdentity(sessionState.config.panelUrl);
+    if (pid) {
+      return {
+        ok: true,
+        config: { ...sessionState.config },
+        panelIdentity: pid,
+        errorCode: null,
+      };
+    }
+  }
+
+  // Strictly read-only reuse of warm global config cache (never modifies global cache or in-flight state)
+  if (!options?.bypassWarmCache && cachedXuiConfig && cachedXuiConfig.expiresAt > Date.now()) {
+    const warmCfg = { ...cachedXuiConfig.config };
+    const pid = computePanelIdentity(warmCfg.panelUrl);
+    if (pid) {
+      if (sessionState) {
+        sessionState.config = { ...warmCfg };
+        sessionState.panelIdentity = pid;
+      }
+      return {
+        ok: true,
+        config: warmCfg,
+        panelIdentity: pid,
+        errorCode: null,
+      };
+    }
+  }
+
+  // Cold-cache Supabase `settings` lookup with explicit AbortSignal + remaining budget enforcement
+  const db = options?.dbClient || supabaseAdmin || supabase;
+  if (!db || typeof db.from !== 'function') {
+    return {
+      ok: false,
+      config: null,
+      panelIdentity: null,
+      errorCode: 'panel_config_unavailable',
+    };
+  }
+
+  const linked = createLinkedDiagnosticAbortController(effectiveTimeoutMs, signal);
+  try {
+    let query: any = db.from('settings').select('id, data').eq('id', 'xui');
+    if (typeof query.abortSignal === 'function') {
+      query = query.abortSignal(linked.controller.signal);
+    }
+    if (typeof query.maybeSingle === 'function') {
+      query = query.maybeSingle();
+    }
+
+    const res: any = await query;
+
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: classifyDiagnosticAbortSignalReason(signal),
+      };
+    }
+    if (linked.timedOut() || linked.controller.signal.aborted) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: linked.timedOut() ? 'panel_timeout' : 'diagnostic_aborted',
+      };
+    }
+
+    // Fail CLOSED on any genuine Supabase settings query error: NEVER silently fall back to env vars!
+    if (res?.error) {
+      const errMsg = String(res.error?.message || '').toLowerCase();
+      if (errMsg.includes('abort') || errMsg.includes('cancel')) {
+        return {
+          ok: false,
+          config: null,
+          panelIdentity: null,
+          errorCode: linked.timedOut() ? 'panel_timeout' : classifyDiagnosticAbortSignalReason(signal),
+        };
+      }
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: 'panel_config_unavailable',
+      };
+    }
+
+    const doc = res?.data;
+    const data = (doc && typeof doc.data === 'object' && doc.data !== null ? doc.data : {}) as Record<string, any>;
+
+    const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || '').trim();
+    const username = String(data.username || process.env.XUI_USERNAME || 'admin').trim();
+    const password = String(
+      data.password ||
+        data.apiToken ||
+        process.env.XUI_PASSWORD ||
+        process.env.XUI_API_TOKEN ||
+        ''
+    ).trim();
+    const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
+
+    if (!panelUrl) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: 'panel_config_unavailable',
+      };
+    }
+
+    try {
+      validateXuiPanelUrl(panelUrl);
+    } catch {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: 'panel_config_unavailable',
+      };
+    }
+
+    const panelIdentity = computePanelIdentity(panelUrl);
+    if (!panelIdentity) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: 'panel_config_unavailable',
+      };
+    }
+
+    const resolvedConfig: XuiConfig = {
+      panelUrl,
+      username,
+      password,
+      apiToken,
+      panelName: String(data.panelName || 'Primary Node'),
+    };
+
+    if (sessionState) {
+      sessionState.config = { ...resolvedConfig };
+      sessionState.panelIdentity = panelIdentity;
+    }
+
+    return {
+      ok: true,
+      config: resolvedConfig,
+      panelIdentity,
+      errorCode: null,
+    };
+  } catch (err: any) {
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: classifyDiagnosticAbortSignalReason(signal),
+      };
+    }
+    if (linked.timedOut()) {
+      return {
+        ok: false,
+        config: null,
+        panelIdentity: null,
+        errorCode: 'panel_timeout',
+      };
+    }
+    const errCode = classifyDiagnosticAxiosError(err, signal);
+    return {
+      ok: false,
+      config: null,
+      panelIdentity: null,
+      errorCode:
+        errCode === 'diagnostic_aborted' || errCode === 'diagnostic_deadline_exceeded' || errCode === 'panel_timeout'
+          ? errCode
+          : 'panel_config_unavailable',
+    };
+  } finally {
+    linked.cleanup();
+  }
+};
+
+/**
+ * Isolated, bounded, AbortSignal-cancellable authentication helper exclusively for read-only diagnostics.
+ * - Keeps existing getXuiAuthHeaders() strictly untouched.
+ * - NEVER cancels, awaits, or invalidates shared `xuiAuthInFlight` promises.
+ * - NEVER writes to or evicts `cachedXuiAuthByScope`, `xuiAuthGenerationByScope`, `globalXuiAuthEpoch`,
+ *   `rememberedLoginEndpointByPanel`, or `confirmedUnsupportedCsrfByPanel`.
+ * - Preserves existing TLS (`sharedHttpsAgent`), URL validation, session login, and CSRF token semantics.
+ */
+export const acquireDiagnosticXuiAuthHeadersReadOnly = async (
+  config: XuiConfig,
+  options?: {
+    forceFreshLogin?: boolean;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    sessionState?: DiagnosticIsolatedSessionState;
+    authHooks?: DiagnosticPanelAuthHooks;
+  }
+): Promise<{
+  ok: boolean;
+  headers: Record<string, string> | null;
+  errorCode: DiagnosticPanelErrorCode | null;
+  source: 'diagnostic_run_cache' | 'shared_cache_readonly' | 'isolated_diagnostic_login' | 'failed';
+}> => {
+  const signal = options?.signal;
+  const forceFreshLogin = options?.forceFreshLogin === true;
+  const sessionState = options?.sessionState;
+  const authHooks = options?.authHooks;
+
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      headers: null,
+      errorCode: classifyDiagnosticAbortSignalReason(signal),
+      source: 'failed',
+    };
+  }
+
+  const { panelIdentity, scopeKey } = computeXuiCredentialScopeKey(config);
+
+  // 1. Check run-local isolated diagnostic session state first (when not forcing fresh login)
+  if (!forceFreshLogin && sessionState?.headers && sessionState.scopeKey === scopeKey) {
+    return {
+      ok: true,
+      headers: { ...sessionState.headers },
+      errorCode: null,
+      source: 'diagnostic_run_cache',
+    };
+  }
+
+  // 2. Strictly read-only reuse of already-valid shared auth cache (ZERO mutation of shared state or generations)
+  if (!forceFreshLogin) {
+    const hasExistingScopeGen = xuiAuthGenerationByScope.has(scopeKey);
+    const currentScopeGen = hasExistingScopeGen ? xuiAuthGenerationByScope.get(scopeKey)! : -1;
+    const sharedCached = cachedXuiAuthByScope.get(scopeKey);
+    if (
+      hasExistingScopeGen &&
+      sharedCached &&
+      sharedCached.generation === currentScopeGen &&
+      sharedCached.generation >= globalXuiAuthEpoch &&
+      sharedCached.expiresAt > Date.now()
+    ) {
+      const copied = { ...sharedCached.headers };
+      if (sessionState) {
+        sessionState.scopeKey = scopeKey;
+        sessionState.headers = { ...copied };
+      }
+      return {
+        ok: true,
+        headers: copied,
+        errorCode: null,
+        source: 'shared_cache_readonly',
+      };
+    }
+
+    // Share an in-flight isolated diagnostic login within this single diagnostic run only (never shared with customer ops)
+    if (sessionState?.inFlightAuth && sessionState.scopeKey === scopeKey) {
+      const existingRes = await sessionState.inFlightAuth;
+      if (existingRes.ok && existingRes.headers) {
+        return {
+          ok: true,
+          headers: { ...existingRes.headers },
+          errorCode: null,
+          source: 'diagnostic_run_cache',
+        };
+      }
+      return {
+        ok: false,
+        headers: null,
+        errorCode: existingRes.errorCode || 'panel_auth_failed',
+        source: 'failed',
+      };
+    }
+  }
+
+  const username = config.username || 'admin';
+  const password = config.password || config.apiToken;
+  if (!password) {
+    return {
+      ok: false,
+      headers: null,
+      errorCode: 'panel_auth_failed',
+      source: 'failed',
+    };
+  }
+
+  const runIsolatedLogin = async (): Promise<{
+    ok: boolean;
+    headers: Record<string, string> | null;
+    errorCode: DiagnosticPanelErrorCode | null;
+  }> => {
+    const authTimeoutMs = Math.max(
+      100,
+      Math.min(
+        Number.isFinite(options?.timeoutMs) && (options?.timeoutMs as number) > 0
+          ? Math.floor(options!.timeoutMs!)
+          : getXuiAuthTimeoutMs(),
+        12000
+      )
+    );
+    const authDeadlineMs = Date.now() + authTimeoutMs;
+    const linked = createLinkedDiagnosticAbortController(authTimeoutMs, signal);
+
+    try {
+      const { baseUrl } = parseUrl(config.panelUrl);
+      const client =
+        authHooks?.loginPostFn && authHooks?.csrfGetFn ? null : createAxiosInstance(baseUrl, authTimeoutMs);
+
+      const headers: Record<string, string> = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'X-Requested-With': 'XMLHttpRequest',
+      };
+
+      // Strictly read-only read of remembered login endpoint for ordering (never writes back)
+      const defaultLoginEndpoints = ['/login', '/panel/login'];
+      const rememberedEndpoint = rememberedLoginEndpointByPanel.get(panelIdentity);
+      const loginEndpoints =
+        rememberedEndpoint && defaultLoginEndpoints.includes(rememberedEndpoint)
+          ? [rememberedEndpoint, ...defaultLoginEndpoints.filter((ep) => ep !== rememberedEndpoint)]
+          : defaultLoginEndpoints;
+
+      let cookieHeader = '';
+      let lastLoginErr: any = null;
+
+      for (let idx = 0; idx < loginEndpoints.length; idx++) {
+        if (signal?.aborted) {
+          return {
+            ok: false,
+            headers: null,
+            errorCode: classifyDiagnosticAbortSignalReason(signal),
+          };
+        }
+        if (linked.controller.signal.aborted) {
+          return {
+            ok: false,
+            headers: null,
+            errorCode: linked.timedOut() ? 'panel_timeout' : 'diagnostic_aborted',
+          };
+        }
+
+        const loginEp = loginEndpoints[idx];
+        const remainingBeforeLoginMs = authDeadlineMs - Date.now();
+        if (remainingBeforeLoginMs <= 40) {
+          break;
+        }
+        const endpointsRemaining = loginEndpoints.length - idx;
+        const attemptTimeoutMs =
+          endpointsRemaining > 1
+            ? Math.max(60, Math.min(remainingBeforeLoginMs, Math.floor(authTimeoutMs * 0.6)))
+            : Math.max(60, remainingBeforeLoginMs);
+
+        try {
+          const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
+          const body = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+          const reqHeaders = {
+            ...headers,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          };
+          const res = authHooks?.loginPostFn
+            ? await authHooks.loginPostFn(fullPath, body, reqHeaders, attemptTimeoutMs, linked.controller.signal)
+            : await client!.post(fullPath, body, {
+                headers: reqHeaders,
+                timeout: attemptTimeoutMs,
+                signal: linked.controller.signal,
+              });
+          const setCookie = res.headers?.['set-cookie'];
+          const loginPayloadOk = !res.data || res.data.success !== false;
+          if (
+            res.status >= 200 &&
+            res.status < 400 &&
+            loginPayloadOk &&
+            setCookie &&
+            Array.isArray(setCookie) &&
+            setCookie.length > 0
+          ) {
+            cookieHeader = setCookie.map((c: string) => c.split(';')[0]).join('; ');
+            break;
+          }
+        } catch (loginErr: any) {
+          lastLoginErr = loginErr;
+          if (signal?.aborted || linked.controller.signal.aborted) {
+            return {
+              ok: false,
+              headers: null,
+              errorCode: signal?.aborted
+                ? classifyDiagnosticAbortSignalReason(signal)
+                : linked.timedOut()
+                  ? 'panel_timeout'
+                  : 'diagnostic_aborted',
+            };
+          }
+        }
+      }
+
+      if (signal?.aborted) {
+        return {
+          ok: false,
+          headers: null,
+          errorCode: classifyDiagnosticAbortSignalReason(signal),
+        };
+      }
+      if (linked.timedOut()) {
+        return {
+          ok: false,
+          headers: null,
+          errorCode: 'panel_timeout',
+        };
+      }
+
+      if (!cookieHeader && lastLoginErr && Date.now() >= authDeadlineMs) {
+        const code = classifyDiagnosticAxiosError(lastLoginErr, signal);
+        return {
+          ok: false,
+          headers: null,
+          errorCode: code === 'panel_network_error' ? 'panel_auth_failed' : code,
+        };
+      }
+
+      if (cookieHeader) {
+        headers['Cookie'] = cookieHeader;
+      }
+      headers['Authorization'] = `Bearer ${password}`;
+
+      // Read-only check of confirmed unsupported CSRF cache (never mutates shared map)
+      const confirmedUnsupported = confirmedUnsupportedCsrfByPanel.get(panelIdentity);
+      const currentScopeGen = xuiAuthGenerationByScope.get(scopeKey);
+      const shouldSkipCsrf = Boolean(
+        !forceFreshLogin &&
+          confirmedUnsupported &&
+          currentScopeGen !== undefined &&
+          confirmedUnsupported.scopeKey === scopeKey &&
+          confirmedUnsupported.generation === currentScopeGen
+      );
+
+      const remainingForCsrfMs = authDeadlineMs - Date.now();
+      if (!shouldSkipCsrf && remainingForCsrfMs > 60 && !linked.controller.signal.aborted) {
+        try {
+          const csrfTimeoutMs = Math.max(60, Math.min(2500, remainingForCsrfMs));
+          const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, '/csrf-token');
+          const csrfRes = authHooks?.csrfGetFn
+            ? await authHooks.csrfGetFn(csrfPath, headers, csrfTimeoutMs, linked.controller.signal)
+            : await client!.get(csrfPath, {
+                headers,
+                timeout: csrfTimeoutMs,
+                signal: linked.controller.signal,
+              });
+
+          if (csrfRes.status !== 404 && csrfRes.status !== 405 && csrfRes.status !== 501) {
+            if (csrfRes.data?.obj) {
+              headers['X-CSRF-Token'] = csrfRes.data.obj;
+            }
+            if (Array.isArray(csrfRes.headers?.['set-cookie']) && csrfRes.headers['set-cookie'].length > 0) {
+              const csrfCookie = csrfRes.headers['set-cookie'].map((c: string) => c.split(';')[0]).join('; ');
+              headers['Cookie'] = headers['Cookie'] ? `${headers['Cookie']}; ${csrfCookie}` : csrfCookie;
+            }
+          }
+        } catch {
+          if (signal?.aborted) {
+            return {
+              ok: false,
+              headers: null,
+              errorCode: classifyDiagnosticAbortSignalReason(signal),
+            };
+          }
+          // Non-fatal if csrf endpoint fails transiently (matches getXuiAuthHeaders behavior)
+        }
+      }
+
+      if (signal?.aborted) {
+        return {
+          ok: false,
+          headers: null,
+          errorCode: classifyDiagnosticAbortSignalReason(signal),
+        };
+      }
+
+      if (sessionState && cookieHeader) {
+        sessionState.scopeKey = scopeKey;
+        sessionState.headers = { ...headers };
+      }
+
+      return {
+        ok: true,
+        headers: { ...headers },
+        errorCode: null,
+      };
+    } catch (err: any) {
+      const code = classifyDiagnosticAxiosError(err, signal);
+      return {
+        ok: false,
+        headers: null,
+        errorCode: code === 'panel_network_error' ? 'panel_auth_failed' : code,
+      };
+    } finally {
+      linked.cleanup();
+    }
+  };
+
+  if (sessionState && !forceFreshLogin) {
+    sessionState.scopeKey = scopeKey;
+    const promise = runIsolatedLogin();
+    sessionState.inFlightAuth = promise;
+    try {
+      const result = await promise;
+      return {
+        ok: result.ok,
+        headers: result.headers ? { ...result.headers } : null,
+        errorCode: result.errorCode,
+        source: result.ok ? 'isolated_diagnostic_login' : 'failed',
+      };
+    } finally {
+      if (sessionState.inFlightAuth === promise) {
+        sessionState.inFlightAuth = null;
+      }
+    }
+  }
+
+  const result = await runIsolatedLogin();
+  return {
+    ok: result.ok,
+    headers: result.headers ? { ...result.headers } : null,
+    errorCode: result.errorCode,
+    source: result.ok ? 'isolated_diagnostic_login' : 'failed',
+  };
+};
+
+async function executeReadOnlyDiagnosticPanelGet(params: {
+  endpoint: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  dbClient?: any;
+  sessionState?: DiagnosticIsolatedSessionState;
+  authHooks?: DiagnosticPanelAuthHooks;
+  requestGetFn?: (
+    url: string,
+    headers: Record<string, string>,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ) => Promise<{ status: number; headers?: Record<string, any>; data?: any }>;
+}): Promise<{
+  ok: boolean;
+  status: number | null;
+  data: any;
+  panelIdentity: string | null;
+  errorCode: DiagnosticPanelErrorCode | null;
+}> {
+  const { endpoint, signal, dbClient, sessionState, authHooks, requestGetFn } = params;
+  const effectiveTimeoutMs = Math.max(200, Math.min(Math.floor(params.timeoutMs || 7000), 15000));
+  const deadlineMs = Date.now() + effectiveTimeoutMs;
+
+  const checkBudget = (
+    minRequiredMs = 60
+  ): { ok: boolean; remainingMs: number; errorCode: DiagnosticPanelErrorCode | null } => {
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        remainingMs: 0,
+        errorCode: classifyDiagnosticAbortSignalReason(signal),
+      };
+    }
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs < minRequiredMs) {
+      return { ok: false, remainingMs: 0, errorCode: 'panel_timeout' };
+    }
+    return { ok: true, remainingMs, errorCode: null };
+  };
+
+  // 1. Resolve panel config strictly via diagnostic-only bounded & cancellable resolver
+  const cfgBudget = checkBudget(80);
+  if (!cfgBudget.ok) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: cfgBudget.errorCode || 'panel_timeout',
+      status: null,
+      panelIdentity: null,
+    };
+  }
+  const cfgRes = await resolveDiagnosticXuiConfigReadOnly({
+    timeoutMs: cfgBudget.remainingMs,
+    signal,
+    dbClient,
+    sessionState,
+  });
+  if (!cfgRes.ok || !cfgRes.config || !cfgRes.panelIdentity) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: cfgRes.errorCode || 'panel_config_unavailable',
+      status: null,
+      panelIdentity: cfgRes.panelIdentity,
+    };
+  }
+
+  const config = cfgRes.config;
+  const panelIdentity = cfgRes.panelIdentity;
+
+  // 2. Acquire isolated diagnostic auth headers (zero mutation or cancellation of shared auth state)
+  const authBudget = checkBudget(80);
+  if (!authBudget.ok) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: authBudget.errorCode || 'panel_timeout',
+      status: null,
+      panelIdentity,
+    };
+  }
+  const authRes = await acquireDiagnosticXuiAuthHeadersReadOnly(config, {
+    forceFreshLogin: false,
+    timeoutMs: authBudget.remainingMs,
+    signal,
+    sessionState,
+    authHooks,
+  });
+  if (!authRes.ok || !authRes.headers) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: authRes.errorCode || 'panel_auth_failed',
+      status: null,
+      panelIdentity,
+    };
+  }
+
+  let headers = authRes.headers;
+  const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, endpoint);
+
+  const performGet = async (reqHeaders: Record<string, string>) => {
+    const httpBudget = checkBudget(60);
+    if (!httpBudget.ok) {
+      const code = httpBudget.errorCode || 'panel_timeout';
+      const err: any = new Error(code);
+      err.code = code === 'panel_timeout' ? 'ETIMEDOUT' : 'ERR_CANCELED';
+      throw err;
+    }
+    if (requestGetFn) {
+      return requestGetFn(fullPath, reqHeaders, httpBudget.remainingMs, signal);
+    }
+    const client = createAxiosInstance(baseUrl, httpBudget.remainingMs);
+    return client.request({
+      url: fullPath,
+      method: 'GET',
+      headers: reqHeaders,
+      timeout: httpBudget.remainingMs,
+      signal,
+    });
+  };
+
+  try {
+    let response = await performGet(headers);
+    const locationHeader = String(
+      (response as any)?.headers?.location || (response as any)?.headers?.Location || ''
+    ).toLowerCase();
+    const isUnauth =
+      response.status === 401 ||
+      response.status === 403 ||
+      ((response.status === 302 || response.status === 307) &&
+        /(?:^|\/)(?:login|auth)(?:[/?#]|$)|login|signin/i.test(locationHeader));
+
+    if (isUnauth) {
+      const reauthBudget = checkBudget(100);
+      if (!reauthBudget.ok) {
+        return {
+          ok: false,
+          data: null,
+          errorCode: reauthBudget.errorCode || 'panel_timeout',
+          status: response.status,
+          panelIdentity,
+        };
+      }
+      if (sessionState) {
+        sessionState.headers = null;
+      }
+      const reauthRes = await acquireDiagnosticXuiAuthHeadersReadOnly(config, {
+        forceFreshLogin: true,
+        timeoutMs: reauthBudget.remainingMs,
+        signal,
+        sessionState,
+        authHooks,
+      });
+      if (!reauthRes.ok || !reauthRes.headers) {
+        return {
+          ok: false,
+          data: null,
+          errorCode: reauthRes.errorCode || 'panel_auth_failed',
+          status: response.status,
+          panelIdentity,
+        };
+      }
+      headers = reauthRes.headers;
+      response = await performGet(headers);
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, data: null, errorCode: 'panel_auth_failed', status: response.status, panelIdentity };
+    }
+    if (response.status >= 400 && response.status < 500) {
+      return { ok: false, data: null, errorCode: 'panel_http_4xx', status: response.status, panelIdentity };
+    }
+    if (response.status >= 500) {
+      return { ok: false, data: null, errorCode: 'panel_http_5xx', status: response.status, panelIdentity };
+    }
+    if (response.status !== 200) {
+      return { ok: false, data: null, errorCode: 'panel_invalid_response', status: response.status, panelIdentity };
+    }
+
+    return { ok: true, status: response.status, data: response.data, panelIdentity, errorCode: null };
+  } catch (err: any) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: classifyDiagnosticAxiosError(err, signal),
+      status: Number(err?.response?.status) || null,
+      panelIdentity,
+    };
+  }
+}
+
+/**
+ * Strictly read-only, uncached GET /panel/api/inbounds/list helper for admin diagnostics.
+ * Supports AbortSignal cancellation and never reads or mutates cachedInbounds, liveInboundCache,
+ * or shared authentication caches/promises.
+ */
+export const fetchReadOnlyDiagnosticInboundsList = async (options?: {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  dbClient?: any;
+  sessionState?: DiagnosticIsolatedSessionState;
+  authHooks?: DiagnosticPanelAuthHooks;
+  requestGetFn?: (
+    url: string,
+    headers: Record<string, string>,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ) => Promise<{ status: number; headers?: Record<string, any>; data?: any }>;
+}): Promise<DiagnosticReadOnlyListResult> => {
+  const startedAt = Date.now();
+  const res = await executeReadOnlyDiagnosticPanelGet({
+    endpoint: '/panel/api/inbounds/list',
+    timeoutMs: options?.timeoutMs ?? 7000,
+    signal: options?.signal,
+    dbClient: options?.dbClient,
+    sessionState: options?.sessionState,
+    authHooks: options?.authHooks,
+    requestGetFn: options?.requestGetFn,
+  });
+
+  const latencyMs = Math.max(0, Date.now() - startedAt);
+  if (!res.ok) {
+    return {
+      ok: false,
+      inbounds: [],
+      latencyMs,
+      panelIdentity: res.panelIdentity,
+      errorCode: res.errorCode,
+    };
+  }
+
+  const payload = res.data;
+  if (!payload || typeof payload !== 'object') {
+    return {
+      ok: false,
+      inbounds: [],
+      latencyMs,
+      panelIdentity: res.panelIdentity,
+      errorCode: 'panel_invalid_response',
+    };
+  }
+  if (payload.success === false) {
+    return {
+      ok: false,
+      inbounds: [],
+      latencyMs,
+      panelIdentity: res.panelIdentity,
+      errorCode: 'panel_rejected_response',
+    };
+  }
+  if (!Array.isArray(payload.obj)) {
+    return {
+      ok: false,
+      inbounds: [],
+      latencyMs,
+      panelIdentity: res.panelIdentity,
+      errorCode: 'panel_non_array_response',
+    };
+  }
+  if (payload.obj.length === 0) {
+    return {
+      ok: false,
+      inbounds: [],
+      latencyMs,
+      panelIdentity: res.panelIdentity,
+      errorCode: 'panel_empty_inbounds',
+    };
+  }
+
+  return {
+    ok: true,
+    inbounds: payload.obj as XuiInbound[],
+    latencyMs,
+    panelIdentity: res.panelIdentity,
+    errorCode: null,
+  };
+};
+
+/**
+ * Strictly read-only, opt-in GET /panel/api/inbounds/get/{id} probe for diagnosing why
+ * direct inbound verification fails while full list succeeds.
+ * Supports AbortSignal cancellation and NEVER reads or mutates liveInboundCache, cache generations,
+ * or shared authentication caches/promises.
+ */
+export const probeDirectLiveInboundReadOnly = async (
+  inboundId: number,
+  options?: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    dbClient?: any;
+    sessionState?: DiagnosticIsolatedSessionState;
+    authHooks?: DiagnosticPanelAuthHooks;
+    requestGetFn?: (
+      url: string,
+      headers: Record<string, string>,
+      timeoutMs: number,
+      signal?: AbortSignal
+    ) => Promise<{ status: number; headers?: Record<string, any>; data?: any }>;
+  }
+): Promise<DiagnosticDirectInboundProbeResult> => {
+  const normalizedId = Number(inboundId);
+  const startedAt = Date.now();
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+    return {
+      inboundId: Number.isFinite(normalizedId) ? normalizedId : 0,
+      outcome: 'invalid_response',
+      latencyMs: 0,
+      httpStatus: null,
+      hasObj: false,
+      clientCount: null,
+      errorCode: 'panel_invalid_response',
+    };
+  }
+
+  const res = await executeReadOnlyDiagnosticPanelGet({
+    endpoint: `/panel/api/inbounds/get/${normalizedId}`,
+    timeoutMs: options?.timeoutMs ?? 4000,
+    signal: options?.signal,
+    dbClient: options?.dbClient,
+    sessionState: options?.sessionState,
+    authHooks: options?.authHooks,
+    requestGetFn: options?.requestGetFn,
+  });
+  const latencyMs = Math.max(0, Date.now() - startedAt);
+
+  if (!res.ok) {
+    let outcome: DiagnosticDirectInboundOutcome = 'network_error';
+    if (res.errorCode === 'panel_timeout' || res.errorCode === 'diagnostic_deadline_exceeded') {
+      outcome = 'timeout';
+    } else if (res.errorCode === 'diagnostic_aborted') {
+      outcome = 'aborted';
+    } else if (res.errorCode === 'panel_auth_failed') {
+      outcome = 'auth_failed';
+    } else if (res.errorCode === 'panel_http_4xx') {
+      outcome = 'http_4xx';
+    } else if (res.errorCode === 'panel_http_5xx') {
+      outcome = 'http_5xx';
+    } else if (res.errorCode === 'panel_invalid_response') {
+      outcome = 'invalid_response';
+    }
+    return {
+      inboundId: normalizedId,
+      outcome,
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: false,
+      clientCount: null,
+      errorCode: res.errorCode,
+    };
+  }
+
+  const payload = res.data;
+  if (!payload || typeof payload !== 'object') {
+    return {
+      inboundId: normalizedId,
+      outcome: 'invalid_response',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: false,
+      clientCount: null,
+      errorCode: 'panel_invalid_response',
+    };
+  }
+  if (payload.success === false) {
+    return {
+      inboundId: normalizedId,
+      outcome: 'http_200_null_or_empty_obj',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: false,
+      clientCount: null,
+      errorCode: 'panel_rejected_response',
+    };
+  }
+
+  const inbound = 'obj' in payload ? payload.obj : payload;
+  if (inbound === null || inbound === undefined || (typeof inbound === 'object' && Object.keys(inbound).length === 0)) {
+    return {
+      inboundId: normalizedId,
+      outcome: 'http_200_null_or_empty_obj',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: false,
+      clientCount: null,
+      errorCode: 'panel_null_or_empty_obj',
+    };
+  }
+  if (typeof inbound !== 'object') {
+    return {
+      inboundId: normalizedId,
+      outcome: 'invalid_response',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: false,
+      clientCount: null,
+      errorCode: 'panel_invalid_response',
+    };
+  }
+  if (Number(inbound.id) !== normalizedId) {
+    return {
+      inboundId: normalizedId,
+      outcome: 'inbound_id_mismatch',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: true,
+      clientCount: null,
+      errorCode: 'panel_inbound_id_mismatch',
+    };
+  }
+
+  const parsed = parseInboundSettingsClientsStrict(inbound);
+  if (!parsed.ok) {
+    return {
+      inboundId: normalizedId,
+      outcome: 'malformed_settings_clients',
+      latencyMs,
+      httpStatus: res.status,
+      hasObj: true,
+      clientCount: null,
+      errorCode: 'panel_malformed_inbound',
+    };
+  }
+
+  return {
+    inboundId: normalizedId,
+    outcome: 'ok_valid_inbound',
+    latencyMs,
+    httpStatus: res.status,
+    hasObj: true,
+    clientCount: parsed.clients.length,
+    errorCode: null,
+  };
+};
+
+
 
 
 

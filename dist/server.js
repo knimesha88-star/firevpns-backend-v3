@@ -10613,7 +10613,231 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
     }
   );
 }
-var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, cachedInboundsPanelIdentity, lastInboundsCacheTime, isCacheRefreshing, inboundsCacheGeneration, lastFailedInboundsAt, FAILED_INBOUNDS_COOLDOWN_MS, inboundsInFlight, getInboundsSnapshotTimestamp, getXuiAuthTimeoutMs, getXuiSingleInboundTimeoutMs, getXuiFullListTimeoutMs, cachedXuiConfig, xuiConfigGeneration, xuiConfigInFlight, XUI_CONFIG_TTL_MS, MAX_XUI_AUTH_SCOPE_ENTRIES, MAX_XUI_PANEL_CAPABILITY_ENTRIES, MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES, maxXuiAuthScopeEntriesOverride, maxClientTrafficMutationStateEntriesOverride, getEffectiveMaxXuiAuthScopeEntries, getEffectiveMaxClientTrafficMutationStateEntries, setBoundedMapEntry, cachedXuiAuthByScope, xuiAuthGenerationByScope, globalXuiAuthEpoch, minValidAuthGenerationFloor, nextMonotonicAuthGeneration, xuiAuthInFlight, rememberedLoginEndpointByPanel, confirmedUnsupportedCsrfByPanel, XUI_AUTH_TTL_MS, setScopeAuthGenerationEntry, getScopeAuthGeneration, ensureScopeAuthGeneration, bumpScopeAuthGeneration, clientTrafficMutationStateByUuid, globalTrafficMutationEpoch, maxEvictedTrafficMutationEpoch, clientTrafficInvalidationListeners, getClientTrafficMutationState, getTrafficMutationEpochSnapshot, registerClientTrafficCacheInvalidator, unregisterClientTrafficCacheInvalidator, notifyClientTrafficInvalidated, invalidateXuiConfigCache, invalidateXuiAuthCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, computeXuiCredentialScopeKey, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, clientProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isPanelDeletionSyncFlagEnabled, getPanelDeletionSyncIntervalMs, getPanelDeletionSyncMaxDeletesPerCycle, getPanelDeletionSyncMaxMissingRatio, isMissingSchemaOrRpcError, isTransientLockReleaseError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, isPanelDeletionSyncInProgress, lastPanelDeletionSyncAt, PANEL_DELETION_SYNC_LEASE_KEY, PANEL_DELETION_SYNC_INSTANCE_ID, applySettingsLeaseCasFilters, acquireCrossInstanceDeletionSyncLease, renewCrossInstanceDeletionSyncLease, verifyCrossInstanceDeletionSyncLeaseOwnership, releaseCrossInstanceDeletionSyncLease, triggerPanelDeletionSyncIfNeeded, triggerBackgroundSyncIfNeeded, startBackgroundSyncScheduler, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, fetchAllTableRowsByPrimaryKeyCursor, evaluateSnapshotMassAbsenceCircuitBreaker, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, isDefinitivePreCommitDeletionRpcError, isAmbiguousDeletionRpcError, runWithStrictTimeout, reconcileClientPanelDeletionState, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic;
+function classifyDiagnosticAbortSignalReason(signal) {
+  const reasonMsg = String(signal?.reason?.message || signal?.reason || "").toLowerCase();
+  if (reasonMsg.includes("deadline")) {
+    return "diagnostic_deadline_exceeded";
+  }
+  if (reasonMsg.includes("timeout")) {
+    return "panel_timeout";
+  }
+  return "diagnostic_aborted";
+}
+function createLinkedDiagnosticAbortController(timeoutMs, parentSignal) {
+  const controller = new AbortController();
+  let localTimedOut = false;
+  const onParentAbort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(parentSignal?.reason ?? new Error("diagnostic_aborted"));
+    }
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onParentAbort();
+    } else {
+      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
+  }
+  const effectiveMs = Math.max(10, Math.floor(timeoutMs));
+  const timer = setTimeout(() => {
+    localTimedOut = true;
+    if (!controller.signal.aborted) {
+      controller.abort(new Error("panel_timeout"));
+    }
+  }, effectiveMs);
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener("abort", onParentAbort);
+    }
+  };
+  return {
+    controller,
+    cleanup,
+    timedOut: () => localTimedOut
+  };
+}
+function classifyDiagnosticAxiosError(err, signal) {
+  if (signal?.aborted) {
+    return classifyDiagnosticAbortSignalReason(signal);
+  }
+  const code = String(err?.code || "").toUpperCase();
+  const name = String(err?.name || "").toLowerCase();
+  const msg = String(err?.message || "").toLowerCase();
+  const status = Number(err?.response?.status ?? err?.statusCode ?? 0);
+  if (code === "ERR_CANCELED" || name === "cancelederror" || name === "aborterror") {
+    return "diagnostic_aborted";
+  }
+  if (code === "ECONNABORTED" || code === "ETIMEDOUT" || msg.includes("timeout") || msg.includes("timed out")) {
+    return "panel_timeout";
+  }
+  if (status === 401 || status === 403 || msg.includes("auth") || msg.includes("login")) {
+    return "panel_auth_failed";
+  }
+  if (status >= 400 && status < 500) {
+    return "panel_http_4xx";
+  }
+  if (status >= 500 && status < 600) {
+    return "panel_http_5xx";
+  }
+  return "panel_network_error";
+}
+async function executeReadOnlyDiagnosticPanelGet(params) {
+  const { endpoint, signal, dbClient, sessionState, authHooks, requestGetFn } = params;
+  const effectiveTimeoutMs = Math.max(200, Math.min(Math.floor(params.timeoutMs || 7e3), 15e3));
+  const deadlineMs = Date.now() + effectiveTimeoutMs;
+  const checkBudget = (minRequiredMs = 60) => {
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        remainingMs: 0,
+        errorCode: classifyDiagnosticAbortSignalReason(signal)
+      };
+    }
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs < minRequiredMs) {
+      return { ok: false, remainingMs: 0, errorCode: "panel_timeout" };
+    }
+    return { ok: true, remainingMs, errorCode: null };
+  };
+  const cfgBudget = checkBudget(80);
+  if (!cfgBudget.ok) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: cfgBudget.errorCode || "panel_timeout",
+      status: null,
+      panelIdentity: null
+    };
+  }
+  const cfgRes = await resolveDiagnosticXuiConfigReadOnly({
+    timeoutMs: cfgBudget.remainingMs,
+    signal,
+    dbClient,
+    sessionState
+  });
+  if (!cfgRes.ok || !cfgRes.config || !cfgRes.panelIdentity) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: cfgRes.errorCode || "panel_config_unavailable",
+      status: null,
+      panelIdentity: cfgRes.panelIdentity
+    };
+  }
+  const config = cfgRes.config;
+  const panelIdentity = cfgRes.panelIdentity;
+  const authBudget = checkBudget(80);
+  if (!authBudget.ok) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: authBudget.errorCode || "panel_timeout",
+      status: null,
+      panelIdentity
+    };
+  }
+  const authRes = await acquireDiagnosticXuiAuthHeadersReadOnly(config, {
+    forceFreshLogin: false,
+    timeoutMs: authBudget.remainingMs,
+    signal,
+    sessionState,
+    authHooks
+  });
+  if (!authRes.ok || !authRes.headers) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: authRes.errorCode || "panel_auth_failed",
+      status: null,
+      panelIdentity
+    };
+  }
+  let headers = authRes.headers;
+  const { baseUrl, fullPath } = getApiEndpointUrl(config.panelUrl, endpoint);
+  const performGet = async (reqHeaders) => {
+    const httpBudget = checkBudget(60);
+    if (!httpBudget.ok) {
+      const code = httpBudget.errorCode || "panel_timeout";
+      const err = new Error(code);
+      err.code = code === "panel_timeout" ? "ETIMEDOUT" : "ERR_CANCELED";
+      throw err;
+    }
+    if (requestGetFn) {
+      return requestGetFn(fullPath, reqHeaders, httpBudget.remainingMs, signal);
+    }
+    const client = createAxiosInstance(baseUrl, httpBudget.remainingMs);
+    return client.request({
+      url: fullPath,
+      method: "GET",
+      headers: reqHeaders,
+      timeout: httpBudget.remainingMs,
+      signal
+    });
+  };
+  try {
+    let response = await performGet(headers);
+    const locationHeader = String(
+      response?.headers?.location || response?.headers?.Location || ""
+    ).toLowerCase();
+    const isUnauth = response.status === 401 || response.status === 403 || (response.status === 302 || response.status === 307) && /(?:^|\/)(?:login|auth)(?:[/?#]|$)|login|signin/i.test(locationHeader);
+    if (isUnauth) {
+      const reauthBudget = checkBudget(100);
+      if (!reauthBudget.ok) {
+        return {
+          ok: false,
+          data: null,
+          errorCode: reauthBudget.errorCode || "panel_timeout",
+          status: response.status,
+          panelIdentity
+        };
+      }
+      if (sessionState) {
+        sessionState.headers = null;
+      }
+      const reauthRes = await acquireDiagnosticXuiAuthHeadersReadOnly(config, {
+        forceFreshLogin: true,
+        timeoutMs: reauthBudget.remainingMs,
+        signal,
+        sessionState,
+        authHooks
+      });
+      if (!reauthRes.ok || !reauthRes.headers) {
+        return {
+          ok: false,
+          data: null,
+          errorCode: reauthRes.errorCode || "panel_auth_failed",
+          status: response.status,
+          panelIdentity
+        };
+      }
+      headers = reauthRes.headers;
+      response = await performGet(headers);
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, data: null, errorCode: "panel_auth_failed", status: response.status, panelIdentity };
+    }
+    if (response.status >= 400 && response.status < 500) {
+      return { ok: false, data: null, errorCode: "panel_http_4xx", status: response.status, panelIdentity };
+    }
+    if (response.status >= 500) {
+      return { ok: false, data: null, errorCode: "panel_http_5xx", status: response.status, panelIdentity };
+    }
+    if (response.status !== 200) {
+      return { ok: false, data: null, errorCode: "panel_invalid_response", status: response.status, panelIdentity };
+    }
+    return { ok: true, status: response.status, data: response.data, panelIdentity, errorCode: null };
+  } catch (err) {
+    return {
+      ok: false,
+      data: null,
+      errorCode: classifyDiagnosticAxiosError(err, signal),
+      status: Number(err?.response?.status) || null,
+      panelIdentity
+    };
+  }
+}
+var TRIAL_GRACE_PERIOD_MINUTES, TRIAL_GRACE_PERIOD_MS, cachedInbounds, cachedInboundsPanelIdentity, lastInboundsCacheTime, isCacheRefreshing, inboundsCacheGeneration, lastFailedInboundsAt, FAILED_INBOUNDS_COOLDOWN_MS, inboundsInFlight, getInboundsSnapshotTimestamp, getXuiAuthTimeoutMs, getXuiSingleInboundTimeoutMs, getXuiFullListTimeoutMs, cachedXuiConfig, xuiConfigGeneration, xuiConfigInFlight, XUI_CONFIG_TTL_MS, MAX_XUI_AUTH_SCOPE_ENTRIES, MAX_XUI_PANEL_CAPABILITY_ENTRIES, MAX_CLIENT_TRAFFIC_MUTATION_STATE_ENTRIES, maxXuiAuthScopeEntriesOverride, maxClientTrafficMutationStateEntriesOverride, getEffectiveMaxXuiAuthScopeEntries, getEffectiveMaxClientTrafficMutationStateEntries, setBoundedMapEntry, cachedXuiAuthByScope, xuiAuthGenerationByScope, globalXuiAuthEpoch, minValidAuthGenerationFloor, nextMonotonicAuthGeneration, xuiAuthInFlight, rememberedLoginEndpointByPanel, confirmedUnsupportedCsrfByPanel, XUI_AUTH_TTL_MS, setScopeAuthGenerationEntry, getScopeAuthGeneration, ensureScopeAuthGeneration, bumpScopeAuthGeneration, clientTrafficMutationStateByUuid, globalTrafficMutationEpoch, maxEvictedTrafficMutationEpoch, clientTrafficInvalidationListeners, getClientTrafficMutationState, getTrafficMutationEpochSnapshot, registerClientTrafficCacheInvalidator, unregisterClientTrafficCacheInvalidator, notifyClientTrafficInvalidated, invalidateXuiConfigCache, invalidateXuiAuthCache, validateXuiPanelUrl, computePanelIdentity, getCurrentPanelIdentity, getXuiConfig, getMaskedXuiSettings, parseUrl, getApiEndpointUrl, logAxiosError, allowInsecureTls, sharedHttpsAgent, createAxiosInstance, computeXuiCredentialScopeKey, getXuiAuthHeaders, requestApi, testApiConnection, getInbounds, LIVE_INBOUND_CACHE_TTL_MS, liveInboundCache, liveInboundInFlight, liveInboundCacheGeneration, invalidateInboundCache, getLiveInbound, getClientByEmail, getSystemStatus, getClientExpiry, addCalendarMonths, updateClientExpiry, findProvisioningTemplate, formatClientRemark, buildVlessLink, activeProvisionings, inboundProcessQueues, clientProcessQueues, DEFAULT_LOCK_LEASE_SECONDS, INBOUND_LOCK_LEASE_SECONDS, isAutoActivateNewOrdersFlagEnabled, isAutoActivateRenewalsFlagEnabled, isPanelDeletionSyncFlagEnabled, getPanelDeletionSyncIntervalMs, getPanelDeletionSyncMaxDeletesPerCycle, getPanelDeletionSyncMaxMissingRatio, isMissingSchemaOrRpcError, isTransientLockReleaseError, provisionOrderClient, revokeProvisionalOrderClient, disable3XUiClient, lastCleanupTime, cleanupExpiredTrials, setCachedInbounds, getCachedInbounds, isSyncInProgress, lastSyncAt, isPanelDeletionSyncInProgress, lastPanelDeletionSyncAt, PANEL_DELETION_SYNC_LEASE_KEY, PANEL_DELETION_SYNC_INSTANCE_ID, applySettingsLeaseCasFilters, acquireCrossInstanceDeletionSyncLease, renewCrossInstanceDeletionSyncLease, verifyCrossInstanceDeletionSyncLeaseOwnership, releaseCrossInstanceDeletionSyncLease, triggerPanelDeletionSyncIfNeeded, triggerBackgroundSyncIfNeeded, startBackgroundSyncScheduler, runBackgroundSync, parseInboundSettingsClientsStrict, fetchUncachedLiveInboundsList, verifyRecordPanelIdentity, fetchAllTableRowsByPrimaryKeyCursor, evaluateSnapshotMassAbsenceCircuitBreaker, loadConfiguredXuiServers, recordDeduplicatedSyncAuditLog, isDefinitivePreCommitDeletionRpcError, isAmbiguousDeletionRpcError, runWithStrictTimeout, reconcileClientPanelDeletionState, verifyAndMarkClientDeletedIfConfirmed, isSafeToRestoreActiveStatus, syncDeleted3XUiClients, resetClientTraffic, createDiagnosticIsolatedSessionState, resolveDiagnosticXuiConfigReadOnly, acquireDiagnosticXuiAuthHeadersReadOnly, fetchReadOnlyDiagnosticInboundsList, probeDirectLiveInboundReadOnly;
 var init_xuiService = __esm({
   "src/api/services/xuiService.ts"() {
     "use strict";
@@ -15405,10 +15629,10 @@ var init_xuiService = __esm({
         };
       }
       const nowMs = params.nowMs ?? Date.now();
-      const RECENT_PROVISION_GRACE_MS = 60 * 1e3;
+      const RECENT_PROVISION_GRACE_MS2 = 60 * 1e3;
       if (params.createdAt) {
         const createdAtMs = new Date(params.createdAt).getTime();
-        if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS) {
+        if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS2) {
           return {
             confirmedDeleted: false,
             dbWrites: 0,
@@ -16371,7 +16595,7 @@ var init_xuiService = __esm({
           }
         }
         const nowIso = new Date(nowMs).toISOString();
-        const RECENT_PROVISION_GRACE_MS = 60 * 1e3;
+        const RECENT_PROVISION_GRACE_MS2 = 60 * 1e3;
         let totalTrackedNonDeleted = 0;
         const trackedNonDeletedUuids = /* @__PURE__ */ new Set();
         const snapshot1MissingCandidates = [];
@@ -16572,7 +16796,7 @@ var init_xuiService = __esm({
           }
           if (group.createdAt) {
             const createdAtMs = new Date(group.createdAt).getTime();
-            if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS) {
+            if (!Number.isNaN(createdAtMs) && nowMs - createdAtMs < RECENT_PROVISION_GRACE_MS2) {
               skippedCount += 1;
               details.push({
                 clientUuid: group.clientUuid,
@@ -17229,6 +17453,631 @@ var init_xuiService = __esm({
         }
       }
       return resetResult;
+    };
+    createDiagnosticIsolatedSessionState = () => ({
+      config: null,
+      panelIdentity: null,
+      scopeKey: null,
+      headers: null,
+      inFlightAuth: null
+    });
+    resolveDiagnosticXuiConfigReadOnly = async (options) => {
+      const signal = options?.signal;
+      const sessionState = options?.sessionState;
+      if (signal?.aborted) {
+        return {
+          ok: false,
+          config: null,
+          panelIdentity: null,
+          errorCode: classifyDiagnosticAbortSignalReason(signal)
+        };
+      }
+      const effectiveTimeoutMs = Math.max(50, Math.min(Math.floor(options?.timeoutMs ?? 4e3), 15e3));
+      if (sessionState?.config) {
+        const pid = sessionState.panelIdentity || computePanelIdentity(sessionState.config.panelUrl);
+        if (pid) {
+          return {
+            ok: true,
+            config: { ...sessionState.config },
+            panelIdentity: pid,
+            errorCode: null
+          };
+        }
+      }
+      if (!options?.bypassWarmCache && cachedXuiConfig && cachedXuiConfig.expiresAt > Date.now()) {
+        const warmCfg = { ...cachedXuiConfig.config };
+        const pid = computePanelIdentity(warmCfg.panelUrl);
+        if (pid) {
+          if (sessionState) {
+            sessionState.config = { ...warmCfg };
+            sessionState.panelIdentity = pid;
+          }
+          return {
+            ok: true,
+            config: warmCfg,
+            panelIdentity: pid,
+            errorCode: null
+          };
+        }
+      }
+      const db = options?.dbClient || supabaseAdmin || supabase;
+      if (!db || typeof db.from !== "function") {
+        return {
+          ok: false,
+          config: null,
+          panelIdentity: null,
+          errorCode: "panel_config_unavailable"
+        };
+      }
+      const linked = createLinkedDiagnosticAbortController(effectiveTimeoutMs, signal);
+      try {
+        let query = db.from("settings").select("id, data").eq("id", "xui");
+        if (typeof query.abortSignal === "function") {
+          query = query.abortSignal(linked.controller.signal);
+        }
+        if (typeof query.maybeSingle === "function") {
+          query = query.maybeSingle();
+        }
+        const res = await query;
+        if (signal?.aborted) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: classifyDiagnosticAbortSignalReason(signal)
+          };
+        }
+        if (linked.timedOut() || linked.controller.signal.aborted) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: linked.timedOut() ? "panel_timeout" : "diagnostic_aborted"
+          };
+        }
+        if (res?.error) {
+          const errMsg = String(res.error?.message || "").toLowerCase();
+          if (errMsg.includes("abort") || errMsg.includes("cancel")) {
+            return {
+              ok: false,
+              config: null,
+              panelIdentity: null,
+              errorCode: linked.timedOut() ? "panel_timeout" : classifyDiagnosticAbortSignalReason(signal)
+            };
+          }
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: "panel_config_unavailable"
+          };
+        }
+        const doc = res?.data;
+        const data = doc && typeof doc.data === "object" && doc.data !== null ? doc.data : {};
+        const panelUrl = String(data.panelUrl || process.env.XUI_PANEL_URL || "").trim();
+        const username = String(data.username || process.env.XUI_USERNAME || "admin").trim();
+        const password = String(
+          data.password || data.apiToken || process.env.XUI_PASSWORD || process.env.XUI_API_TOKEN || ""
+        ).trim();
+        const apiToken = String(data.apiToken || process.env.XUI_API_TOKEN || password).trim();
+        if (!panelUrl) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: "panel_config_unavailable"
+          };
+        }
+        try {
+          validateXuiPanelUrl(panelUrl);
+        } catch {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: "panel_config_unavailable"
+          };
+        }
+        const panelIdentity = computePanelIdentity(panelUrl);
+        if (!panelIdentity) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: "panel_config_unavailable"
+          };
+        }
+        const resolvedConfig = {
+          panelUrl,
+          username,
+          password,
+          apiToken,
+          panelName: String(data.panelName || "Primary Node")
+        };
+        if (sessionState) {
+          sessionState.config = { ...resolvedConfig };
+          sessionState.panelIdentity = panelIdentity;
+        }
+        return {
+          ok: true,
+          config: resolvedConfig,
+          panelIdentity,
+          errorCode: null
+        };
+      } catch (err) {
+        if (signal?.aborted) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: classifyDiagnosticAbortSignalReason(signal)
+          };
+        }
+        if (linked.timedOut()) {
+          return {
+            ok: false,
+            config: null,
+            panelIdentity: null,
+            errorCode: "panel_timeout"
+          };
+        }
+        const errCode = classifyDiagnosticAxiosError(err, signal);
+        return {
+          ok: false,
+          config: null,
+          panelIdentity: null,
+          errorCode: errCode === "diagnostic_aborted" || errCode === "diagnostic_deadline_exceeded" || errCode === "panel_timeout" ? errCode : "panel_config_unavailable"
+        };
+      } finally {
+        linked.cleanup();
+      }
+    };
+    acquireDiagnosticXuiAuthHeadersReadOnly = async (config, options) => {
+      const signal = options?.signal;
+      const forceFreshLogin = options?.forceFreshLogin === true;
+      const sessionState = options?.sessionState;
+      const authHooks = options?.authHooks;
+      if (signal?.aborted) {
+        return {
+          ok: false,
+          headers: null,
+          errorCode: classifyDiagnosticAbortSignalReason(signal),
+          source: "failed"
+        };
+      }
+      const { panelIdentity, scopeKey } = computeXuiCredentialScopeKey(config);
+      if (!forceFreshLogin && sessionState?.headers && sessionState.scopeKey === scopeKey) {
+        return {
+          ok: true,
+          headers: { ...sessionState.headers },
+          errorCode: null,
+          source: "diagnostic_run_cache"
+        };
+      }
+      if (!forceFreshLogin) {
+        const hasExistingScopeGen = xuiAuthGenerationByScope.has(scopeKey);
+        const currentScopeGen = hasExistingScopeGen ? xuiAuthGenerationByScope.get(scopeKey) : -1;
+        const sharedCached = cachedXuiAuthByScope.get(scopeKey);
+        if (hasExistingScopeGen && sharedCached && sharedCached.generation === currentScopeGen && sharedCached.generation >= globalXuiAuthEpoch && sharedCached.expiresAt > Date.now()) {
+          const copied = { ...sharedCached.headers };
+          if (sessionState) {
+            sessionState.scopeKey = scopeKey;
+            sessionState.headers = { ...copied };
+          }
+          return {
+            ok: true,
+            headers: copied,
+            errorCode: null,
+            source: "shared_cache_readonly"
+          };
+        }
+        if (sessionState?.inFlightAuth && sessionState.scopeKey === scopeKey) {
+          const existingRes = await sessionState.inFlightAuth;
+          if (existingRes.ok && existingRes.headers) {
+            return {
+              ok: true,
+              headers: { ...existingRes.headers },
+              errorCode: null,
+              source: "diagnostic_run_cache"
+            };
+          }
+          return {
+            ok: false,
+            headers: null,
+            errorCode: existingRes.errorCode || "panel_auth_failed",
+            source: "failed"
+          };
+        }
+      }
+      const username = config.username || "admin";
+      const password = config.password || config.apiToken;
+      if (!password) {
+        return {
+          ok: false,
+          headers: null,
+          errorCode: "panel_auth_failed",
+          source: "failed"
+        };
+      }
+      const runIsolatedLogin = async () => {
+        const authTimeoutMs = Math.max(
+          100,
+          Math.min(
+            Number.isFinite(options?.timeoutMs) && options?.timeoutMs > 0 ? Math.floor(options.timeoutMs) : getXuiAuthTimeoutMs(),
+            12e3
+          )
+        );
+        const authDeadlineMs = Date.now() + authTimeoutMs;
+        const linked = createLinkedDiagnosticAbortController(authTimeoutMs, signal);
+        try {
+          const { baseUrl } = parseUrl(config.panelUrl);
+          const client = authHooks?.loginPostFn && authHooks?.csrfGetFn ? null : createAxiosInstance(baseUrl, authTimeoutMs);
+          const headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "X-Requested-With": "XMLHttpRequest"
+          };
+          const defaultLoginEndpoints = ["/login", "/panel/login"];
+          const rememberedEndpoint = rememberedLoginEndpointByPanel.get(panelIdentity);
+          const loginEndpoints = rememberedEndpoint && defaultLoginEndpoints.includes(rememberedEndpoint) ? [rememberedEndpoint, ...defaultLoginEndpoints.filter((ep) => ep !== rememberedEndpoint)] : defaultLoginEndpoints;
+          let cookieHeader = "";
+          let lastLoginErr = null;
+          for (let idx = 0; idx < loginEndpoints.length; idx++) {
+            if (signal?.aborted) {
+              return {
+                ok: false,
+                headers: null,
+                errorCode: classifyDiagnosticAbortSignalReason(signal)
+              };
+            }
+            if (linked.controller.signal.aborted) {
+              return {
+                ok: false,
+                headers: null,
+                errorCode: linked.timedOut() ? "panel_timeout" : "diagnostic_aborted"
+              };
+            }
+            const loginEp = loginEndpoints[idx];
+            const remainingBeforeLoginMs = authDeadlineMs - Date.now();
+            if (remainingBeforeLoginMs <= 40) {
+              break;
+            }
+            const endpointsRemaining = loginEndpoints.length - idx;
+            const attemptTimeoutMs = endpointsRemaining > 1 ? Math.max(60, Math.min(remainingBeforeLoginMs, Math.floor(authTimeoutMs * 0.6))) : Math.max(60, remainingBeforeLoginMs);
+            try {
+              const { fullPath } = getApiEndpointUrl(config.panelUrl, loginEp);
+              const body = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+              const reqHeaders = {
+                ...headers,
+                "Content-Type": "application/x-www-form-urlencoded"
+              };
+              const res = authHooks?.loginPostFn ? await authHooks.loginPostFn(fullPath, body, reqHeaders, attemptTimeoutMs, linked.controller.signal) : await client.post(fullPath, body, {
+                headers: reqHeaders,
+                timeout: attemptTimeoutMs,
+                signal: linked.controller.signal
+              });
+              const setCookie = res.headers?.["set-cookie"];
+              const loginPayloadOk = !res.data || res.data.success !== false;
+              if (res.status >= 200 && res.status < 400 && loginPayloadOk && setCookie && Array.isArray(setCookie) && setCookie.length > 0) {
+                cookieHeader = setCookie.map((c) => c.split(";")[0]).join("; ");
+                break;
+              }
+            } catch (loginErr) {
+              lastLoginErr = loginErr;
+              if (signal?.aborted || linked.controller.signal.aborted) {
+                return {
+                  ok: false,
+                  headers: null,
+                  errorCode: signal?.aborted ? classifyDiagnosticAbortSignalReason(signal) : linked.timedOut() ? "panel_timeout" : "diagnostic_aborted"
+                };
+              }
+            }
+          }
+          if (signal?.aborted) {
+            return {
+              ok: false,
+              headers: null,
+              errorCode: classifyDiagnosticAbortSignalReason(signal)
+            };
+          }
+          if (linked.timedOut()) {
+            return {
+              ok: false,
+              headers: null,
+              errorCode: "panel_timeout"
+            };
+          }
+          if (!cookieHeader && lastLoginErr && Date.now() >= authDeadlineMs) {
+            const code = classifyDiagnosticAxiosError(lastLoginErr, signal);
+            return {
+              ok: false,
+              headers: null,
+              errorCode: code === "panel_network_error" ? "panel_auth_failed" : code
+            };
+          }
+          if (cookieHeader) {
+            headers["Cookie"] = cookieHeader;
+          }
+          headers["Authorization"] = `Bearer ${password}`;
+          const confirmedUnsupported = confirmedUnsupportedCsrfByPanel.get(panelIdentity);
+          const currentScopeGen = xuiAuthGenerationByScope.get(scopeKey);
+          const shouldSkipCsrf = Boolean(
+            !forceFreshLogin && confirmedUnsupported && currentScopeGen !== void 0 && confirmedUnsupported.scopeKey === scopeKey && confirmedUnsupported.generation === currentScopeGen
+          );
+          const remainingForCsrfMs = authDeadlineMs - Date.now();
+          if (!shouldSkipCsrf && remainingForCsrfMs > 60 && !linked.controller.signal.aborted) {
+            try {
+              const csrfTimeoutMs = Math.max(60, Math.min(2500, remainingForCsrfMs));
+              const { fullPath: csrfPath } = getApiEndpointUrl(config.panelUrl, "/csrf-token");
+              const csrfRes = authHooks?.csrfGetFn ? await authHooks.csrfGetFn(csrfPath, headers, csrfTimeoutMs, linked.controller.signal) : await client.get(csrfPath, {
+                headers,
+                timeout: csrfTimeoutMs,
+                signal: linked.controller.signal
+              });
+              if (csrfRes.status !== 404 && csrfRes.status !== 405 && csrfRes.status !== 501) {
+                if (csrfRes.data?.obj) {
+                  headers["X-CSRF-Token"] = csrfRes.data.obj;
+                }
+                if (Array.isArray(csrfRes.headers?.["set-cookie"]) && csrfRes.headers["set-cookie"].length > 0) {
+                  const csrfCookie = csrfRes.headers["set-cookie"].map((c) => c.split(";")[0]).join("; ");
+                  headers["Cookie"] = headers["Cookie"] ? `${headers["Cookie"]}; ${csrfCookie}` : csrfCookie;
+                }
+              }
+            } catch {
+              if (signal?.aborted) {
+                return {
+                  ok: false,
+                  headers: null,
+                  errorCode: classifyDiagnosticAbortSignalReason(signal)
+                };
+              }
+            }
+          }
+          if (signal?.aborted) {
+            return {
+              ok: false,
+              headers: null,
+              errorCode: classifyDiagnosticAbortSignalReason(signal)
+            };
+          }
+          if (sessionState && cookieHeader) {
+            sessionState.scopeKey = scopeKey;
+            sessionState.headers = { ...headers };
+          }
+          return {
+            ok: true,
+            headers: { ...headers },
+            errorCode: null
+          };
+        } catch (err) {
+          const code = classifyDiagnosticAxiosError(err, signal);
+          return {
+            ok: false,
+            headers: null,
+            errorCode: code === "panel_network_error" ? "panel_auth_failed" : code
+          };
+        } finally {
+          linked.cleanup();
+        }
+      };
+      if (sessionState && !forceFreshLogin) {
+        sessionState.scopeKey = scopeKey;
+        const promise = runIsolatedLogin();
+        sessionState.inFlightAuth = promise;
+        try {
+          const result2 = await promise;
+          return {
+            ok: result2.ok,
+            headers: result2.headers ? { ...result2.headers } : null,
+            errorCode: result2.errorCode,
+            source: result2.ok ? "isolated_diagnostic_login" : "failed"
+          };
+        } finally {
+          if (sessionState.inFlightAuth === promise) {
+            sessionState.inFlightAuth = null;
+          }
+        }
+      }
+      const result = await runIsolatedLogin();
+      return {
+        ok: result.ok,
+        headers: result.headers ? { ...result.headers } : null,
+        errorCode: result.errorCode,
+        source: result.ok ? "isolated_diagnostic_login" : "failed"
+      };
+    };
+    fetchReadOnlyDiagnosticInboundsList = async (options) => {
+      const startedAt = Date.now();
+      const res = await executeReadOnlyDiagnosticPanelGet({
+        endpoint: "/panel/api/inbounds/list",
+        timeoutMs: options?.timeoutMs ?? 7e3,
+        signal: options?.signal,
+        dbClient: options?.dbClient,
+        sessionState: options?.sessionState,
+        authHooks: options?.authHooks,
+        requestGetFn: options?.requestGetFn
+      });
+      const latencyMs = Math.max(0, Date.now() - startedAt);
+      if (!res.ok) {
+        return {
+          ok: false,
+          inbounds: [],
+          latencyMs,
+          panelIdentity: res.panelIdentity,
+          errorCode: res.errorCode
+        };
+      }
+      const payload = res.data;
+      if (!payload || typeof payload !== "object") {
+        return {
+          ok: false,
+          inbounds: [],
+          latencyMs,
+          panelIdentity: res.panelIdentity,
+          errorCode: "panel_invalid_response"
+        };
+      }
+      if (payload.success === false) {
+        return {
+          ok: false,
+          inbounds: [],
+          latencyMs,
+          panelIdentity: res.panelIdentity,
+          errorCode: "panel_rejected_response"
+        };
+      }
+      if (!Array.isArray(payload.obj)) {
+        return {
+          ok: false,
+          inbounds: [],
+          latencyMs,
+          panelIdentity: res.panelIdentity,
+          errorCode: "panel_non_array_response"
+        };
+      }
+      if (payload.obj.length === 0) {
+        return {
+          ok: false,
+          inbounds: [],
+          latencyMs,
+          panelIdentity: res.panelIdentity,
+          errorCode: "panel_empty_inbounds"
+        };
+      }
+      return {
+        ok: true,
+        inbounds: payload.obj,
+        latencyMs,
+        panelIdentity: res.panelIdentity,
+        errorCode: null
+      };
+    };
+    probeDirectLiveInboundReadOnly = async (inboundId, options) => {
+      const normalizedId = Number(inboundId);
+      const startedAt = Date.now();
+      if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+        return {
+          inboundId: Number.isFinite(normalizedId) ? normalizedId : 0,
+          outcome: "invalid_response",
+          latencyMs: 0,
+          httpStatus: null,
+          hasObj: false,
+          clientCount: null,
+          errorCode: "panel_invalid_response"
+        };
+      }
+      const res = await executeReadOnlyDiagnosticPanelGet({
+        endpoint: `/panel/api/inbounds/get/${normalizedId}`,
+        timeoutMs: options?.timeoutMs ?? 4e3,
+        signal: options?.signal,
+        dbClient: options?.dbClient,
+        sessionState: options?.sessionState,
+        authHooks: options?.authHooks,
+        requestGetFn: options?.requestGetFn
+      });
+      const latencyMs = Math.max(0, Date.now() - startedAt);
+      if (!res.ok) {
+        let outcome = "network_error";
+        if (res.errorCode === "panel_timeout" || res.errorCode === "diagnostic_deadline_exceeded") {
+          outcome = "timeout";
+        } else if (res.errorCode === "diagnostic_aborted") {
+          outcome = "aborted";
+        } else if (res.errorCode === "panel_auth_failed") {
+          outcome = "auth_failed";
+        } else if (res.errorCode === "panel_http_4xx") {
+          outcome = "http_4xx";
+        } else if (res.errorCode === "panel_http_5xx") {
+          outcome = "http_5xx";
+        } else if (res.errorCode === "panel_invalid_response") {
+          outcome = "invalid_response";
+        }
+        return {
+          inboundId: normalizedId,
+          outcome,
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: false,
+          clientCount: null,
+          errorCode: res.errorCode
+        };
+      }
+      const payload = res.data;
+      if (!payload || typeof payload !== "object") {
+        return {
+          inboundId: normalizedId,
+          outcome: "invalid_response",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: false,
+          clientCount: null,
+          errorCode: "panel_invalid_response"
+        };
+      }
+      if (payload.success === false) {
+        return {
+          inboundId: normalizedId,
+          outcome: "http_200_null_or_empty_obj",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: false,
+          clientCount: null,
+          errorCode: "panel_rejected_response"
+        };
+      }
+      const inbound = "obj" in payload ? payload.obj : payload;
+      if (inbound === null || inbound === void 0 || typeof inbound === "object" && Object.keys(inbound).length === 0) {
+        return {
+          inboundId: normalizedId,
+          outcome: "http_200_null_or_empty_obj",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: false,
+          clientCount: null,
+          errorCode: "panel_null_or_empty_obj"
+        };
+      }
+      if (typeof inbound !== "object") {
+        return {
+          inboundId: normalizedId,
+          outcome: "invalid_response",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: false,
+          clientCount: null,
+          errorCode: "panel_invalid_response"
+        };
+      }
+      if (Number(inbound.id) !== normalizedId) {
+        return {
+          inboundId: normalizedId,
+          outcome: "inbound_id_mismatch",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: true,
+          clientCount: null,
+          errorCode: "panel_inbound_id_mismatch"
+        };
+      }
+      const parsed = parseInboundSettingsClientsStrict(inbound);
+      if (!parsed.ok) {
+        return {
+          inboundId: normalizedId,
+          outcome: "malformed_settings_clients",
+          latencyMs,
+          httpStatus: res.status,
+          hasObj: true,
+          clientCount: null,
+          errorCode: "panel_malformed_inbound"
+        };
+      }
+      return {
+        inboundId: normalizedId,
+        outcome: "ok_valid_inbound",
+        latencyMs,
+        httpStatus: res.status,
+        hasObj: true,
+        clientCount: parsed.clients.length,
+        errorCode: null
+      };
     };
   }
 });
@@ -18467,6 +19316,12 @@ var webhookRateLimit = createRateLimiter({
   max: 60,
   keyPrefix: "webhook"
 });
+var adminDiagnosticRateLimit = createRateLimiter({
+  windowMs: 5 * 60 * 1e3,
+  max: 6,
+  keyPrefix: "admin_sync_diagnostics",
+  message: "Too many synchronization diagnostic requests. Please wait before running another diagnostic scan."
+});
 
 // src/api/routes/authRoutes.ts
 var router = Router();
@@ -19272,7 +20127,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
     err.retryable = true;
     return err;
   };
-  const isConfirmedMissingColumnError = (err, tableName, columnName) => {
+  const isConfirmedMissingColumnError2 = (err, tableName, columnName) => {
     if (!err) return false;
     const code = String(err?.code || "").trim().toUpperCase();
     const message = String(err?.message || err?.details || err?.hint || "").toLowerCase();
@@ -19381,7 +20236,7 @@ var getMyConfigs = async (uid, email, _token, options) => {
         throw createCustomerQueryFailureError("vpn_configs_customer_uid", byCustomerUidRes.error);
       }
       const userIdMissingColumnOnly = Boolean(
-        byUserIdRes?.error && isConfirmedMissingColumnError(byUserIdRes.error, "vpn_configs", "user_id")
+        byUserIdRes?.error && isConfirmedMissingColumnError2(byUserIdRes.error, "vpn_configs", "user_id")
       );
       if (byUserIdRes?.error && !userIdMissingColumnOnly) {
         throw createCustomerQueryFailureError("vpn_configs_user_id", byUserIdRes.error);
@@ -23614,6 +24469,2063 @@ var saveAdminAiSettingsHandler = async (req, res) => {
   }
 };
 
+// src/api/services/syncDiagnosticsService.ts
+init_supabase();
+init_xuiService();
+import crypto7 from "crypto";
+var DEFAULT_DIAGNOSTIC_BUDGET_MS = 16e3;
+var MAX_DIAGNOSTIC_BUDGET_MS = 19e3;
+var DEFAULT_REREAD_DELAY_MS = 150;
+var MAX_DIRECT_PROBE_CONCURRENCY = 2;
+var MAX_DIRECT_PROBE_INBOUNDS = 12;
+var CUSTOMER_LIVE_INBOUND_BUDGET_MS = 4e3;
+var RECENT_PROVISION_GRACE_MS = 60 * 1e3;
+function redactOwnerUid(rawUid) {
+  const norm = String(rawUid || "").trim().toLowerCase();
+  if (!norm) return "missing";
+  const digest = crypto7.createHash("sha256").update(norm).digest("hex").slice(0, 12);
+  return `owner:${digest}`;
+}
+function sanitizeInboundRemark(rawRemark) {
+  const cleaned = String(rawRemark ?? "").replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  return cleaned.slice(0, 64);
+}
+function sanitizeCsvCell(value) {
+  if (value === null || value === void 0) {
+    return '""';
+  }
+  const raw = String(value);
+  let normalized = raw.replace(/\r\n|\r|\n|\t/g, " ").replace(/[\u0000-\u001F\u007F]/g, "");
+  const trimmedLeading = normalized.replace(/^[\s\uFEFF\u200B-\u200D]+/, "");
+  if (trimmedLeading.length > 0 && /^[=+\-@|]/.test(trimmedLeading)) {
+    normalized = `'${normalized}`;
+  }
+  const escaped = normalized.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+function isConfirmedMissingColumnError(err) {
+  if (!err) return { missing: false, columnName: null };
+  const code = String(err?.code || "").toUpperCase();
+  const msg = String(err?.message || "");
+  const details = String(err?.details || "");
+  const combined = `${msg} ${details}`;
+  const isCodeMatch = code === "42703" || code === "PGRST204";
+  const pgMatch = combined.match(
+    /column\s+(?:[a-zA-Z0-9_."]+\.)?"?([a-zA-Z0-9_]+)"?(?:\s+of\s+relation\s+"?[a-zA-Z0-9_.]+"?)?\s+does\s+not\s+exist/i
+  );
+  const pgrstMatch = combined.match(/could\s+not\s+find\s+the\s+'([a-zA-Z0-9_]+)'\s+column/i);
+  if (pgMatch?.[1]) {
+    return { missing: true, columnName: pgMatch[1].toLowerCase() };
+  }
+  if (pgrstMatch?.[1]) {
+    return { missing: true, columnName: pgrstMatch[1].toLowerCase() };
+  }
+  if (isCodeMatch) {
+    return { missing: true, columnName: null };
+  }
+  return { missing: false, columnName: null };
+}
+function isMissingTableError(err) {
+  if (!err) return false;
+  const code = String(err?.code || "").toUpperCase();
+  const msg = String(err?.message || "").toLowerCase();
+  return code === "42P01" || code === "PGRST205" || msg.includes("relation") && msg.includes("does not exist") || msg.includes("could not find the table") && msg.includes("schema cache");
+}
+function sleepWithAbort(ms, signal) {
+  if (ms <= 0) return Promise.resolve(!signal?.aborted);
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+async function runBoundedConcurrency(items, maxConcurrency, worker) {
+  const results = new Array(items.length);
+  if (items.length === 0) return results;
+  const limit = Math.max(1, Math.min(Math.floor(maxConcurrency), items.length));
+  let nextIndex = 0;
+  const workers = Array.from({ length: limit }, async () => {
+    while (true) {
+      const current = nextIndex;
+      if (current >= items.length) break;
+      nextIndex += 1;
+      results[current] = await worker(items[current], current);
+    }
+  });
+  await Promise.allSettled(workers);
+  return results;
+}
+async function fetchDiagnosticTablePaginated(params) {
+  const {
+    dbClient,
+    table,
+    requiredColumns,
+    optionalColumns,
+    optionalTable = false,
+    pageSize,
+    deadlineMs,
+    signal,
+    applyFilters
+  } = params;
+  const pkCol = params.primaryKeyColumn || "id";
+  if (!dbClient || typeof dbClient.from !== "function") {
+    return {
+      ok: false,
+      rows: [],
+      missingTable: false,
+      missingOptionalColumns: [],
+      aborted: false,
+      deadlineExceeded: false
+    };
+  }
+  let activeOptional = [...optionalColumns];
+  const droppedOptional = [];
+  while (true) {
+    if (signal.aborted || Date.now() >= deadlineMs) {
+      const reasonMsg = String(signal?.reason?.message || "").toLowerCase();
+      return {
+        ok: false,
+        rows: [],
+        missingTable: false,
+        missingOptionalColumns: droppedOptional,
+        aborted: true,
+        deadlineExceeded: reasonMsg.includes("deadline") || Date.now() >= deadlineMs
+      };
+    }
+    const selectCols = [...requiredColumns, ...activeOptional].join(", ");
+    const allRows = [];
+    const seenIds = /* @__PURE__ */ new Set();
+    let lastCursorId = null;
+    let pagesFetched = 0;
+    const maxPages = 1e3;
+    let retryWithReducedColumns = false;
+    while (pagesFetched < maxPages) {
+      if (signal.aborted || Date.now() >= deadlineMs) {
+        const reasonMsg = String(signal?.reason?.message || "").toLowerCase();
+        return {
+          ok: false,
+          rows: [],
+          missingTable: false,
+          missingOptionalColumns: droppedOptional,
+          aborted: true,
+          deadlineExceeded: reasonMsg.includes("deadline") || Date.now() >= deadlineMs
+        };
+      }
+      try {
+        let query = dbClient.from(table).select(selectCols);
+        if (applyFilters) {
+          query = applyFilters(query);
+        }
+        if (typeof query.order === "function") {
+          query = query.order(pkCol, { ascending: true });
+        }
+        const supportsGtCursor = typeof query.gt === "function";
+        if (lastCursorId !== null && supportsGtCursor) {
+          query = query.gt(pkCol, lastCursorId);
+        }
+        if (typeof query.limit === "function") {
+          query = query.limit(pageSize);
+        } else if (typeof query.range === "function") {
+          const offset = pagesFetched * pageSize;
+          query = query.range(offset, offset + pageSize - 1);
+        }
+        if (typeof query.abortSignal === "function") {
+          query = query.abortSignal(signal);
+        }
+        const res = await query;
+        if (res?.error) {
+          if (optionalTable && isMissingTableError(res.error)) {
+            return {
+              ok: true,
+              rows: [],
+              missingTable: true,
+              missingOptionalColumns: droppedOptional,
+              aborted: false,
+              deadlineExceeded: false
+            };
+          }
+          const missingCol = isConfirmedMissingColumnError(res.error);
+          if (missingCol.missing && activeOptional.length > 0 && pagesFetched === 0) {
+            if (!missingCol.columnName) {
+              return {
+                ok: false,
+                rows: [],
+                missingTable: false,
+                missingOptionalColumns: droppedOptional,
+                aborted: false,
+                deadlineExceeded: false
+              };
+            }
+            const lowerRequired = new Set(requiredColumns.map((c) => c.toLowerCase()));
+            if (lowerRequired.has(missingCol.columnName)) {
+              return {
+                ok: false,
+                rows: [],
+                missingTable: false,
+                missingOptionalColumns: droppedOptional,
+                aborted: false,
+                deadlineExceeded: false
+              };
+            }
+            const beforeLen = activeOptional.length;
+            activeOptional = activeOptional.filter((c) => c.toLowerCase() !== missingCol.columnName);
+            if (activeOptional.length < beforeLen) {
+              droppedOptional.push(missingCol.columnName);
+              retryWithReducedColumns = true;
+              break;
+            }
+            return {
+              ok: false,
+              rows: [],
+              missingTable: false,
+              missingOptionalColumns: droppedOptional,
+              aborted: false,
+              deadlineExceeded: false
+            };
+          }
+          return {
+            ok: false,
+            rows: [],
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: signal.aborted,
+            deadlineExceeded: Date.now() >= deadlineMs
+          };
+        }
+        if (!Array.isArray(res?.data)) {
+          return {
+            ok: false,
+            rows: [],
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: false,
+            deadlineExceeded: false
+          };
+        }
+        const pageRows = res.data;
+        pagesFetched += 1;
+        if (pageRows.length === 0) {
+          return {
+            ok: true,
+            rows: allRows,
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: false,
+            deadlineExceeded: false
+          };
+        }
+        if (!supportsGtCursor) {
+          for (const r of pageRows) allRows.push(r);
+          return {
+            ok: true,
+            rows: allRows,
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: false,
+            deadlineExceeded: false
+          };
+        }
+        let advancedInPage = 0;
+        let nextCursorCandidate = lastCursorId;
+        for (const r of pageRows) {
+          const rawPk = r?.[pkCol];
+          if (rawPk === null || rawPk === void 0 || String(rawPk).trim() === "") {
+            return {
+              ok: false,
+              rows: [],
+              missingTable: false,
+              missingOptionalColumns: droppedOptional,
+              aborted: false,
+              deadlineExceeded: false
+            };
+          }
+          const pkKey = String(rawPk);
+          if (seenIds.has(pkKey)) continue;
+          seenIds.add(pkKey);
+          allRows.push(r);
+          nextCursorCandidate = rawPk;
+          advancedInPage += 1;
+        }
+        if (advancedInPage === 0) {
+          return {
+            ok: true,
+            rows: allRows,
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: false,
+            deadlineExceeded: false
+          };
+        }
+        if (nextCursorCandidate === lastCursorId) {
+          return {
+            ok: false,
+            rows: [],
+            missingTable: false,
+            missingOptionalColumns: droppedOptional,
+            aborted: false,
+            deadlineExceeded: false
+          };
+        }
+        lastCursorId = nextCursorCandidate;
+      } catch {
+        const reasonMsg = String(signal?.reason?.message || "").toLowerCase();
+        return {
+          ok: false,
+          rows: [],
+          missingTable: false,
+          missingOptionalColumns: droppedOptional,
+          aborted: signal.aborted,
+          deadlineExceeded: reasonMsg.includes("deadline") || Date.now() >= deadlineMs
+        };
+      }
+    }
+    if (!retryWithReducedColumns) {
+      return {
+        ok: false,
+        rows: [],
+        missingTable: false,
+        missingOptionalColumns: droppedOptional,
+        aborted: false,
+        deadlineExceeded: false
+      };
+    }
+  }
+}
+function parseDiagnosticSnapshot(inbounds) {
+  const unparsedInboundIds = [];
+  const occurrencesByUuid = /* @__PURE__ */ new Map();
+  const duplicateLiveUuids = /* @__PURE__ */ new Set();
+  const duplicateAcrossDifferentInbounds = /* @__PURE__ */ new Set();
+  const inboundsById = /* @__PURE__ */ new Map();
+  let totalLiveOccurrences = 0;
+  for (const ib of inbounds) {
+    const parsed = parseInboundSettingsClientsStrict(ib);
+    if (!parsed.ok) {
+      const rawId = Number(ib?.id);
+      unparsedInboundIds.push(Number.isInteger(rawId) && rawId > 0 ? rawId : -1);
+      continue;
+    }
+    const remark = sanitizeInboundRemark(ib?.remark);
+    const rawPort = Number(ib?.port);
+    const port = Number.isInteger(rawPort) && rawPort > 0 ? rawPort : null;
+    const uniqueInThisInbound = /* @__PURE__ */ new Set();
+    for (const c of parsed.clients) {
+      const normUuid = String(c?.id || "").trim().toLowerCase();
+      if (!normUuid) continue;
+      totalLiveOccurrences += 1;
+      uniqueInThisInbound.add(normUuid);
+      const occ = {
+        inboundId: parsed.inboundId,
+        remark,
+        port,
+        enabled: c.enable !== false,
+        expiryTime: Number(c.expiryTime) || 0
+      };
+      const existing = occurrencesByUuid.get(normUuid);
+      if (existing) {
+        duplicateLiveUuids.add(normUuid);
+        if (existing.some((e) => e.inboundId !== parsed.inboundId)) {
+          duplicateAcrossDifferentInbounds.add(normUuid);
+        }
+        existing.push(occ);
+      } else {
+        occurrencesByUuid.set(normUuid, [occ]);
+      }
+    }
+    inboundsById.set(parsed.inboundId, {
+      inboundId: parsed.inboundId,
+      remark,
+      port,
+      liveClientCount: parsed.clients.length,
+      uniqueLiveUuidCount: uniqueInThisInbound.size
+    });
+  }
+  return {
+    ok: inbounds.length > 0 && unparsedInboundIds.length === 0,
+    allInboundsCleanlyParsed: unparsedInboundIds.length === 0,
+    unparsedInboundIds,
+    inboundCount: inbounds.length,
+    totalLiveOccurrences,
+    uniqueLiveUuidCount: occurrencesByUuid.size,
+    duplicateLiveUuids,
+    duplicateAcrossDifferentInbounds,
+    occurrencesByUuid,
+    inboundsById
+  };
+}
+function normalizeVpnLifecycleStatus(rawStatus, deletedFromPanelAt) {
+  if (deletedFromPanelAt) return "deleted";
+  const st = String(rawStatus || "").trim().toLowerCase();
+  if (!st) return "unknown";
+  if (st === "canceled") return "cancelled";
+  if (st === "cancelled" || st === "rejected" || st === "revoked") return "revoked";
+  if (st === "active" || st === "enabled") return "active";
+  if (st === "disabled" || st === "inactive" || st === "suspended") return "disabled";
+  if (st === "expired") return "expired";
+  if (st === "deleted") return "deleted";
+  return st;
+}
+function detectTrialOrder(ord) {
+  if (!ord || typeof ord !== "object") return false;
+  if (ord.is_trial === true) return true;
+  const orderId = String(ord.order_id || ord.id || "").trim().toUpperCase();
+  if (orderId.startsWith("TRIAL-")) return true;
+  const pkg = String(ord.package_name || "").toLowerCase();
+  if (/\bfree\s*trial\b/.test(pkg) || pkg.includes("trial")) return true;
+  const pmRaw = ord.payment_method;
+  if (typeof pmRaw === "string") {
+    const pmLower = pmRaw.toLowerCase();
+    if (pmLower.includes("trial")) return true;
+    if (pmRaw.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(pmRaw);
+        if (parsed?.is_trial === true || parsed?.isTrial === true) return true;
+        if (String(parsed?.paymentMethod || "").toLowerCase().includes("trial")) return true;
+      } catch {
+      }
+    }
+  } else if (pmRaw && typeof pmRaw === "object") {
+    if (pmRaw.is_trial === true || pmRaw.isTrial === true) return true;
+    if (String(pmRaw.paymentMethod || "").toLowerCase().includes("trial")) return true;
+  }
+  return false;
+}
+function parseTimestampMs(raw) {
+  if (raw === null || raw === void 0 || raw === "") return null;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    if (raw <= 0) return null;
+    return raw < 1e12 ? raw * 1e3 : raw;
+  }
+  const parsed = Date.parse(String(raw));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+function pickLatestIso(a, b) {
+  if (!b) return a;
+  const bStr = String(b);
+  const bMs = Date.parse(bStr);
+  if (Number.isNaN(bMs)) return a;
+  if (!a) return bStr;
+  const aMs = Date.parse(a);
+  if (Number.isNaN(aMs)) return bStr;
+  return bMs > aMs ? bStr : a;
+}
+function mapPanelErrorToAbortReason(stage, errorCode) {
+  if (errorCode === "diagnostic_deadline_exceeded") return "diagnostic_deadline_exceeded";
+  if (errorCode === "diagnostic_aborted") return "diagnostic_aborted";
+  if (errorCode === "panel_config_unavailable") return "panel_config_unavailable";
+  if (errorCode === "panel_auth_failed") return "panel_auth_failed";
+  if (errorCode === "panel_empty_inbounds") {
+    return stage === "snapshot1" ? "panel_snapshot1_empty" : "panel_snapshot2_empty";
+  }
+  if (errorCode === "panel_malformed_inbound" || errorCode === "panel_non_array_response") {
+    return stage === "snapshot1" ? "panel_snapshot1_malformed" : "panel_snapshot2_malformed";
+  }
+  return stage === "snapshot1" ? "panel_snapshot1_failed" : "panel_snapshot2_failed";
+}
+function setsEqualNumbers(a, b) {
+  const setA = Array.from(new Set(a)).sort((x, y) => x - y);
+  const setB = Array.from(new Set(b)).sort((x, y) => x - y);
+  if (setA.length !== setB.length) return false;
+  for (let i = 0; i < setA.length; i++) {
+    if (setA[i] !== setB[i]) return false;
+  }
+  return true;
+}
+async function runReadOnlySyncDiagnostics(options) {
+  const startedAtMs = Date.now();
+  const nowMs = options?.nowMs ?? startedAtMs;
+  const generatedAt = new Date(nowMs).toISOString();
+  const totalBudgetMs = Math.max(
+    300,
+    Math.min(
+      Math.floor(options?.totalBudgetMs ?? DEFAULT_DIAGNOSTIC_BUDGET_MS),
+      MAX_DIAGNOSTIC_BUDGET_MS
+    )
+  );
+  const serializationReserveMs = Math.min(1e3, Math.floor(totalBudgetMs * 0.15));
+  const deadlineMs = startedAtMs + totalBudgetMs;
+  const reReadDelayMs = Math.max(0, Math.min(Math.floor(options?.reReadDelayMs ?? DEFAULT_REREAD_DELAY_MS), 2e3));
+  const pageSize = Math.max(1, Math.min(Math.floor(options?.pageSize ?? 1e3), 5e3));
+  const includeDirectProbe = options?.includeDirectProbe === true;
+  const dbClient = options?.dbClient ?? supabaseAdmin;
+  const fetchListFn = options?.fetchInboundsListFn ?? fetchReadOnlyDiagnosticInboundsList;
+  const probeInboundFn = options?.probeDirectInboundFn ?? probeDirectLiveInboundReadOnly;
+  const diagnosticSessionState = createDiagnosticIsolatedSessionState();
+  const panelDeletionSyncEnabled = options?.panelDeletionSyncEnabled ?? isPanelDeletionSyncFlagEnabled();
+  const maxDeletesPerCycle = options?.maxDeletesPerCycle ?? getPanelDeletionSyncMaxDeletesPerCycle();
+  const maxMissingRatio = options?.maxMissingRatio ?? getPanelDeletionSyncMaxMissingRatio();
+  const controller = new AbortController();
+  let deadlineExceeded = false;
+  let externallyCancelled = false;
+  const deadlineTimer = setTimeout(() => {
+    deadlineExceeded = true;
+    if (!controller.signal.aborted) {
+      controller.abort(new Error("diagnostic_deadline_exceeded"));
+    }
+  }, totalBudgetMs);
+  const onExternalAbort = () => {
+    externallyCancelled = true;
+    if (!controller.signal.aborted) {
+      controller.abort(new Error("diagnostic_aborted"));
+    }
+  };
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      onExternalAbort();
+    } else {
+      options.signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+  const getRemainingWorkBudgetMs = (minRequiredMs = 80) => {
+    if (controller.signal.aborted) return null;
+    const remaining = deadlineMs - Date.now() - serializationReserveMs;
+    if (remaining < minRequiredMs) {
+      deadlineExceeded = true;
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("diagnostic_deadline_exceeded"));
+      }
+      return null;
+    }
+    return remaining;
+  };
+  const missingOptionalColumnsByTable = {};
+  const optionalTablesMissing = [];
+  let resolvedPanelIdentity = null;
+  let configuredServersCount = 0;
+  const snapshotMeta = {
+    snapshot1Ok: false,
+    snapshot1LatencyMs: null,
+    snapshot1InboundCount: 0,
+    snapshot1LiveOccurrences: 0,
+    snapshot1UniqueLiveUuids: 0,
+    snapshot1DuplicateLiveUuids: 0,
+    snapshot1UnparsedInboundIds: [],
+    snapshot1ErrorCode: null,
+    snapshot2Executed: false,
+    snapshot2Ok: false,
+    snapshot2LatencyMs: null,
+    snapshot2InboundCount: 0,
+    snapshot2LiveOccurrences: 0,
+    snapshot2UniqueLiveUuids: 0,
+    snapshot2DuplicateLiveUuids: 0,
+    snapshot2UnparsedInboundIds: [],
+    snapshot2ErrorCode: null
+  };
+  const buildAbortedReport = (abortReason) => {
+    const elapsed = Math.max(0, Date.now() - startedAtMs);
+    return {
+      success: false,
+      readOnly: true,
+      aborted: true,
+      abortReason,
+      generatedAt,
+      executionMs: elapsed,
+      budget: {
+        totalBudgetMs,
+        remainingBudgetMs: Math.max(0, deadlineMs - Date.now()),
+        deadlineExceeded: deadlineExceeded || abortReason === "diagnostic_deadline_exceeded",
+        cancelled: externallyCancelled || abortReason === "diagnostic_aborted"
+      },
+      runtimeLimits: {
+        mutexScope: "per_instance_in_memory",
+        rateLimitScope: "per_instance_in_memory",
+        directProbeOptIn: includeDirectProbe,
+        maxDirectProbeConcurrency: MAX_DIRECT_PROBE_CONCURRENCY,
+        note: "In-process mutex and rate limiting are enforced per backend instance and are not distributed across multiple replicas."
+      },
+      panel: {
+        panelIdentity: resolvedPanelIdentity,
+        connectionMode: configuredServersCount > 0 ? "configured_servers_present" : resolvedPanelIdentity ? "env_single_panel" : "unknown",
+        configuredXuiServersCount: configuredServersCount,
+        panelProvenanceNote: "Classification aborted before completion; no client absence or deletion conclusions were produced.",
+        panelDeletionSyncEnabled,
+        snapshots: snapshotMeta
+      },
+      schemaCompatibility: {
+        vpnConfigsOwnershipColumn: "customer_uid",
+        vpnAccountsHasInboundId: false,
+        missingOptionalColumnsByTable,
+        optionalTablesMissing
+      },
+      liveInbounds: [],
+      historicalMissingInbounds: [],
+      summary: {
+        uniqueDbTrackedNonDeleted: 0,
+        uniqueDbAllIncludingDeletedAndOrders: 0,
+        livePanelUniqueClientsSnap1: snapshotMeta.snapshot1UniqueLiveUuids,
+        livePanelUniqueClientsSnap2: snapshotMeta.snapshot2Executed ? snapshotMeta.snapshot2UniqueLiveUuids : null,
+        liveMatchedHealthy: 0,
+        liveMatchedStatusConflict: 0,
+        liveDuplicateUuidAmbiguous: 0,
+        movedClients: 0,
+        snapshotInconsistentAppeared: 0,
+        snapshotInconsistentDisappeared: 0,
+        snapshotInconsistentMoved: 0,
+        rawAbsentFromSnap1: 0,
+        rawAbsentBothSnapshots: 0,
+        deletionWorkerEligibleCandidates: 0,
+        deletionWorkerBlockedBeforeCircuitBreaker: 0,
+        deletionWorkerBlockedByLocks: 0,
+        alreadyMarkedDeletedInDb: 0,
+        ordersOnlyUntracked: 0,
+        untrackedLivePanelClients: 0,
+        flags: {
+          historicalTrials: 0,
+          expiredAccounts: 0,
+          rejectedOrRevokedAccounts: 0,
+          conflictingDbStatuses: 0,
+          liveVsDbEnableMismatch: 0,
+          conflictingOwnership: 0,
+          missingOwnership: 0,
+          conflictingInboundIds: 0,
+          conflictingPanelIdentities: 0,
+          missingPanelIdentity: 0,
+          panelProvenanceUnverifiedLegacy: 0,
+          missingInboundId: 0,
+          referencesRemovedHistoricalInbound: 0,
+          uncertainClientLocks: 0,
+          uncertainInboundLocks: 0,
+          activeInProgressLocks: 0
+        },
+        blockingReasonCounts: {}
+      },
+      circuitBreakerEvaluation: {
+        evaluated: false,
+        wouldTrigger: false,
+        primaryReason: null,
+        allTriggeredReasons: [],
+        eligibleCandidateCount: 0,
+        rawAbsentBothSnapshotsCount: 0,
+        totalTrackedNonDeleted: 0,
+        missingRatio: 0,
+        maxDeletesPerCycle,
+        maxMissingRatio
+      },
+      activeAndUncertainLocks: [],
+      directInboundVerificationProbe: {
+        optInRequested: includeDirectProbe,
+        executed: false,
+        skippedReason: `aborted:${abortReason}`,
+        maxConcurrency: MAX_DIRECT_PROBE_CONCURRENCY,
+        customerBudgetMs: CUSTOMER_LIVE_INBOUND_BUDGET_MS,
+        probedCount: 0,
+        directSucceededCount: 0,
+        directFailedOrEmptyCount: 0,
+        directTimedOutCount: 0,
+        directSkippedBudgetCount: 0,
+        wouldBreakCustomerPromiseAll: null,
+        knownTelemetryNote: "vpnController.ts:29 and clientController.ts:30 hardcode '3X-UI Time: 0ms'; actual 3X-UI latency is included inside Database Time.",
+        inbounds: []
+      },
+      clients: []
+    };
+  };
+  try {
+    if (!dbClient || typeof dbClient.from !== "function") {
+      return buildAbortedReport("db_client_unavailable");
+    }
+    const initialBudget = getRemainingWorkBudgetMs(120);
+    if (initialBudget === null) {
+      return buildAbortedReport(externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded");
+    }
+    const snap1TimeoutMs = Math.min(7e3, Math.max(200, Math.floor(initialBudget * 0.55)));
+    const dbDeadlineMs = deadlineMs - serializationReserveMs;
+    const [
+      snap1Settled,
+      accSettled,
+      cfgSettled,
+      grantsSettled,
+      ordersSettled,
+      locksSettled,
+      serversSettled
+    ] = await Promise.allSettled([
+      fetchListFn({
+        timeoutMs: snap1TimeoutMs,
+        signal: controller.signal,
+        dbClient,
+        sessionState: diagnosticSessionState
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "vpn_accounts",
+        requiredColumns: ["id", "user_id", "uuid", "status", "enable", "created_at"],
+        optionalColumns: [
+          "order_id",
+          "server_id",
+          "is_trial",
+          "expiry_time",
+          "expiry_date",
+          "expires_at",
+          "panel_identity",
+          "deleted_from_panel_at",
+          "reconciliation_required"
+        ],
+        primaryKeyColumn: "id",
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "vpn_configs",
+        // Production vpn_configs uses customer_uid (never user_id) and does not depend on updated_at
+        requiredColumns: ["id", "customer_uid", "uuid", "inbound_id", "status", "enabled", "created_at"],
+        optionalColumns: [
+          "order_id",
+          "is_trial",
+          "expiry_time",
+          "expiry_date",
+          "expires_at",
+          "server_id",
+          "panel_identity",
+          "deleted_from_panel_at",
+          "reconciliation_required"
+        ],
+        primaryKeyColumn: "id",
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "vpn_entitlement_grants",
+        requiredColumns: ["id", "client_uuid", "inbound_id"],
+        optionalColumns: ["order_id", "user_id", "status", "provisional", "grant_type", "created_at"],
+        primaryKeyColumn: "id",
+        optionalTable: true,
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal,
+        applyFilters: (q) => q.not("inbound_id", "is", null)
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "orders",
+        requiredColumns: ["id", "status", "created_at"],
+        optionalColumns: [
+          "order_id",
+          "customer_id",
+          "payment_status",
+          "provisioning_status",
+          "client_uuid",
+          "is_trial",
+          "payment_method",
+          "package_name",
+          "expires_at",
+          "expiry_date"
+        ],
+        primaryKeyColumn: "id",
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "provisioning_operations",
+        requiredColumns: ["operation_key", "status"],
+        optionalColumns: [
+          "id",
+          "operation_type",
+          "target_id",
+          "client_uuid",
+          "lease_expires_at",
+          "uncertain_at",
+          "created_at",
+          "updated_at"
+        ],
+        primaryKeyColumn: "operation_key",
+        optionalTable: true,
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal,
+        applyFilters: (q) => q.in("status", ["in_progress", "uncertain"])
+      }),
+      fetchDiagnosticTablePaginated({
+        dbClient,
+        table: "xui_servers",
+        requiredColumns: ["id", "is_active"],
+        optionalColumns: ["panel_url", "url"],
+        primaryKeyColumn: "id",
+        optionalTable: true,
+        pageSize,
+        deadlineMs: dbDeadlineMs,
+        signal: controller.signal
+      })
+    ]);
+    if (controller.signal.aborted) {
+      return buildAbortedReport(
+        externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded"
+      );
+    }
+    if (snap1Settled.status !== "fulfilled") {
+      return buildAbortedReport("panel_snapshot1_failed");
+    }
+    const snap1Raw = snap1Settled.value;
+    snapshotMeta.snapshot1LatencyMs = snap1Raw.latencyMs;
+    snapshotMeta.snapshot1ErrorCode = snap1Raw.errorCode;
+    if (snap1Raw.panelIdentity) {
+      resolvedPanelIdentity = snap1Raw.panelIdentity;
+    }
+    if (!snap1Raw.ok || !Array.isArray(snap1Raw.inbounds) || snap1Raw.inbounds.length === 0) {
+      return buildAbortedReport(mapPanelErrorToAbortReason("snapshot1", snap1Raw.errorCode));
+    }
+    const snap1Parsed = parseDiagnosticSnapshot(snap1Raw.inbounds);
+    snapshotMeta.snapshot1InboundCount = snap1Parsed.inboundCount;
+    snapshotMeta.snapshot1LiveOccurrences = snap1Parsed.totalLiveOccurrences;
+    snapshotMeta.snapshot1UniqueLiveUuids = snap1Parsed.uniqueLiveUuidCount;
+    snapshotMeta.snapshot1DuplicateLiveUuids = snap1Parsed.duplicateLiveUuids.size;
+    snapshotMeta.snapshot1UnparsedInboundIds = snap1Parsed.unparsedInboundIds;
+    snapshotMeta.snapshot1Ok = snap1Parsed.ok;
+    if (!snap1Parsed.ok || !snap1Parsed.allInboundsCleanlyParsed) {
+      snapshotMeta.snapshot1ErrorCode = "panel_malformed_inbound";
+      return buildAbortedReport("panel_snapshot1_malformed");
+    }
+    if (!resolvedPanelIdentity) {
+      return buildAbortedReport("panel_config_unavailable");
+    }
+    const checkTable = (settled, tableName, failReason) => {
+      if (settled.status !== "fulfilled") {
+        return { ok: false, rows: [], abortReason: failReason };
+      }
+      const val = settled.value;
+      if (val.missingOptionalColumns.length > 0) {
+        missingOptionalColumnsByTable[tableName] = Array.from(new Set(val.missingOptionalColumns));
+      }
+      if (val.missingTable) {
+        optionalTablesMissing.push(tableName);
+      }
+      if (!val.ok) {
+        if (val.deadlineExceeded) return { ok: false, rows: [], abortReason: "diagnostic_deadline_exceeded" };
+        if (val.aborted) return { ok: false, rows: [], abortReason: "diagnostic_aborted" };
+        return { ok: false, rows: [], abortReason: failReason };
+      }
+      return { ok: true, rows: val.rows, abortReason: null };
+    };
+    const accCheck = checkTable(accSettled, "vpn_accounts", "db_vpn_accounts_query_failed");
+    if (!accCheck.ok) return buildAbortedReport(accCheck.abortReason || "db_vpn_accounts_query_failed");
+    const cfgCheck = checkTable(cfgSettled, "vpn_configs", "db_vpn_configs_query_failed");
+    if (!cfgCheck.ok) return buildAbortedReport(cfgCheck.abortReason || "db_vpn_configs_query_failed");
+    const grantsCheck = checkTable(grantsSettled, "vpn_entitlement_grants", "db_grants_query_failed");
+    if (!grantsCheck.ok) return buildAbortedReport(grantsCheck.abortReason || "db_grants_query_failed");
+    const ordersCheck = checkTable(ordersSettled, "orders", "db_orders_query_failed");
+    if (!ordersCheck.ok) return buildAbortedReport(ordersCheck.abortReason || "db_orders_query_failed");
+    const locksCheck = checkTable(locksSettled, "provisioning_operations", "db_locks_query_failed");
+    if (!locksCheck.ok) return buildAbortedReport(locksCheck.abortReason || "db_locks_query_failed");
+    const serversCheck = checkTable(serversSettled, "xui_servers", "db_xui_servers_query_failed");
+    if (!serversCheck.ok) return buildAbortedReport(serversCheck.abortReason || "db_xui_servers_query_failed");
+    const accounts = accCheck.rows;
+    const configs = cfgCheck.rows;
+    const grants = grantsCheck.rows;
+    const orders = ordersCheck.rows;
+    const activeLocks = locksCheck.rows;
+    const configuredServers = serversCheck.rows.map((s) => ({
+      id: String(s?.id || ""),
+      panel_url: s?.panel_url ?? s?.url ?? null,
+      is_active: s?.is_active ?? true
+    }));
+    configuredServersCount = configuredServers.length;
+    const budgetBeforeWait = getRemainingWorkBudgetMs(reReadDelayMs + 150);
+    if (budgetBeforeWait === null) {
+      return buildAbortedReport(externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded");
+    }
+    const sleptOk = await sleepWithAbort(reReadDelayMs, controller.signal);
+    if (!sleptOk || controller.signal.aborted) {
+      return buildAbortedReport(externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded");
+    }
+    const budgetForSnap2 = getRemainingWorkBudgetMs(150);
+    if (budgetForSnap2 === null) {
+      return buildAbortedReport(externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded");
+    }
+    snapshotMeta.snapshot2Executed = true;
+    const snap2TimeoutMs = Math.min(7e3, Math.max(200, budgetForSnap2));
+    let snap2Raw;
+    try {
+      snap2Raw = await fetchListFn({
+        timeoutMs: snap2TimeoutMs,
+        signal: controller.signal,
+        dbClient,
+        sessionState: diagnosticSessionState
+      });
+    } catch {
+      return buildAbortedReport(
+        controller.signal.aborted ? externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded" : "panel_snapshot2_failed"
+      );
+    }
+    snapshotMeta.snapshot2LatencyMs = snap2Raw.latencyMs;
+    snapshotMeta.snapshot2ErrorCode = snap2Raw.errorCode;
+    if (controller.signal.aborted) {
+      return buildAbortedReport(externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded");
+    }
+    if (!snap2Raw.ok || !Array.isArray(snap2Raw.inbounds) || snap2Raw.inbounds.length === 0) {
+      return buildAbortedReport(mapPanelErrorToAbortReason("snapshot2", snap2Raw.errorCode));
+    }
+    const snap2Parsed = parseDiagnosticSnapshot(snap2Raw.inbounds);
+    snapshotMeta.snapshot2InboundCount = snap2Parsed.inboundCount;
+    snapshotMeta.snapshot2LiveOccurrences = snap2Parsed.totalLiveOccurrences;
+    snapshotMeta.snapshot2UniqueLiveUuids = snap2Parsed.uniqueLiveUuidCount;
+    snapshotMeta.snapshot2DuplicateLiveUuids = snap2Parsed.duplicateLiveUuids.size;
+    snapshotMeta.snapshot2UnparsedInboundIds = snap2Parsed.unparsedInboundIds;
+    snapshotMeta.snapshot2Ok = snap2Parsed.ok;
+    if (!snap2Parsed.ok || !snap2Parsed.allInboundsCleanlyParsed) {
+      snapshotMeta.snapshot2ErrorCode = "panel_malformed_inbound";
+      return buildAbortedReport("panel_snapshot2_malformed");
+    }
+    const groups = /* @__PURE__ */ new Map();
+    const ensureGroup = (rawUuid) => {
+      const norm = String(rawUuid || "").trim().toLowerCase();
+      if (!norm) return null;
+      let g = groups.get(norm);
+      if (!g) {
+        g = {
+          clientUuid: norm,
+          accounts: [],
+          configs: [],
+          grants: [],
+          orders: [],
+          distinctInboundIds: /* @__PURE__ */ new Set(),
+          primaryInboundId: null,
+          primaryOwnerUid: null,
+          distinctOwners: /* @__PURE__ */ new Set(),
+          hasConflictingOwnership: false,
+          hasMissingOwnership: false,
+          distinctPanelIdentities: /* @__PURE__ */ new Set(),
+          primaryPanelIdentity: null,
+          distinctServerIds: /* @__PURE__ */ new Set(),
+          primaryServerId: null,
+          latestVpnCreatedAt: null,
+          latestOrderCreatedAt: null,
+          latestCreatedAt: null,
+          anyNonDeletedInVpnTables: false,
+          allDeletedInVpnTables: true,
+          hasVpnTableRows: false
+        };
+        groups.set(norm, g);
+      }
+      return g;
+    };
+    const ordersById = /* @__PURE__ */ new Map();
+    for (const ord of orders) {
+      if (ord?.id) ordersById.set(String(ord.id).trim(), ord);
+      if (ord?.order_id) ordersById.set(String(ord.order_id).trim(), ord);
+      const ordUuid = String(ord?.client_uuid || "").trim().toLowerCase();
+      if (ordUuid) {
+        const g = ensureGroup(ordUuid);
+        if (g) {
+          g.orders.push(ord);
+          g.latestOrderCreatedAt = pickLatestIso(g.latestOrderCreatedAt, ord.created_at);
+          g.latestCreatedAt = pickLatestIso(g.latestCreatedAt, ord.created_at);
+        }
+      }
+    }
+    for (const gr of grants) {
+      const g = ensureGroup(gr?.client_uuid);
+      if (!g) continue;
+      g.grants.push(gr);
+      const gib = Number(gr?.inbound_id);
+      if (Number.isInteger(gib) && gib > 0) {
+        g.distinctInboundIds.add(gib);
+        if (g.primaryInboundId === null) g.primaryInboundId = gib;
+      }
+    }
+    for (const acc of accounts) {
+      const g = ensureGroup(acc?.uuid);
+      if (!g) continue;
+      g.accounts.push(acc);
+      g.hasVpnTableRows = true;
+      const accOwner = String(acc?.user_id || "").trim();
+      if (accOwner) {
+        g.distinctOwners.add(accOwner.toLowerCase());
+        if (!g.primaryOwnerUid) g.primaryOwnerUid = accOwner;
+      } else {
+        g.hasMissingOwnership = true;
+      }
+      if (acc?.panel_identity) {
+        const pid = String(acc.panel_identity).trim();
+        if (pid) {
+          g.distinctPanelIdentities.add(pid);
+          if (!g.primaryPanelIdentity) g.primaryPanelIdentity = pid;
+        }
+      }
+      if (acc?.server_id) {
+        const sid = String(acc.server_id).trim();
+        if (sid) {
+          g.distinctServerIds.add(sid);
+          if (!g.primaryServerId) g.primaryServerId = sid;
+        }
+      }
+      g.latestVpnCreatedAt = pickLatestIso(g.latestVpnCreatedAt, acc?.created_at);
+      g.latestCreatedAt = pickLatestIso(g.latestCreatedAt, acc?.created_at);
+      const st = String(acc?.status || "").trim().toLowerCase();
+      if (st !== "deleted" && !acc?.deleted_from_panel_at) {
+        g.anyNonDeletedInVpnTables = true;
+        g.allDeletedInVpnTables = false;
+      }
+      if (acc?.order_id) {
+        const linkedOrd = ordersById.get(String(acc.order_id).trim());
+        if (linkedOrd && !g.orders.includes(linkedOrd)) {
+          g.orders.push(linkedOrd);
+          g.latestOrderCreatedAt = pickLatestIso(g.latestOrderCreatedAt, linkedOrd?.created_at);
+        }
+      }
+    }
+    for (const cfg of configs) {
+      const g = ensureGroup(cfg?.uuid);
+      if (!g) continue;
+      g.configs.push(cfg);
+      g.hasVpnTableRows = true;
+      const ibId = Number(cfg?.inbound_id);
+      if (Number.isInteger(ibId) && ibId > 0) {
+        g.distinctInboundIds.add(ibId);
+        g.primaryInboundId = ibId;
+      }
+      const cfgCustUid = String(cfg?.customer_uid || "").trim();
+      if (cfgCustUid) {
+        g.distinctOwners.add(cfgCustUid.toLowerCase());
+        if (!g.primaryOwnerUid) g.primaryOwnerUid = cfgCustUid;
+      } else {
+        g.hasMissingOwnership = true;
+      }
+      if (cfg?.panel_identity) {
+        const pid = String(cfg.panel_identity).trim();
+        if (pid) {
+          g.distinctPanelIdentities.add(pid);
+          if (!g.primaryPanelIdentity) g.primaryPanelIdentity = pid;
+        }
+      }
+      if (cfg?.server_id) {
+        const sid = String(cfg.server_id).trim();
+        if (sid) {
+          g.distinctServerIds.add(sid);
+          if (!g.primaryServerId) g.primaryServerId = sid;
+        }
+      }
+      g.latestVpnCreatedAt = pickLatestIso(g.latestVpnCreatedAt, cfg?.created_at);
+      g.latestCreatedAt = pickLatestIso(g.latestCreatedAt, cfg?.created_at);
+      const st = String(cfg?.status || "").trim().toLowerCase();
+      if (st !== "deleted" && !cfg?.deleted_from_panel_at) {
+        g.anyNonDeletedInVpnTables = true;
+        g.allDeletedInVpnTables = false;
+      }
+      if (cfg?.order_id) {
+        const linkedOrd = ordersById.get(String(cfg.order_id).trim());
+        if (linkedOrd && !g.orders.includes(linkedOrd)) {
+          g.orders.push(linkedOrd);
+          g.latestOrderCreatedAt = pickLatestIso(g.latestOrderCreatedAt, linkedOrd?.created_at);
+        }
+      }
+    }
+    for (const g of groups.values()) {
+      if (g.distinctOwners.size > 1) {
+        g.hasConflictingOwnership = true;
+      }
+      if (g.distinctInboundIds.size === 1) {
+        g.primaryInboundId = Array.from(g.distinctInboundIds)[0];
+      } else if (g.distinctInboundIds.size > 1) {
+        g.primaryInboundId = null;
+      }
+    }
+    const lockByKey = /* @__PURE__ */ new Map();
+    for (const lk of activeLocks) {
+      const key = String(lk?.operation_key || "").trim().toLowerCase();
+      if (key) lockByKey.set(key, lk);
+    }
+    let totalTrackedNonDeleted = 0;
+    let rawAbsentFromSnap1 = 0;
+    let rawAbsentBothSnapshots = 0;
+    const eligibleCandidateUuids = /* @__PURE__ */ new Set();
+    const preCircuitBreakerEvaluations = /* @__PURE__ */ new Map();
+    for (const g of groups.values()) {
+      if (!g.hasVpnTableRows || !g.anyNonDeletedInVpnTables || g.allDeletedInVpnTables) {
+        continue;
+      }
+      totalTrackedNonDeleted += 1;
+      const inSnap1 = snap1Parsed.occurrencesByUuid.has(g.clientUuid);
+      const inSnap2 = snap2Parsed.occurrencesByUuid.has(g.clientUuid);
+      const identityCheck = verifyRecordPanelIdentity({
+        currentPanelIdentity: resolvedPanelIdentity,
+        recordPanelIdentity: g.primaryPanelIdentity,
+        recordServerId: g.primaryServerId,
+        recordInboundId: g.primaryInboundId,
+        recordOwnerUid: g.primaryOwnerUid,
+        configuredServers
+      });
+      const preCbBlockReasons = [];
+      if (g.hasConflictingOwnership || g.distinctOwners.size > 1) {
+        preCbBlockReasons.push("conflicting_or_duplicate_ownership");
+      }
+      if (g.hasMissingOwnership || !g.primaryOwnerUid) {
+        preCbBlockReasons.push("missing_customer_ownership");
+      }
+      if (g.distinctInboundIds.size > 1) {
+        preCbBlockReasons.push("conflicting_inbound_id");
+      }
+      if (g.distinctPanelIdentities.size > 1) {
+        preCbBlockReasons.push("conflicting_panel_identity");
+      }
+      if (g.latestVpnCreatedAt) {
+        const createdMs = Date.parse(g.latestVpnCreatedAt);
+        if (!Number.isNaN(createdMs) && nowMs - createdMs < RECENT_PROVISION_GRACE_MS) {
+          preCbBlockReasons.push("recent_provision_grace_period");
+        }
+      }
+      if (!identityCheck.ok && !preCbBlockReasons.includes(identityCheck.code)) {
+        preCbBlockReasons.push(identityCheck.code);
+      }
+      if (!inSnap1) {
+        rawAbsentFromSnap1 += 1;
+        if (!inSnap2) {
+          rawAbsentBothSnapshots += 1;
+        }
+      }
+      const wouldPassPreCb = !inSnap1 && !inSnap2 && preCbBlockReasons.length === 0;
+      if (wouldPassPreCb) {
+        eligibleCandidateUuids.add(g.clientUuid);
+      }
+      preCircuitBreakerEvaluations.set(g.clientUuid, {
+        wouldPassPreCb,
+        panelIdentityCheckCode: identityCheck.code,
+        preCbBlockReasons
+      });
+    }
+    const eligibleCandidateCount = eligibleCandidateUuids.size;
+    const allTriggeredCbReasons = [];
+    if ((snap1Parsed.uniqueLiveUuidCount === 0 || snap2Parsed.uniqueLiveUuidCount === 0) && totalTrackedNonDeleted >= 3) {
+      allTriggeredCbReasons.push("unexpected_zero_live_clients");
+    }
+    if (eligibleCandidateCount > maxDeletesPerCycle) {
+      allTriggeredCbReasons.push("max_deletes_per_cycle_exceeded");
+    }
+    if (totalTrackedNonDeleted >= 8 && eligibleCandidateCount >= 3 && eligibleCandidateCount / totalTrackedNonDeleted > maxMissingRatio) {
+      allTriggeredCbReasons.push("max_missing_ratio_exceeded");
+    }
+    const primaryCbReason = allTriggeredCbReasons.length > 0 ? allTriggeredCbReasons[0] : null;
+    const circuitBreakerWouldTrigger = allTriggeredCbReasons.length > 0;
+    const missingRatio = totalTrackedNonDeleted > 0 ? Number((eligibleCandidateCount / totalTrackedNonDeleted).toFixed(4)) : 0;
+    const allUuids = /* @__PURE__ */ new Set([
+      ...groups.keys(),
+      ...snap1Parsed.occurrencesByUuid.keys(),
+      ...snap2Parsed.occurrencesByUuid.keys()
+    ]);
+    const liveInboundIdsSet = new Set(snap1Parsed.inboundsById.keys());
+    const dbRefCountByInboundId = /* @__PURE__ */ new Map();
+    const lockBlocksCountByKey = /* @__PURE__ */ new Map();
+    const clientRows = [];
+    const blockingReasonCounts = {};
+    const bumpBlockCount = (reason) => {
+      blockingReasonCounts[reason] = (blockingReasonCounts[reason] || 0) + 1;
+    };
+    const summaryCounts = {
+      liveMatchedHealthy: 0,
+      liveMatchedStatusConflict: 0,
+      liveDuplicateUuidAmbiguous: 0,
+      movedClients: 0,
+      snapshotInconsistentAppeared: 0,
+      snapshotInconsistentDisappeared: 0,
+      snapshotInconsistentMoved: 0,
+      deletionWorkerBlockedBeforeCircuitBreaker: 0,
+      deletionWorkerBlockedByLocks: 0,
+      alreadyMarkedDeletedInDb: 0,
+      ordersOnlyUntracked: 0,
+      untrackedLivePanelClients: 0,
+      flags: {
+        historicalTrials: 0,
+        expiredAccounts: 0,
+        rejectedOrRevokedAccounts: 0,
+        conflictingDbStatuses: 0,
+        liveVsDbEnableMismatch: 0,
+        conflictingOwnership: 0,
+        missingOwnership: 0,
+        conflictingInboundIds: 0,
+        conflictingPanelIdentities: 0,
+        missingPanelIdentity: 0,
+        panelProvenanceUnverifiedLegacy: 0,
+        missingInboundId: 0,
+        referencesRemovedHistoricalInbound: 0,
+        uncertainClientLocks: 0,
+        uncertainInboundLocks: 0,
+        activeInProgressLocks: 0
+      }
+    };
+    for (const uuid of allUuids) {
+      const g = groups.get(uuid) || null;
+      const occ1 = snap1Parsed.occurrencesByUuid.get(uuid) || [];
+      const occ2 = snap2Parsed.occurrencesByUuid.get(uuid) || [];
+      const presentInSnap1 = occ1.length > 0;
+      const presentInSnap2 = occ2.length > 0;
+      const liveInboundIdsSnap1 = Array.from(new Set(occ1.map((o) => o.inboundId))).sort((a, b) => a - b);
+      const liveInboundIdsSnap2 = Array.from(new Set(occ2.map((o) => o.inboundId))).sort((a, b) => a - b);
+      const hasDuplicateLiveUuid = occ1.length > 1 || occ2.length > 1 || snap1Parsed.duplicateLiveUuids.has(uuid) || snap2Parsed.duplicateLiveUuids.has(uuid);
+      const hasDuplicateAcrossDifferentInbounds = liveInboundIdsSnap1.length > 1 || liveInboundIdsSnap2.length > 1 || snap1Parsed.duplicateAcrossDifferentInbounds.has(uuid) || snap2Parsed.duplicateAcrossDifferentInbounds.has(uuid);
+      const primaryLiveOcc = occ1.length === 1 ? occ1[0] : occ2.length === 1 ? occ2[0] : occ1[0] || occ2[0] || null;
+      const liveInboundRemark = primaryLiveOcc ? primaryLiveOcc.remark || null : null;
+      const liveClientEnabled = !hasDuplicateLiveUuid && primaryLiveOcc ? primaryLiveOcc.enabled : null;
+      if (!g) {
+        let classification2 = "untracked_live_panel_client";
+        if (hasDuplicateLiveUuid) {
+          classification2 = "live_duplicate_uuid_ambiguous";
+          summaryCounts.liveDuplicateUuidAmbiguous += 1;
+        } else if (!presentInSnap1 && presentInSnap2) {
+          classification2 = "snapshot_inconsistent_appeared_in_snap2";
+          summaryCounts.snapshotInconsistentAppeared += 1;
+        } else if (presentInSnap1 && !presentInSnap2) {
+          classification2 = "snapshot_inconsistent_disappeared_in_snap2";
+          summaryCounts.snapshotInconsistentDisappeared += 1;
+        } else if (!setsEqualNumbers(liveInboundIdsSnap1, liveInboundIdsSnap2)) {
+          classification2 = "snapshot_inconsistent_moved_between_snapshots";
+          summaryCounts.snapshotInconsistentMoved += 1;
+        } else {
+          summaryCounts.untrackedLivePanelClients += 1;
+        }
+        clientRows.push({
+          clientUuid: uuid,
+          classification: classification2,
+          presentInSnap1,
+          presentInSnap2,
+          liveInboundIdsSnap1,
+          liveInboundIdsSnap2,
+          liveInboundRemark,
+          liveClientEnabled,
+          hasDuplicateLiveUuid,
+          hasDuplicateAcrossDifferentInbounds,
+          dbInboundIds: [],
+          referencesRemovedHistoricalInbound: false,
+          vpnAccountStatuses: [],
+          vpnConfigStatuses: [],
+          orderStatuses: [],
+          hasConflictingDbStatuses: false,
+          statusConflictReasons: [],
+          liveVsDbEnableMismatch: false,
+          isHistoricalTrial: false,
+          isExpiredAccount: false,
+          isRejectedOrRevoked: false,
+          ownerRef: "missing",
+          distinctOwnerCount: 0,
+          hasConflictingOwnership: false,
+          hasMissingOwnership: false,
+          hasConflictingInboundIds: false,
+          hasConflictingPanelIdentities: false,
+          missingPanelIdentity: false,
+          panelProvenanceUnverifiedLegacy: false,
+          missingInboundId: false,
+          panelIdentityCheckCode: "not_in_db",
+          lockStatus: "none",
+          blockingLockKeys: [],
+          wouldPassPreCircuitBreakerGates: false,
+          primaryBlockReason: "not_tracked_in_db",
+          allBlockingReasons: ["not_tracked_in_db"],
+          dbTablesPresent: [],
+          latestVpnCreatedAt: null,
+          latestOrderCreatedAt: null,
+          latestCreatedAt: null
+        });
+        continue;
+      }
+      const dbInboundIds = Array.from(g.distinctInboundIds).sort((a, b) => a - b);
+      for (const ibId of dbInboundIds) {
+        if (g.anyNonDeletedInVpnTables) {
+          dbRefCountByInboundId.set(ibId, (dbRefCountByInboundId.get(ibId) || 0) + 1);
+        }
+      }
+      const referencesRemovedHistoricalInbound = dbInboundIds.some(
+        (id) => !liveInboundIdsSet.has(id)
+      );
+      const vpnAccountStatuses = Array.from(
+        new Set(g.accounts.map((a) => normalizeVpnLifecycleStatus(a?.status, a?.deleted_from_panel_at)))
+      ).sort();
+      const vpnConfigStatuses = Array.from(
+        new Set(g.configs.map((c) => normalizeVpnLifecycleStatus(c?.status, c?.deleted_from_panel_at)))
+      ).sort();
+      const orderStatuses = Array.from(
+        new Set(
+          g.orders.map((o) => {
+            const st = String(o?.status || "").trim().toLowerCase() || "unknown";
+            const pst = String(o?.payment_status || "").trim().toLowerCase();
+            return pst ? `${st}/${pst}` : st;
+          })
+        )
+      ).sort();
+      const statusConflictReasons = [];
+      if (vpnAccountStatuses.length > 1) {
+        statusConflictReasons.push("vpn_accounts_internal_status_conflict");
+      }
+      if (vpnConfigStatuses.length > 1) {
+        statusConflictReasons.push("vpn_configs_internal_status_conflict");
+      }
+      if (vpnAccountStatuses.length === 1 && vpnConfigStatuses.length === 1 && vpnAccountStatuses[0] !== vpnConfigStatuses[0]) {
+        statusConflictReasons.push("vpn_accounts_vs_vpn_configs_status_mismatch");
+      }
+      const hasActiveAccountWithDisabledFlag = g.accounts.some(
+        (a) => normalizeVpnLifecycleStatus(a?.status, a?.deleted_from_panel_at) === "active" && a?.enable === false
+      );
+      const hasActiveConfigWithDisabledFlag = g.configs.some(
+        (c) => normalizeVpnLifecycleStatus(c?.status, c?.deleted_from_panel_at) === "active" && c?.enabled === false
+      );
+      if (hasActiveAccountWithDisabledFlag || hasActiveConfigWithDisabledFlag) {
+        statusConflictReasons.push("active_status_with_disabled_boolean_flag");
+      }
+      const anyVpnActive = vpnAccountStatuses.includes("active") || vpnConfigStatuses.includes("active");
+      const hasAnyOrderApprovedOrActive = g.orders.some((o) => {
+        const st = String(o?.status || "").trim().toLowerCase();
+        const pst = String(o?.payment_status || "").trim().toLowerCase();
+        return st === "active" || st === "completed" || pst === "paid";
+      });
+      const hasRejectedOrCancelledOrder = g.orders.some((o) => {
+        const st = String(o?.status || "").trim().toLowerCase();
+        const pst = String(o?.payment_status || "").trim().toLowerCase();
+        return st === "rejected" || st === "cancelled" || st === "canceled" || pst === "failed" || pst === "cancelled" || pst === "canceled";
+      });
+      if (anyVpnActive && hasRejectedOrCancelledOrder && !hasAnyOrderApprovedOrActive) {
+        statusConflictReasons.push("active_vpn_with_rejected_or_cancelled_order");
+      }
+      const hasConflictingDbStatuses = statusConflictReasons.length > 0;
+      const liveVsDbEnableMismatch = Boolean(
+        presentInSnap1 && presentInSnap2 && !hasDuplicateLiveUuid && liveClientEnabled !== null && (anyVpnActive && liveClientEnabled === false || !anyVpnActive && g.anyNonDeletedInVpnTables && liveClientEnabled === true)
+      );
+      const isHistoricalTrial = g.accounts.some((a) => a?.is_trial === true || String(a?.order_id || "").toUpperCase().startsWith("TRIAL-")) || g.configs.some((c) => c?.is_trial === true || String(c?.order_id || "").toUpperCase().startsWith("TRIAL-")) || g.orders.some((o) => detectTrialOrder(o));
+      const isExpiredAccount = vpnAccountStatuses.includes("expired") || vpnConfigStatuses.includes("expired") || g.accounts.some((a) => {
+        const exp = parseTimestampMs(a?.expires_at ?? a?.expiry_date ?? a?.expiry_time);
+        return exp !== null && exp < nowMs;
+      }) || g.configs.some((c) => {
+        const exp = parseTimestampMs(c?.expires_at ?? c?.expiry_date ?? c?.expiry_time);
+        return exp !== null && exp < nowMs;
+      });
+      const isRejectedOrRevoked = vpnAccountStatuses.includes("revoked") || vpnConfigStatuses.includes("revoked") || g.grants.some((gr) => {
+        const gst = String(gr?.status || "").trim().toLowerCase();
+        return gst === "revoked" || gst === "revoke_failed";
+      }) || hasRejectedOrCancelledOrder && !hasAnyOrderApprovedOrActive;
+      const missingPanelIdentity = g.hasVpnTableRows && g.anyNonDeletedInVpnTables && (g.accounts.some((a) => !a?.deleted_from_panel_at && String(a?.status || "").toLowerCase() !== "deleted" && !String(a?.panel_identity || "").trim()) || g.configs.some((c) => !c?.deleted_from_panel_at && String(c?.status || "").toLowerCase() !== "deleted" && !String(c?.panel_identity || "").trim()));
+      const panelProvenanceUnverifiedLegacy = g.hasVpnTableRows && g.anyNonDeletedInVpnTables && !g.primaryPanelIdentity && !g.primaryServerId;
+      const missingInboundId = g.hasVpnTableRows && g.anyNonDeletedInVpnTables && dbInboundIds.length === 0;
+      const hasConflictingInboundIds = g.distinctInboundIds.size > 1 || presentInSnap1 && !hasDuplicateLiveUuid && liveInboundIdsSnap1.length === 1 && dbInboundIds.some((id) => id !== liveInboundIdsSnap1[0]);
+      const hasConflictingPanelIdentities = g.distinctPanelIdentities.size > 1;
+      const blockingLockKeys = [];
+      let lockStatus = "none";
+      const clientLockKey = `client:${uuid}`;
+      const clientLock = lockByKey.get(clientLockKey);
+      if (clientLock) {
+        const lStatus = String(clientLock.status || "").toLowerCase();
+        blockingLockKeys.push(clientLockKey);
+        if (lStatus === "uncertain") {
+          lockStatus = "uncertain_client_lock";
+        } else if (lStatus === "in_progress") {
+          lockStatus = "in_progress_client_lock";
+        }
+        lockBlocksCountByKey.set(clientLockKey, (lockBlocksCountByKey.get(clientLockKey) || 0) + 1);
+      }
+      for (const ibId of dbInboundIds) {
+        const inboundLockKey = `inbound:${ibId}`;
+        const inboundLock = lockByKey.get(inboundLockKey);
+        if (inboundLock) {
+          const lStatus = String(inboundLock.status || "").toLowerCase();
+          blockingLockKeys.push(inboundLockKey);
+          if (lockStatus === "none") {
+            lockStatus = lStatus === "uncertain" ? "uncertain_inbound_lock" : "in_progress_inbound_lock";
+          }
+          lockBlocksCountByKey.set(inboundLockKey, (lockBlocksCountByKey.get(inboundLockKey) || 0) + 1);
+        }
+      }
+      const dbTablesPresent = [];
+      if (g.accounts.length > 0) dbTablesPresent.push("vpn_accounts");
+      if (g.configs.length > 0) dbTablesPresent.push("vpn_configs");
+      if (g.grants.length > 0) dbTablesPresent.push("vpn_entitlement_grants");
+      if (g.orders.length > 0) dbTablesPresent.push("orders");
+      const ownerRef = g.distinctOwners.size === 1 ? redactOwnerUid(g.primaryOwnerUid) : g.distinctOwners.size > 1 ? "conflicting_multiple_owners" : "missing";
+      const preCb = preCircuitBreakerEvaluations.get(uuid);
+      const allBlockingReasons = [];
+      let classification;
+      if (!g.hasVpnTableRows) {
+        classification = "orders_only_untracked";
+        summaryCounts.ordersOnlyUntracked += 1;
+        allBlockingReasons.push("orders_only_not_in_vpn_tables");
+      } else if (!g.anyNonDeletedInVpnTables || g.allDeletedInVpnTables) {
+        if (presentInSnap1 || presentInSnap2) {
+          classification = hasDuplicateLiveUuid ? "live_duplicate_uuid_ambiguous" : "untracked_live_panel_client";
+          if (hasDuplicateLiveUuid) summaryCounts.liveDuplicateUuidAmbiguous += 1;
+          else summaryCounts.untrackedLivePanelClients += 1;
+          allBlockingReasons.push("already_marked_deleted_in_db_but_present_live");
+        } else {
+          classification = "already_marked_deleted_in_db";
+          summaryCounts.alreadyMarkedDeletedInDb += 1;
+          allBlockingReasons.push("already_marked_deleted_in_db");
+        }
+      } else if (hasDuplicateLiveUuid) {
+        classification = "live_duplicate_uuid_ambiguous";
+        summaryCounts.liveDuplicateUuidAmbiguous += 1;
+        allBlockingReasons.push("duplicate_live_uuid_in_panel");
+      } else if (!presentInSnap1 && presentInSnap2) {
+        classification = "snapshot_inconsistent_appeared_in_snap2";
+        summaryCounts.snapshotInconsistentAppeared += 1;
+        allBlockingReasons.push("reappeared_in_snapshot2");
+      } else if (presentInSnap1 && !presentInSnap2) {
+        classification = "snapshot_inconsistent_disappeared_in_snap2";
+        summaryCounts.snapshotInconsistentDisappeared += 1;
+        allBlockingReasons.push("disappeared_between_snapshot1_and_snapshot2");
+      } else if (presentInSnap1 && presentInSnap2) {
+        if (!setsEqualNumbers(liveInboundIdsSnap1, liveInboundIdsSnap2)) {
+          classification = "snapshot_inconsistent_moved_between_snapshots";
+          summaryCounts.snapshotInconsistentMoved += 1;
+          allBlockingReasons.push("moved_between_snapshot1_and_snapshot2");
+        } else if (liveInboundIdsSnap1.length === 1 && dbInboundIds.some((id) => id !== liveInboundIdsSnap1[0])) {
+          classification = "moved_client";
+          summaryCounts.movedClients += 1;
+          allBlockingReasons.push("live_client_inbound_mismatch");
+        } else if (hasConflictingDbStatuses) {
+          classification = "live_matched_status_conflict";
+          summaryCounts.liveMatchedStatusConflict += 1;
+          allBlockingReasons.push("present_in_live_panel");
+        } else {
+          classification = "live_matched";
+          summaryCounts.liveMatchedHealthy += 1;
+          allBlockingReasons.push("present_in_live_panel");
+        }
+      } else {
+        classification = "absent_two_snapshots_unconfirmed";
+        if (!panelDeletionSyncEnabled) {
+          allBlockingReasons.push("feature_flag_disabled");
+        }
+        if (preCb) {
+          for (const r of preCb.preCbBlockReasons) {
+            if (!allBlockingReasons.includes(r)) allBlockingReasons.push(r);
+          }
+        }
+        if (referencesRemovedHistoricalInbound) {
+          allBlockingReasons.push("historical_inbound_absent_from_panel");
+        }
+        if (preCb?.wouldPassPreCb) {
+          for (const cbReason of allTriggeredCbReasons) {
+            allBlockingReasons.push(`circuit_breaker:${cbReason}`);
+          }
+          if (lockStatus !== "none") {
+            allBlockingReasons.push(lockStatus);
+            summaryCounts.deletionWorkerBlockedByLocks += 1;
+          }
+        } else {
+          summaryCounts.deletionWorkerBlockedBeforeCircuitBreaker += 1;
+          if (lockStatus !== "none") {
+            allBlockingReasons.push(lockStatus);
+          }
+        }
+        for (const r of allBlockingReasons) {
+          bumpBlockCount(r);
+        }
+      }
+      if (g.hasVpnTableRows && g.anyNonDeletedInVpnTables) {
+        if (isHistoricalTrial) summaryCounts.flags.historicalTrials += 1;
+        if (isExpiredAccount) summaryCounts.flags.expiredAccounts += 1;
+        if (isRejectedOrRevoked) summaryCounts.flags.rejectedOrRevokedAccounts += 1;
+        if (hasConflictingDbStatuses) summaryCounts.flags.conflictingDbStatuses += 1;
+        if (liveVsDbEnableMismatch) summaryCounts.flags.liveVsDbEnableMismatch += 1;
+        if (g.hasConflictingOwnership) summaryCounts.flags.conflictingOwnership += 1;
+        if (g.hasMissingOwnership) summaryCounts.flags.missingOwnership += 1;
+        if (hasConflictingInboundIds) summaryCounts.flags.conflictingInboundIds += 1;
+        if (hasConflictingPanelIdentities) summaryCounts.flags.conflictingPanelIdentities += 1;
+        if (missingPanelIdentity) summaryCounts.flags.missingPanelIdentity += 1;
+        if (panelProvenanceUnverifiedLegacy) summaryCounts.flags.panelProvenanceUnverifiedLegacy += 1;
+        if (missingInboundId) summaryCounts.flags.missingInboundId += 1;
+        if (referencesRemovedHistoricalInbound) summaryCounts.flags.referencesRemovedHistoricalInbound += 1;
+        if (lockStatus === "uncertain_client_lock") summaryCounts.flags.uncertainClientLocks += 1;
+        if (lockStatus === "uncertain_inbound_lock") summaryCounts.flags.uncertainInboundLocks += 1;
+        if (lockStatus === "in_progress_client_lock" || lockStatus === "in_progress_inbound_lock") {
+          summaryCounts.flags.activeInProgressLocks += 1;
+        }
+      }
+      let primaryBlockReason = allBlockingReasons[0] || "none";
+      if (classification === "absent_two_snapshots_unconfirmed") {
+        if (preCb && !preCb.wouldPassPreCb && preCb.preCbBlockReasons.length > 0) {
+          primaryBlockReason = preCb.preCbBlockReasons[0];
+        } else if (primaryCbReason) {
+          primaryBlockReason = `circuit_breaker:${primaryCbReason}`;
+        } else if (lockStatus !== "none") {
+          primaryBlockReason = lockStatus;
+        } else if (!panelDeletionSyncEnabled) {
+          primaryBlockReason = "feature_flag_disabled";
+        } else {
+          primaryBlockReason = "eligible_pending_audited_review";
+        }
+      }
+      clientRows.push({
+        clientUuid: uuid,
+        classification,
+        presentInSnap1,
+        presentInSnap2,
+        liveInboundIdsSnap1,
+        liveInboundIdsSnap2,
+        liveInboundRemark,
+        liveClientEnabled,
+        hasDuplicateLiveUuid,
+        hasDuplicateAcrossDifferentInbounds,
+        dbInboundIds,
+        referencesRemovedHistoricalInbound,
+        vpnAccountStatuses,
+        vpnConfigStatuses,
+        orderStatuses,
+        hasConflictingDbStatuses,
+        statusConflictReasons,
+        liveVsDbEnableMismatch,
+        isHistoricalTrial,
+        isExpiredAccount,
+        isRejectedOrRevoked,
+        ownerRef,
+        distinctOwnerCount: g.distinctOwners.size,
+        hasConflictingOwnership: g.hasConflictingOwnership,
+        hasMissingOwnership: g.hasMissingOwnership,
+        hasConflictingInboundIds,
+        hasConflictingPanelIdentities,
+        missingPanelIdentity,
+        panelProvenanceUnverifiedLegacy,
+        missingInboundId,
+        panelIdentityCheckCode: preCb?.panelIdentityCheckCode || "not_evaluated",
+        lockStatus,
+        blockingLockKeys,
+        wouldPassPreCircuitBreakerGates: Boolean(preCb?.wouldPassPreCb),
+        primaryBlockReason,
+        allBlockingReasons,
+        dbTablesPresent,
+        latestVpnCreatedAt: g.latestVpnCreatedAt,
+        latestOrderCreatedAt: g.latestOrderCreatedAt,
+        latestCreatedAt: g.latestCreatedAt
+      });
+    }
+    clientRows.sort((a, b) => {
+      if (a.classification !== b.classification) {
+        return a.classification.localeCompare(b.classification);
+      }
+      return a.clientUuid.localeCompare(b.clientUuid);
+    });
+    const liveInbounds = Array.from(snap1Parsed.inboundsById.values()).sort((a, b) => a.inboundId - b.inboundId).map((ib) => ({
+      inboundId: ib.inboundId,
+      remark: ib.remark,
+      port: ib.port,
+      liveClientCount: ib.liveClientCount,
+      uniqueLiveUuidCount: ib.uniqueLiveUuidCount,
+      dbReferencedUuidCount: dbRefCountByInboundId.get(ib.inboundId) || 0
+    }));
+    const historicalMissingInbounds = Array.from(
+      dbRefCountByInboundId.entries()
+    ).filter(([ibId]) => !liveInboundIdsSet.has(ibId)).sort((a, b) => a[0] - b[0]).map(([inboundId, dbReferencedUuidCount]) => ({
+      inboundId,
+      dbReferencedUuidCount,
+      presentInLivePanel: false
+    }));
+    const activeAndUncertainLocks = activeLocks.map((lk) => {
+      const opKey = String(lk?.operation_key || "").trim();
+      const opKeyLower = opKey.toLowerCase();
+      const scope = opKeyLower.startsWith("client:") ? "client" : opKeyLower.startsWith("inbound:") ? "inbound" : "other";
+      const clientUuid = scope === "client" ? opKeyLower.slice("client:".length) : lk?.client_uuid ? String(lk.client_uuid).trim().toLowerCase() : null;
+      const parsedIb = scope === "inbound" ? Number(opKeyLower.slice("inbound:".length)) : NaN;
+      const inboundId = Number.isInteger(parsedIb) && parsedIb > 0 ? parsedIb : null;
+      const st = String(lk?.status || "").toLowerCase() === "uncertain" ? "uncertain" : "in_progress";
+      return {
+        operationKey: opKey,
+        scope,
+        status: st,
+        operationType: String(lk?.operation_type || "unknown"),
+        clientUuid,
+        inboundId,
+        createdAt: lk?.created_at ? String(lk.created_at) : null,
+        updatedAt: lk?.updated_at ? String(lk.updated_at) : null,
+        uncertainAt: lk?.uncertain_at ? String(lk.uncertain_at) : null,
+        leaseExpiresAt: lk?.lease_expires_at ? String(lk.lease_expires_at) : null,
+        blocksTrackedUuidsCount: lockBlocksCountByKey.get(opKeyLower) || 0
+      };
+    }).sort((a, b) => a.operationKey.localeCompare(b.operationKey));
+    const directProbeSection = {
+      optInRequested: includeDirectProbe,
+      executed: false,
+      skippedReason: includeDirectProbe ? null : "opt_in_disabled_by_default",
+      maxConcurrency: MAX_DIRECT_PROBE_CONCURRENCY,
+      customerBudgetMs: CUSTOMER_LIVE_INBOUND_BUDGET_MS,
+      probedCount: 0,
+      directSucceededCount: 0,
+      directFailedOrEmptyCount: 0,
+      directTimedOutCount: 0,
+      directSkippedBudgetCount: 0,
+      wouldBreakCustomerPromiseAll: null,
+      knownTelemetryNote: "vpnController.ts:29 and clientController.ts:30 hardcode '3X-UI Time: 0ms'; actual 3X-UI latency is included inside Database Time.",
+      inbounds: []
+    };
+    if (includeDirectProbe) {
+      const minBudgetForDirectProbesMs = Math.min(2e3, Math.floor(totalBudgetMs * 0.25));
+      const remainingBeforeProbes = deadlineMs - Date.now() - serializationReserveMs;
+      if (controller.signal.aborted || remainingBeforeProbes < minBudgetForDirectProbesMs) {
+        directProbeSection.skippedReason = externallyCancelled ? "diagnostic_aborted" : "insufficient_remaining_budget";
+      } else {
+        const targetInboundIds = [];
+        for (const hist of historicalMissingInbounds) {
+          if (targetInboundIds.length < MAX_DIRECT_PROBE_INBOUNDS) {
+            targetInboundIds.push(hist.inboundId);
+          }
+        }
+        for (const live of liveInbounds) {
+          if (targetInboundIds.length < MAX_DIRECT_PROBE_INBOUNDS && !targetInboundIds.includes(live.inboundId)) {
+            targetInboundIds.push(live.inboundId);
+          }
+        }
+        directProbeSection.executed = true;
+        directProbeSection.skippedReason = null;
+        const probeEntries = await runBoundedConcurrency(
+          targetInboundIds,
+          MAX_DIRECT_PROBE_CONCURRENCY,
+          async (inboundId) => {
+            const fullListInfo = snap1Parsed.inboundsById.get(inboundId);
+            const presentInFullList = Boolean(fullListInfo);
+            const fullListClientCount = fullListInfo ? fullListInfo.liveClientCount : null;
+            const remainingNow = deadlineMs - Date.now() - serializationReserveMs;
+            if (controller.signal.aborted || remainingNow < 200) {
+              return {
+                inboundId,
+                presentInFullList,
+                fullListClientCount,
+                directGetOutcome: "skipped_budget",
+                directGetLatencyMs: null,
+                httpStatus: null,
+                directGetHasObj: false,
+                directGetClientCount: null,
+                matchesFullListClientCount: null,
+                errorCode: null
+              };
+            }
+            const probeTimeoutMs = Math.min(CUSTOMER_LIVE_INBOUND_BUDGET_MS, Math.max(200, remainingNow));
+            try {
+              const probeRes = await probeInboundFn(inboundId, {
+                timeoutMs: probeTimeoutMs,
+                signal: controller.signal,
+                dbClient,
+                sessionState: diagnosticSessionState
+              });
+              const matchesCount = presentInFullList && probeRes.outcome === "ok_valid_inbound" && probeRes.clientCount !== null ? probeRes.clientCount === fullListClientCount : null;
+              return {
+                inboundId,
+                presentInFullList,
+                fullListClientCount,
+                directGetOutcome: probeRes.outcome,
+                directGetLatencyMs: probeRes.latencyMs,
+                httpStatus: probeRes.httpStatus,
+                directGetHasObj: probeRes.hasObj,
+                directGetClientCount: probeRes.clientCount,
+                matchesFullListClientCount: matchesCount,
+                errorCode: probeRes.errorCode
+              };
+            } catch {
+              return {
+                inboundId,
+                presentInFullList,
+                fullListClientCount,
+                directGetOutcome: controller.signal.aborted ? "aborted" : "network_error",
+                directGetLatencyMs: null,
+                httpStatus: null,
+                directGetHasObj: false,
+                directGetClientCount: null,
+                matchesFullListClientCount: null,
+                errorCode: controller.signal.aborted ? "diagnostic_aborted" : "panel_network_error"
+              };
+            }
+          }
+        );
+        probeEntries.sort((a, b) => a.inboundId - b.inboundId);
+        directProbeSection.inbounds = probeEntries;
+        directProbeSection.probedCount = probeEntries.filter(
+          (e) => e.directGetOutcome !== "skipped_budget"
+        ).length;
+        directProbeSection.directSucceededCount = probeEntries.filter(
+          (e) => e.directGetOutcome === "ok_valid_inbound"
+        ).length;
+        directProbeSection.directTimedOutCount = probeEntries.filter(
+          (e) => e.directGetOutcome === "timeout"
+        ).length;
+        directProbeSection.directSkippedBudgetCount = probeEntries.filter(
+          (e) => e.directGetOutcome === "skipped_budget"
+        ).length;
+        directProbeSection.directFailedOrEmptyCount = probeEntries.filter(
+          (e) => e.directGetOutcome !== "ok_valid_inbound" && e.directGetOutcome !== "skipped_budget"
+        ).length;
+        directProbeSection.wouldBreakCustomerPromiseAll = probeEntries.some(
+          (e) => e.directGetOutcome === "timeout" || e.directGetOutcome === "http_200_null_or_empty_obj" || e.directGetOutcome === "malformed_settings_clients" || e.directGetOutcome === "http_4xx" || e.directGetOutcome === "http_5xx" || e.directGetOutcome === "network_error" || e.directGetLatencyMs !== null && e.directGetLatencyMs >= CUSTOMER_LIVE_INBOUND_BUDGET_MS
+        );
+      }
+    }
+    if (controller.signal.aborted) {
+      return buildAbortedReport(
+        externallyCancelled ? "diagnostic_aborted" : "diagnostic_deadline_exceeded"
+      );
+    }
+    const executionMs = Math.max(0, Date.now() - startedAtMs);
+    return {
+      success: true,
+      readOnly: true,
+      aborted: false,
+      abortReason: null,
+      generatedAt,
+      executionMs,
+      budget: {
+        totalBudgetMs,
+        remainingBudgetMs: Math.max(0, deadlineMs - Date.now()),
+        deadlineExceeded,
+        cancelled: externallyCancelled
+      },
+      runtimeLimits: {
+        mutexScope: "per_instance_in_memory",
+        rateLimitScope: "per_instance_in_memory",
+        directProbeOptIn: includeDirectProbe,
+        maxDirectProbeConcurrency: MAX_DIRECT_PROBE_CONCURRENCY,
+        note: "In-process mutex and rate limiting are enforced per backend instance and are not distributed across multiple replicas."
+      },
+      panel: {
+        panelIdentity: resolvedPanelIdentity,
+        connectionMode: configuredServersCount > 0 ? "configured_servers_present" : "env_single_panel",
+        configuredXuiServersCount: configuredServersCount,
+        panelProvenanceNote: configuredServersCount === 0 ? "xui_servers is empty; verifyRecordPanelIdentity permits legacy rows without panel_identity under single-panel fallback (matched_single_panel_legacy), which does NOT independently prove historical records originated on the current panel." : `${configuredServersCount} xui_servers record(s) configured; legacy rows without panel_identity require manual panel provenance verification.`,
+        panelDeletionSyncEnabled,
+        snapshots: snapshotMeta
+      },
+      schemaCompatibility: {
+        vpnConfigsOwnershipColumn: "customer_uid",
+        vpnAccountsHasInboundId: false,
+        missingOptionalColumnsByTable,
+        optionalTablesMissing
+      },
+      liveInbounds,
+      historicalMissingInbounds,
+      summary: {
+        uniqueDbTrackedNonDeleted: totalTrackedNonDeleted,
+        uniqueDbAllIncludingDeletedAndOrders: groups.size,
+        livePanelUniqueClientsSnap1: snap1Parsed.uniqueLiveUuidCount,
+        livePanelUniqueClientsSnap2: snap2Parsed.uniqueLiveUuidCount,
+        liveMatchedHealthy: summaryCounts.liveMatchedHealthy,
+        liveMatchedStatusConflict: summaryCounts.liveMatchedStatusConflict,
+        liveDuplicateUuidAmbiguous: summaryCounts.liveDuplicateUuidAmbiguous,
+        movedClients: summaryCounts.movedClients,
+        snapshotInconsistentAppeared: summaryCounts.snapshotInconsistentAppeared,
+        snapshotInconsistentDisappeared: summaryCounts.snapshotInconsistentDisappeared,
+        snapshotInconsistentMoved: summaryCounts.snapshotInconsistentMoved,
+        rawAbsentFromSnap1,
+        rawAbsentBothSnapshots,
+        deletionWorkerEligibleCandidates: eligibleCandidateCount,
+        deletionWorkerBlockedBeforeCircuitBreaker: summaryCounts.deletionWorkerBlockedBeforeCircuitBreaker,
+        deletionWorkerBlockedByLocks: summaryCounts.deletionWorkerBlockedByLocks,
+        alreadyMarkedDeletedInDb: summaryCounts.alreadyMarkedDeletedInDb,
+        ordersOnlyUntracked: summaryCounts.ordersOnlyUntracked,
+        untrackedLivePanelClients: summaryCounts.untrackedLivePanelClients,
+        flags: summaryCounts.flags,
+        blockingReasonCounts
+      },
+      circuitBreakerEvaluation: {
+        evaluated: true,
+        wouldTrigger: circuitBreakerWouldTrigger,
+        primaryReason: primaryCbReason,
+        allTriggeredReasons: allTriggeredCbReasons,
+        eligibleCandidateCount,
+        rawAbsentBothSnapshotsCount: rawAbsentBothSnapshots,
+        totalTrackedNonDeleted,
+        missingRatio,
+        maxDeletesPerCycle,
+        maxMissingRatio
+      },
+      activeAndUncertainLocks,
+      directInboundVerificationProbe: directProbeSection,
+      clients: clientRows
+    };
+  } finally {
+    clearTimeout(deadlineTimer);
+    if (options?.signal) {
+      options.signal.removeEventListener("abort", onExternalAbort);
+    }
+  }
+}
+var SYNC_DIAGNOSTICS_CSV_HEADERS = [
+  "client_uuid",
+  "classification",
+  "present_in_snap1",
+  "present_in_snap2",
+  "live_inbound_ids_snap1",
+  "live_inbound_ids_snap2",
+  "live_inbound_remark",
+  "live_client_enabled",
+  "has_duplicate_live_uuid",
+  "has_duplicate_across_different_inbounds",
+  "db_inbound_ids",
+  "references_removed_historical_inbound",
+  "vpn_account_statuses",
+  "vpn_config_statuses",
+  "order_statuses",
+  "has_conflicting_db_statuses",
+  "status_conflict_reasons",
+  "live_vs_db_enable_mismatch",
+  "is_historical_trial",
+  "is_expired_account",
+  "is_rejected_or_revoked",
+  "owner_ref",
+  "distinct_owner_count",
+  "has_conflicting_ownership",
+  "has_missing_ownership",
+  "has_conflicting_inbound_ids",
+  "has_conflicting_panel_identities",
+  "missing_panel_identity",
+  "panel_provenance_unverified_legacy",
+  "missing_inbound_id",
+  "panel_identity_check_code",
+  "lock_status",
+  "blocking_lock_keys",
+  "would_pass_pre_circuit_breaker_gates",
+  "primary_block_reason",
+  "all_blocking_reasons",
+  "db_tables_present",
+  "latest_vpn_created_at",
+  "latest_order_created_at",
+  "latest_created_at"
+];
+function formatSyncDiagnosticsCsv(report) {
+  const lines = [];
+  lines.push(SYNC_DIAGNOSTICS_CSV_HEADERS.map((h) => sanitizeCsvCell(h)).join(","));
+  for (const row of report.clients) {
+    const cells = [
+      row.clientUuid,
+      row.classification,
+      row.presentInSnap1,
+      row.presentInSnap2 === null ? "not_run" : row.presentInSnap2,
+      row.liveInboundIdsSnap1.join("|"),
+      row.liveInboundIdsSnap2.join("|"),
+      row.liveInboundRemark ?? "",
+      row.liveClientEnabled === null ? "" : row.liveClientEnabled,
+      row.hasDuplicateLiveUuid,
+      row.hasDuplicateAcrossDifferentInbounds,
+      row.dbInboundIds.join("|"),
+      row.referencesRemovedHistoricalInbound,
+      row.vpnAccountStatuses.join("|"),
+      row.vpnConfigStatuses.join("|"),
+      row.orderStatuses.join("|"),
+      row.hasConflictingDbStatuses,
+      row.statusConflictReasons.join("|"),
+      row.liveVsDbEnableMismatch,
+      row.isHistoricalTrial,
+      row.isExpiredAccount,
+      row.isRejectedOrRevoked,
+      row.ownerRef,
+      row.distinctOwnerCount,
+      row.hasConflictingOwnership,
+      row.hasMissingOwnership,
+      row.hasConflictingInboundIds,
+      row.hasConflictingPanelIdentities,
+      row.missingPanelIdentity,
+      row.panelProvenanceUnverifiedLegacy,
+      row.missingInboundId,
+      row.panelIdentityCheckCode,
+      row.lockStatus,
+      row.blockingLockKeys.join("|"),
+      row.wouldPassPreCircuitBreakerGates,
+      row.primaryBlockReason,
+      row.allBlockingReasons.join("|"),
+      row.dbTablesPresent.join("|"),
+      row.latestVpnCreatedAt ?? "",
+      row.latestOrderCreatedAt ?? "",
+      row.latestCreatedAt ?? ""
+    ];
+    lines.push(cells.map((c) => sanitizeCsvCell(c)).join(","));
+  }
+  return `${lines.join("\r\n")}\r
+`;
+}
+
+// src/api/controllers/syncDiagnosticsController.ts
+function parseBooleanQueryParam(raw) {
+  if (raw === void 0 || raw === null || raw === "") {
+    return { ok: true, value: false };
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") {
+    return { ok: true, value: true };
+  }
+  if (normalized === "false" || normalized === "0") {
+    return { ok: true, value: false };
+  }
+  return { ok: false };
+}
+function parseFormatQueryParam(raw, defaultFormat) {
+  if (raw === void 0 || raw === null || raw === "") {
+    return { ok: true, value: defaultFormat };
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === "json" || normalized === "csv") {
+    return { ok: true, value: normalized };
+  }
+  return { ok: false };
+}
+function buildSafeCsvFilename(generatedAtIso) {
+  const safeStamp = String(generatedAtIso || (/* @__PURE__ */ new Date()).toISOString()).replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").replace(/[^A-Za-z0-9TZ]/g, "");
+  return `firevpns-sync-diagnostics-${safeStamp || "report"}.csv`;
+}
+function setNoStoreDiagnosticHeaders(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Diagnostics-Read-Only", "true");
+}
+function createSyncDiagnosticsHandlers(deps) {
+  const runDiagnostics = deps?.runDiagnosticsFn ?? runReadOnlySyncDiagnostics;
+  const defaultBudgetMs = deps?.defaultBudgetMs ?? DEFAULT_DIAGNOSTIC_BUDGET_MS;
+  let activeDiagnosticPromise = null;
+  const isDiagnosticRunActive = () => activeDiagnosticPromise !== null;
+  const handleRequest = async (req, res, defaultFormat) => {
+    setNoStoreDiagnosticHeaders(res);
+    const directProbeParam = parseBooleanQueryParam(req.query?.includeDirectProbe);
+    if (!directProbeParam.ok) {
+      res.status(400).json({
+        success: false,
+        readOnly: true,
+        aborted: true,
+        errorCode: "invalid_query_parameter",
+        error: "Invalid includeDirectProbe parameter. Expected true or false."
+      });
+      return;
+    }
+    const formatParam = parseFormatQueryParam(req.query?.format, defaultFormat);
+    if (!formatParam.ok) {
+      res.status(400).json({
+        success: false,
+        readOnly: true,
+        aborted: true,
+        errorCode: "invalid_query_parameter",
+        error: "Invalid format parameter. Expected json or csv."
+      });
+      return;
+    }
+    if (activeDiagnosticPromise !== null) {
+      res.status(409).json({
+        success: false,
+        readOnly: true,
+        aborted: true,
+        errorCode: "diagnostic_already_running",
+        error: "A read-only synchronization diagnostic scan is already running on this backend instance. Please retry after it completes."
+      });
+      return;
+    }
+    const requestAbortController = new AbortController();
+    const serverTimeoutSignal = req.timeoutSignal;
+    const OUTER_SERIALIZATION_SAFETY_MARGIN_MS = 1e3;
+    const DEFAULT_OUTER_API_TIMEOUT_MS = 25e3;
+    let effectiveBudgetMs = defaultBudgetMs;
+    const rawDeadlineMs = Number(req.requestDeadlineMs);
+    const rawStartedAtMs = Number(req.requestStartedAt);
+    if (Number.isFinite(rawDeadlineMs) && rawDeadlineMs > 0) {
+      const remainingOuterMs = rawDeadlineMs - Date.now() - OUTER_SERIALIZATION_SAFETY_MARGIN_MS;
+      if (remainingOuterMs <= 0) {
+        res.status(504).json({
+          success: false,
+          readOnly: true,
+          aborted: true,
+          errorCode: "diagnostic_deadline_exceeded",
+          error: "Insufficient remaining request budget to execute read-only synchronization diagnostics."
+        });
+        return;
+      }
+      effectiveBudgetMs = Math.min(defaultBudgetMs, Math.max(300, Math.floor(remainingOuterMs)));
+    } else if (Number.isFinite(rawStartedAtMs) && rawStartedAtMs > 0) {
+      const remainingOuterMs = rawStartedAtMs + DEFAULT_OUTER_API_TIMEOUT_MS - Date.now() - OUTER_SERIALIZATION_SAFETY_MARGIN_MS;
+      if (remainingOuterMs <= 0) {
+        res.status(504).json({
+          success: false,
+          readOnly: true,
+          aborted: true,
+          errorCode: "diagnostic_deadline_exceeded",
+          error: "Insufficient remaining request budget to execute read-only synchronization diagnostics."
+        });
+        return;
+      }
+      effectiveBudgetMs = Math.min(defaultBudgetMs, Math.max(300, Math.floor(remainingOuterMs)));
+    }
+    const onServerTimeoutAbort = () => {
+      if (!requestAbortController.signal.aborted) {
+        requestAbortController.abort(new Error("diagnostic_deadline_exceeded"));
+      }
+    };
+    const onResponseClose = () => {
+      if (!res.writableEnded && !requestAbortController.signal.aborted) {
+        requestAbortController.abort(new Error("diagnostic_aborted"));
+      }
+    };
+    if (serverTimeoutSignal) {
+      if (serverTimeoutSignal.aborted) {
+        onServerTimeoutAbort();
+      } else {
+        serverTimeoutSignal.addEventListener("abort", onServerTimeoutAbort, { once: true });
+      }
+    }
+    res.on("close", onResponseClose);
+    const runPromise = runDiagnostics({
+      includeDirectProbe: directProbeParam.value,
+      totalBudgetMs: effectiveBudgetMs,
+      signal: requestAbortController.signal
+    });
+    activeDiagnosticPromise = runPromise;
+    runPromise.catch(() => {
+    }).finally(() => {
+      if (activeDiagnosticPromise === runPromise) {
+        activeDiagnosticPromise = null;
+      }
+      if (serverTimeoutSignal) {
+        serverTimeoutSignal.removeEventListener("abort", onServerTimeoutAbort);
+      }
+      res.removeListener("close", onResponseClose);
+    });
+    try {
+      const report = await runPromise;
+      if (res.headersSent || res.writableEnded) {
+        return;
+      }
+      if (report.aborted || !report.success) {
+        const statusCode = report.abortReason === "diagnostic_deadline_exceeded" ? 504 : 503;
+        res.status(statusCode).json({
+          success: false,
+          readOnly: true,
+          aborted: true,
+          errorCode: report.abortReason || "diagnostic_aborted",
+          report
+        });
+        return;
+      }
+      if (formatParam.value === "csv") {
+        const csvBody = formatSyncDiagnosticsCsv(report);
+        if (res.headersSent || res.writableEnded) {
+          return;
+        }
+        const filename = buildSafeCsvFilename(report.generatedAt);
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        res.status(200).send(csvBody);
+        return;
+      }
+      res.status(200).json(report);
+    } catch {
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(503).json({
+          success: false,
+          readOnly: true,
+          aborted: true,
+          errorCode: "diagnostic_execution_failed",
+          error: "Read-only synchronization diagnostics failed safely with zero modifications."
+        });
+      }
+    }
+  };
+  return {
+    getSyncDiagnosticsHandler: (req, res) => handleRequest(req, res, "json"),
+    getSyncDiagnosticsCsvHandler: (req, res) => handleRequest(req, res, "csv"),
+    isDiagnosticRunActive
+  };
+}
+var defaultHandlers = createSyncDiagnosticsHandlers();
+var getSyncDiagnosticsHandler = defaultHandlers.getSyncDiagnosticsHandler;
+var getSyncDiagnosticsCsvHandler = defaultHandlers.getSyncDiagnosticsCsvHandler;
+var isSyncDiagnosticsRunActive = defaultHandlers.isDiagnosticRunActive;
+
 // src/api/routes/adminRoutes.ts
 var router2 = Router2();
 router2.use(authMiddleware);
@@ -23653,6 +26565,8 @@ router2.get("/payment-slips/signed-url", getPaymentSlipSignedUrlHandler);
 router2.post("/payment-slips/signed-url", getPaymentSlipSignedUrlHandler);
 router2.get("/ai-settings", getAdminAiSettingsHandler);
 router2.post("/ai-settings", saveAdminAiSettingsHandler);
+router2.get("/sync-diagnostics", adminDiagnosticRateLimit, getSyncDiagnosticsHandler);
+router2.get("/sync-diagnostics/csv", adminDiagnosticRateLimit, getSyncDiagnosticsCsvHandler);
 var adminRoutes_default = router2;
 
 // src/api/routes/clientRoutes.ts
@@ -24393,13 +27307,13 @@ var aiRoutes_default = router9;
 // src/api/routes/telegramRoutes.ts
 init_telegramService();
 import { Router as Router10 } from "express";
-import crypto7 from "crypto";
+import crypto8 from "crypto";
 var router10 = Router10();
 function safeCompareSecret(provided, expected) {
   const a = Buffer.from(provided, "utf8");
   const b = Buffer.from(expected, "utf8");
   if (a.length !== b.length) return false;
-  return crypto7.timingSafeEqual(a, b);
+  return crypto8.timingSafeEqual(a, b);
 }
 var telegramWebhookHandler = async (req, res) => {
   try {
