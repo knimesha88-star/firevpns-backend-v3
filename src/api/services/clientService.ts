@@ -76,9 +76,11 @@ export const getClientStatus = async (
   });
 
   if (myConfigs.length > 0) {
-    // Prefer verified active configs when selecting a default, while keeping disabled/expired/unavailable configs visible
+    // Prefer verified active configs when selecting a default, and prefer usable (non-panel-absent) configs
+    // over reliably verified panel-absent historical records.
     const now = Date.now();
-    const activeOnly = myConfigs.filter((c: any) => {
+    const usableConfigs = myConfigs.filter((c: any) => c.panelWideAbsentVerified !== true);
+    const activeOnly = usableConfigs.filter((c: any) => {
       const st = String(c.status || '').toLowerCase().trim();
       if (
         st !== 'active' ||
@@ -98,12 +100,21 @@ export const getClientStatus = async (
     let selectedConfig = null;
 
     if (activeUuid && !deletedUuidSet.has(String(activeUuid).trim().toLowerCase())) {
-      selectedConfig = activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase())
-        || myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === String(activeUuid).toLowerCase());
+      const normActiveUuid = String(activeUuid).toLowerCase();
+      if (targetUuid) {
+        selectedConfig =
+          activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === normActiveUuid) ||
+          usableConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === normActiveUuid) ||
+          myConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === normActiveUuid);
+      } else {
+        selectedConfig =
+          activeOnly.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === normActiveUuid) ||
+          usableConfigs.find((c: any) => c.uuid && String(c.uuid).toLowerCase() === normActiveUuid);
+      }
     }
 
     if (!selectedConfig) {
-      selectedConfig = activeOnly[0] || myConfigs[0] || null;
+      selectedConfig = activeOnly[0] || usableConfigs[0] || myConfigs[0] || null;
     }
 
     if (selectedConfig) {
@@ -158,6 +169,9 @@ export const getClientStatus = async (
         isTrial: Boolean(selectedConfig.isTrial),
         trafficResetEligible: selectedConfig.trafficResetEligible === true,
         isUnlimitedPlan: selectedConfig.isUnlimitedPlan === true,
+        panelWideAbsentVerified: selectedConfig.panelWideAbsentVerified === true,
+        panelAbsenceClassification: selectedConfig.panelAbsenceClassification || null,
+        panelProvenanceVerified: selectedConfig.panelProvenanceVerified === true,
         deletedUuids,
       };
     }

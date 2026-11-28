@@ -15,9 +15,11 @@ import {
   registerClientTrafficCacheInvalidator,
   unregisterClientTrafficCacheInvalidator,
   invalidateInboundCache,
+  fetchUncachedLiveInboundsList,
   ClientTrafficMutationState,
   GetInboundsOptions,
   ResetClientTrafficOptions,
+  UncachedInboundsListReadResult,
 } from './xuiService.js';
 import { createCustomerNotification } from './notificationService.js';
 import crypto from 'crypto';
@@ -1151,6 +1153,9 @@ export const buildRejectedVpnDisplayConfig = (ord: any, grant?: any): Record<str
     rejectionReason: safeReason,
     trafficResetEligible: false,
     isUnlimitedPlan: false,
+    panelWideAbsentVerified: false,
+    panelAbsenceClassification: null,
+    panelProvenanceVerified: false,
   };
 };
 
@@ -1162,6 +1167,11 @@ export type VpnTrafficSource =
   | 'reset_confirmed'
   | 'unknown';
 
+export type PanelAbsenceClassification =
+  | 'absent_from_current_panel'
+  | 'absent_from_current_panel_unverified_provenance'
+  | null;
+
 export interface GetMyConfigsOptions {
   dbClient?: any;
   adminDbClient?: any;
@@ -1171,6 +1181,9 @@ export interface GetMyConfigsOptions {
     options?: boolean | { forceRefresh?: boolean; timeoutMs?: number }
   ) => Promise<any | null>;
   getInboundsFn?: (forceRefresh?: boolean, options?: GetInboundsOptions) => Promise<any[]>;
+  fetchUncachedLiveInboundsListFn?: (options?: {
+    timeoutMs?: number;
+  }) => Promise<UncachedInboundsListReadResult>;
   verifyDeletedFn?: typeof verifyAndMarkClientDeletedIfConfirmed;
   currentPanelIdentity?: string;
   totalRequestBudgetMs?: number;
@@ -2058,8 +2071,49 @@ export const getMyConfigs = async (
   // Track ONLY live-verified inbounds fetched from 3X-UI
   const liveInboundsMap = new Map<number, any>();
   const cleanlyParsedLiveInboundIds = new Set<number>();
+  const panelWideInboundIds = new Set<number>();
+  const failedLiveInboundFetchIds = new Set<number>();
   let liveFullListFetched = false;
   let liveFullListCleanlyParsed = false;
+  let coldStartTimedOut = false;
+  let coldStartFailed = false;
+  let liveInboundTimedOut = false;
+  let panelWideReadTimedOut = false;
+  let panelWideReadFailed = false;
+  let hasMalformedLiveInbound = false;
+  let panelWideHasDuplicateInboundIds = false;
+
+  const registerAuthoritativePanelWideInboundsList = (inboundList: any[]) => {
+    if (!Array.isArray(inboundList) || inboundList.length === 0) {
+      panelWideReadFailed = true;
+      return;
+    }
+    const seenIds = new Set<number>();
+    let allClean = true;
+    for (const ib of inboundList) {
+      const parsed = parseInboundSettingsClientsStrict(ib);
+      if (!parsed.ok) {
+        allClean = false;
+        hasMalformedLiveInbound = true;
+        continue;
+      }
+      if (seenIds.has(parsed.inboundId)) {
+        allClean = false;
+        panelWideHasDuplicateInboundIds = true;
+      }
+      seenIds.add(parsed.inboundId);
+      panelWideInboundIds.add(parsed.inboundId);
+      liveInboundsMap.set(parsed.inboundId, ib);
+      cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+    }
+    liveFullListFetched = true;
+    liveFullListCleanlyParsed =
+      allClean &&
+      !hasMalformedLiveInbound &&
+      !panelWideHasDuplicateInboundIds &&
+      seenIds.size === inboundList.length &&
+      seenIds.size > 0;
+  };
 
   const hasMissingInboundId = configs.some(
     c =>
@@ -2097,10 +2151,11 @@ export const getMyConfigs = async (
           fetchInboundsList(false, resolvedPanelIdentity ? { panelIdentity: resolvedPanelIdentity } : undefined),
           coldStartWaitMs,
           () => {
+            coldStartTimedOut = true;
             console.warn(`[Live Traffic Engine] Cold-start full inbound list wait exceeded ${coldStartWaitMs}ms; continuing with shared warm-up.`);
           }
         );
-        if (Array.isArray(freshList) && freshList.length > 0) {
+        if (!coldStartTimedOut && Array.isArray(freshList) && freshList.length > 0) {
           cachedFallbackInbounds = freshList;
           resolveMissingInboundIds(freshList);
 
@@ -2111,24 +2166,17 @@ export const getMyConfigs = async (
             (cacheTsAfter > 0 && Date.now() - cacheTsAfter < 10000);
 
           if (isFreshLiveFetch) {
-            liveFullListFetched = true;
-            let allClean = true;
-            freshList.forEach(ib => {
-              const parsed = parseInboundSettingsClientsStrict(ib);
-              if (parsed.ok) {
-                liveInboundsMap.set(parsed.inboundId, ib);
-                cleanlyParsedLiveInboundIds.add(parsed.inboundId);
-              } else {
-                allClean = false;
-              }
-            });
-            liveFullListCleanlyParsed = allClean;
+            registerAuthoritativePanelWideInboundsList(freshList);
           }
+        } else if (!coldStartTimedOut) {
+          coldStartFailed = true;
         }
       } catch (err: any) {
+        coldStartFailed = true;
         console.warn('[Live Traffic Engine] Cold-start inbound lookup failed:', err?.message || err);
       }
     } else {
+      coldStartTimedOut = true;
       console.warn(
         `[Live Traffic Engine] Skipping cold-start wait: customer request deadline budget exhausted (${remainingForColdStartMs}ms remaining).`
       );
@@ -2143,12 +2191,13 @@ export const getMyConfigs = async (
       .map(id => Number(id))
   )).filter(id => !liveInboundsMap.has(id));
 
+  const requestedLiveInboundMs =
+    options?.liveInboundTimeoutMs && Number.isFinite(options.liveInboundTimeoutMs) && options.liveInboundTimeoutMs > 0
+      ? Math.floor(options.liveInboundTimeoutMs)
+      : CUSTOMER_MAX_LIVE_INBOUND_WAIT_MS;
+
   if (userInboundIds.length > 0) {
     const remainingForLiveInboundMs = getRemainingCustomerBudgetMs();
-    const requestedLiveInboundMs =
-      options?.liveInboundTimeoutMs && Number.isFinite(options.liveInboundTimeoutMs) && options.liveInboundTimeoutMs > 0
-        ? Math.floor(options.liveInboundTimeoutMs)
-        : CUSTOMER_MAX_LIVE_INBOUND_WAIT_MS;
     const liveInboundWaitMs = Math.min(requestedLiveInboundMs, remainingForLiveInboundMs);
 
     if (liveInboundWaitMs >= 20) {
@@ -2159,74 +2208,71 @@ export const getMyConfigs = async (
             Promise.all(userInboundIds.map(id => fetchLiveInbound(id))),
             liveInboundWaitMs,
             () => {
+              liveInboundTimedOut = true;
               console.warn(`[Live Traffic Engine] Live inbound fetch timed out after ${liveInboundWaitMs}ms; panel status unverified.`);
             }
           )) || [];
-        liveResults.forEach(ib => {
-          if (ib && ib.id) {
-            const parsed = parseInboundSettingsClientsStrict(ib);
-            if (parsed.ok) {
-              liveInboundsMap.set(parsed.inboundId, ib);
-              cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+        if (!liveInboundTimedOut && Array.isArray(liveResults) && liveResults.length === userInboundIds.length) {
+          userInboundIds.forEach((reqId, idx) => {
+            const ib = liveResults[idx];
+            if (ib && ib.id) {
+              const parsed = parseInboundSettingsClientsStrict(ib);
+              if (parsed.ok) {
+                liveInboundsMap.set(parsed.inboundId, ib);
+                cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+                if (parsed.inboundId !== reqId) {
+                  failedLiveInboundFetchIds.add(reqId);
+                }
+              } else {
+                failedLiveInboundFetchIds.add(reqId);
+                hasMalformedLiveInbound = true;
+              }
+            } else {
+              failedLiveInboundFetchIds.add(reqId);
             }
-          }
-        });
+          });
+        } else {
+          userInboundIds.forEach(reqId => failedLiveInboundFetchIds.add(reqId));
+        }
       } catch (err: any) {
+        userInboundIds.forEach(reqId => failedLiveInboundFetchIds.add(reqId));
         console.warn(`[Live Traffic Engine] Error fetching live customer inbounds:`, err.message || err);
       }
     } else {
+      liveInboundTimedOut = true;
+      userInboundIds.forEach(reqId => failedLiveInboundFetchIds.add(reqId));
       console.warn(
         `[Live Traffic Engine] Skipping live inbound fetch: customer request deadline budget exhausted (${remainingForLiveInboundMs}ms remaining); returning safe Status Unavailable fallback.`
       );
     }
   }
 
-  const liveInbounds = Array.from(liveInboundsMap.values());
-
   // Build strict live UUID map from cleanly parsed settings.clients[] ONLY (NEVER clientStats)
   // Reject duplicate UUIDs across inbounds so ambiguous UUID mappings are never trusted.
   const liveClientByUuid = new Map<string, { inbound: any; client: any }>();
   const duplicateLiveUuids = new Set<string>();
-  for (const ib of liveInbounds) {
-    const parsed = parseInboundSettingsClientsStrict(ib);
-    if (!parsed.ok) continue;
-    for (const c of parsed.clients) {
-      const cUuid = String(c?.id || '').trim().toLowerCase();
-      if (!cUuid) continue;
-      if (duplicateLiveUuids.has(cUuid)) {
-        continue;
+  const rebuildLiveClientLookup = () => {
+    liveClientByUuid.clear();
+    duplicateLiveUuids.clear();
+    for (const ib of liveInboundsMap.values()) {
+      const parsed = parseInboundSettingsClientsStrict(ib);
+      if (!parsed.ok) continue;
+      for (const c of parsed.clients) {
+        const cUuid = String(c?.id || '').trim().toLowerCase();
+        if (!cUuid) continue;
+        if (duplicateLiveUuids.has(cUuid)) {
+          continue;
+        }
+        if (liveClientByUuid.has(cUuid)) {
+          liveClientByUuid.delete(cUuid);
+          duplicateLiveUuids.add(cUuid);
+          continue;
+        }
+        liveClientByUuid.set(cUuid, { inbound: ib, client: c });
       }
-      if (liveClientByUuid.has(cUuid)) {
-        liveClientByUuid.delete(cUuid);
-        duplicateLiveUuids.add(cUuid);
-        continue;
-      }
-      liveClientByUuid.set(cUuid, { inbound: ib, client: c });
     }
-  }
-
-  // Build read-only fallback client map from cached inbounds strictly for preserving numeric
-  // traffic usage when the panel is temporarily unreachable (never for Active/Disabled/Deleted claims).
-  // Reject duplicate UUIDs across cached inbounds.
-  const cachedTrafficByUuid = new Map<string, { inbound: any; client: any }>();
-  const duplicateCachedUuids = new Set<string>();
-  for (const ib of cachedFallbackInbounds) {
-    const parsed = parseInboundSettingsClientsStrict(ib);
-    if (!parsed.ok) continue;
-    for (const c of parsed.clients) {
-      const cUuid = String(c?.id || '').trim().toLowerCase();
-      if (!cUuid) continue;
-      if (duplicateCachedUuids.has(cUuid)) {
-        continue;
-      }
-      if (cachedTrafficByUuid.has(cUuid)) {
-        cachedTrafficByUuid.delete(cUuid);
-        duplicateCachedUuids.add(cUuid);
-        continue;
-      }
-      cachedTrafficByUuid.set(cUuid, { inbound: ib, client: c });
-    }
-  }
+  };
+  rebuildLiveClientLookup();
 
   const verifyClientOwnershipAndInboundMatch = (params: {
     inbound: any;
@@ -2236,7 +2282,10 @@ export const getMyConfigs = async (
   }): boolean => {
     const { inbound, client, config, requireSharedFallbackVerification } = params;
     if (!inbound || !client || !config) return false;
-    if (config._hasConflictingOwnership || config._hasConflictingInboundId) {
+    if (config._hasConflictingOwnership) {
+      return false;
+    }
+    if (requireSharedFallbackVerification && config._hasConflictingInboundId) {
       return false;
     }
     const recPanel = String(config._recordPanelIdentity || '').trim();
@@ -2250,14 +2299,34 @@ export const getMyConfigs = async (
         ? Number(config._persistedInboundId)
         : null;
     const candidateIbId = Number(inbound.id);
-    if (persistedIbId !== null && candidateIbId !== persistedIbId) {
-      return false;
-    }
 
     const cliEmail = String(client.email || '').trim().toLowerCase();
     const ownerEmail = String(config._ownerEmail || userEmail || '').trim().toLowerCase();
     const expectedRemark = String(config.packageName || '').trim().toLowerCase();
     const expectedOrderId = String(config.orderId || '').trim().toLowerCase();
+
+    if (persistedIbId !== null && candidateIbId !== persistedIbId) {
+      if (requireSharedFallbackVerification) {
+        return false;
+      }
+      // Live panel moved-client support: allow a client that moved to another inbound on 3X-UI
+      // only when uniquely present across live inbounds and with no conflicting customer @ email.
+      const normConfigUuid = String(config.uuid || '').trim().toLowerCase();
+      if (!normConfigUuid || duplicateLiveUuids.has(normConfigUuid)) {
+        return false;
+      }
+      if (cliEmail.includes('@') && ownerEmail && cliEmail !== ownerEmail) {
+        return false;
+      }
+    } else if (config._hasConflictingInboundId && !requireSharedFallbackVerification) {
+      const normConfigUuid = String(config.uuid || '').trim().toLowerCase();
+      if (!normConfigUuid || duplicateLiveUuids.has(normConfigUuid)) {
+        return false;
+      }
+      if (cliEmail.includes('@') && ownerEmail && cliEmail !== ownerEmail) {
+        return false;
+      }
+    }
 
     if (requireSharedFallbackVerification) {
       // Shared cachedFallbackInbounds requires explicit record panel identity match and verified client identity match
@@ -2286,6 +2355,195 @@ export const getMyConfigs = async (
 
     return true;
   };
+
+  // If any active customer configuration was not matched on its expected inbound, perform a complete,
+  // fresh, authoritative panel-wide check across all inbounds so moved clients are discovered on their
+  // new inbound and panel-wide absence is verified without relying on a single-inbound read.
+  const hasUnmatchedConfigForPanelWideCheck = configs.some((c) => {
+    const normUuid = String(c.uuid || '').trim().toLowerCase();
+    if (!normUuid || c._hasConflictingOwnership) return false;
+    if (
+      confirmedDeletedUuids.has(normUuid) ||
+      blockedNonActiveUuids.has(normUuid) ||
+      nonApprovedOrderUuids.has(normUuid)
+    ) {
+      return false;
+    }
+    if (duplicateLiveUuids.has(normUuid)) return false;
+    const hit = liveClientByUuid.get(normUuid);
+    if (!hit) return true;
+    return !verifyClientOwnershipAndInboundMatch({
+      inbound: hit.inbound,
+      client: hit.client,
+      config: c,
+      requireSharedFallbackVerification: false,
+    });
+  });
+
+  const canRunPanelWideVerification =
+    Boolean(options?.fetchUncachedLiveInboundsListFn) ||
+    Boolean(options?.getInboundsFn) ||
+    (!options?.getCachedInboundsFn && !options?.getLiveInboundFn);
+
+  if (
+    hasUnmatchedConfigForPanelWideCheck &&
+    canRunPanelWideVerification &&
+    !liveFullListFetched &&
+    !coldStartTimedOut &&
+    !coldStartFailed &&
+    !liveInboundTimedOut &&
+    !hasMalformedLiveInbound
+  ) {
+    const remainingForPanelWideMs = getRemainingCustomerBudgetMs();
+    const panelWideWaitMs = Math.min(requestedLiveInboundMs, remainingForPanelWideMs);
+    if (panelWideWaitMs >= 20) {
+      if (
+        options?.fetchUncachedLiveInboundsListFn ||
+        (!options?.getInboundsFn && !options?.getCachedInboundsFn && !options?.getLiveInboundFn)
+      ) {
+        const uncachedListFn = options?.fetchUncachedLiveInboundsListFn || fetchUncachedLiveInboundsList;
+        try {
+          const uncachedRes = await raceWithTimeout(
+            uncachedListFn({ timeoutMs: panelWideWaitMs }),
+            panelWideWaitMs,
+            () => {
+              panelWideReadTimedOut = true;
+              console.warn(
+                `[Live Traffic Engine] Authoritative panel-wide inbound verification timed out after ${panelWideWaitMs}ms.`
+              );
+            }
+          );
+          if (
+            !panelWideReadTimedOut &&
+            uncachedRes &&
+            uncachedRes.ok &&
+            Array.isArray(uncachedRes.inbounds) &&
+            uncachedRes.inbounds.length > 0
+          ) {
+            const snapPanelId = String((uncachedRes as any).panelIdentity || '').trim();
+            if (snapPanelId) {
+              if (!resolvedPanelIdentity) {
+                resolvedPanelIdentity = snapPanelId;
+              } else if (snapPanelId !== resolvedPanelIdentity) {
+                panelWideReadFailed = true;
+              }
+            }
+            if (!panelWideReadFailed) {
+              registerAuthoritativePanelWideInboundsList(uncachedRes.inbounds);
+              if (
+                !uncachedRes.allInboundsCleanlyParsed ||
+                (Array.isArray(uncachedRes.unparsedInboundIds) && uncachedRes.unparsedInboundIds.length > 0)
+              ) {
+                liveFullListCleanlyParsed = false;
+                hasMalformedLiveInbound = true;
+              }
+              resolveMissingInboundIds(uncachedRes.inbounds);
+              rebuildLiveClientLookup();
+            }
+          } else {
+            panelWideReadFailed = true;
+            if (!panelWideReadTimedOut && Array.isArray(uncachedRes?.inbounds) && uncachedRes.inbounds.length > 0) {
+              for (const ib of uncachedRes.inbounds) {
+                const parsed = parseInboundSettingsClientsStrict(ib);
+                if (parsed.ok) {
+                  liveInboundsMap.set(parsed.inboundId, ib);
+                  cleanlyParsedLiveInboundIds.add(parsed.inboundId);
+                }
+              }
+              liveFullListCleanlyParsed = false;
+              hasMalformedLiveInbound = true;
+              rebuildLiveClientLookup();
+            }
+          }
+        } catch (err: any) {
+          panelWideReadFailed = true;
+          console.warn('[Live Traffic Engine] Authoritative panel-wide inbound verification failed:', err?.message || err);
+        }
+      } else if (options?.getInboundsFn) {
+        try {
+          const fullList = await raceWithTimeout(
+            fetchInboundsList(
+              true,
+              resolvedPanelIdentity
+                ? { panelIdentity: resolvedPanelIdentity, timeoutMs: panelWideWaitMs }
+                : { timeoutMs: panelWideWaitMs }
+            ),
+            panelWideWaitMs,
+            () => {
+              panelWideReadTimedOut = true;
+              console.warn(
+                `[Live Traffic Engine] Panel-wide getInbounds verification timed out after ${panelWideWaitMs}ms.`
+              );
+            }
+          );
+          if (!panelWideReadTimedOut && Array.isArray(fullList) && fullList.length > 0) {
+            registerAuthoritativePanelWideInboundsList(fullList);
+            resolveMissingInboundIds(fullList);
+            rebuildLiveClientLookup();
+          } else {
+            panelWideReadFailed = true;
+          }
+        } catch (err: any) {
+          panelWideReadFailed = true;
+          console.warn('[Live Traffic Engine] Panel-wide getInbounds verification failed:', err?.message || err);
+        }
+      }
+    } else {
+      panelWideReadTimedOut = true;
+    }
+  }
+
+  const allLiveFetchedInboundsInPanelWideList = Array.from(liveInboundsMap.keys()).every((id) =>
+    panelWideInboundIds.has(id)
+  );
+  const allCachedInboundsInPanelWideList = cachedFallbackInbounds.every((ib) => {
+    const id = Number(ib?.id);
+    return !Number.isInteger(id) || id <= 0 || panelWideInboundIds.has(id);
+  });
+  const noFailedLiveInboundInPanelWideList = Array.from(failedLiveInboundFetchIds).every(
+    (id) => !panelWideInboundIds.has(id)
+  );
+  const panelWideSnapshotCompleteAndClean = Boolean(
+    liveFullListFetched &&
+      liveFullListCleanlyParsed &&
+      !coldStartTimedOut &&
+      !coldStartFailed &&
+      !liveInboundTimedOut &&
+      !panelWideReadTimedOut &&
+      !panelWideReadFailed &&
+      !hasMalformedLiveInbound &&
+      !panelWideHasDuplicateInboundIds &&
+      duplicateLiveUuids.size === 0 &&
+      !customerRequestTimedOut &&
+      Boolean(resolvedPanelIdentity) &&
+      panelWideInboundIds.size > 0 &&
+      allLiveFetchedInboundsInPanelWideList &&
+      allCachedInboundsInPanelWideList &&
+      noFailedLiveInboundInPanelWideList
+  );
+
+  // Build read-only fallback client map from cached inbounds strictly for preserving numeric
+  // traffic usage when the panel is temporarily unreachable (never for Active/Disabled/Deleted claims).
+  // Reject duplicate UUIDs across cached inbounds.
+  const cachedTrafficByUuid = new Map<string, { inbound: any; client: any }>();
+  const duplicateCachedUuids = new Set<string>();
+  for (const ib of cachedFallbackInbounds) {
+    const parsed = parseInboundSettingsClientsStrict(ib);
+    if (!parsed.ok) continue;
+    for (const c of parsed.clients) {
+      const cUuid = String(c?.id || '').trim().toLowerCase();
+      if (!cUuid) continue;
+      if (duplicateCachedUuids.has(cUuid)) {
+        continue;
+      }
+      if (cachedTrafficByUuid.has(cUuid)) {
+        cachedTrafficByUuid.delete(cUuid);
+        duplicateCachedUuids.add(cUuid);
+        continue;
+      }
+      cachedTrafficByUuid.set(cUuid, { inbound: ib, client: c });
+    }
+  }
 
   // Collect legacy records requiring separate offline reconciliation (NEVER auto-backfilled on customer reads)
   const legacyReconciliationRecords: LegacyReconciliationRecord[] = [];
@@ -2581,7 +2839,7 @@ export const getMyConfigs = async (
     }
 
     if (matchedInbound && foundClient) {
-      if (!inboundId) {
+      if (!inboundId || Number(matchedInbound.id) !== Number(inboundId)) {
         inboundId = Number(matchedInbound.id);
       }
       clientEmail = foundClient.email || userEmail;
@@ -2981,11 +3239,12 @@ export const getMyConfigs = async (
     }
 
     const expectedInboundCleanlyFetched = Boolean(
-      !config._hasConflictingInboundId &&
       !config._hasConflictingOwnership &&
       !duplicateLiveUuids.has(normUuid) &&
-      ((inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId))) ||
-        (liveFullListFetched && liveFullListCleanlyParsed))
+      (Boolean(matchedInbound && foundClient) ||
+        (!config._hasConflictingInboundId &&
+          ((inboundId && cleanlyParsedLiveInboundIds.has(Number(inboundId))) ||
+            (liveFullListFetched && liveFullListCleanlyParsed))))
     );
 
     // Deletion verification runs asynchronously in the dedicated background panel-wide synchronizer
@@ -3024,6 +3283,34 @@ export const getMyConfigs = async (
       effectiveDisplayStatus === 'Disabled' ? false : evaluated.effectiveEnable;
     const effectiveDisplayEnableStatus =
       effectiveDisplayStatus === 'Disabled' ? false : evaluated.enableStatus;
+
+    const recPanelId = String(config._recordPanelIdentity || '').trim();
+    const hasPanelIdentityConflict = Boolean(
+      recPanelId && resolvedPanelIdentity && recPanelId !== resolvedPanelIdentity
+    );
+    const panelProvenanceVerified = Boolean(
+      recPanelId && resolvedPanelIdentity && recPanelId === resolvedPanelIdentity
+    );
+    const expectedInboundVerifiedInPanelWideSnapshot =
+      inboundId !== null && Number(inboundId) > 0
+        ? panelWideInboundIds.has(Number(inboundId)) && !failedLiveInboundFetchIds.has(Number(inboundId))
+        : failedLiveInboundFetchIds.size === 0;
+    const panelWideAbsentVerified = Boolean(
+      !matchedInbound &&
+        !foundClient &&
+        panelWideSnapshotCompleteAndClean &&
+        expectedInboundVerifiedInPanelWideSnapshot &&
+        !config._hasConflictingOwnership &&
+        !duplicateLiveUuids.has(normUuid) &&
+        !hasPanelIdentityConflict &&
+        !mutationStateEvictedMidFlight &&
+        !hasInMemoryRevocationBlock
+    );
+    const panelAbsenceClassification: PanelAbsenceClassification = panelWideAbsentVerified
+      ? panelProvenanceVerified
+        ? 'absent_from_current_panel'
+        : 'absent_from_current_panel_unverified_provenance'
+      : null;
 
     let currentExpiryDate = config.expiryDate;
     if (expTimeMs > 0) {
@@ -3095,6 +3382,9 @@ export const getMyConfigs = async (
       provisioningStatus: config.provisioningStatus || null,
       trafficResetEligible: resetEligibility.eligible,
       isUnlimitedPlan: resetEligibility.isUnlimitedPlan,
+      panelWideAbsentVerified,
+      panelAbsenceClassification,
+      panelProvenanceVerified,
     });
   }
 
