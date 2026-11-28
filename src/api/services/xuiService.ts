@@ -3,6 +3,7 @@ import { supabase, supabaseAdmin, getSupabaseClient } from '../../lib/supabase.j
 import { sendOrderApprovedNotification } from './telegramService.js';
 import { createCustomerNotification, runScheduledExpiryEmailCheck } from './notificationService.js';
 import { sendPaymentApprovedEmail, sendOrderCompletedEmail, sendTrialApprovedEmail, sendVpnExpiredEmail } from './emailService.js';
+import { findCanonicalPackage } from './discountService.js';
 
 import crypto from 'crypto';
 
@@ -1681,6 +1682,605 @@ export const addCalendarMonths = (baseTimeMs: number, durationMonths: number): n
   return result.getTime();
 };
 
+export type CanonicalRenewalPlanId = 'sim_100' | 'sim_unlimited' | 'router_unlimited';
+export type CanonicalRenewalPackageType = 'SIM 100GB' | 'SIM Unlimited' | 'Router Unlimited';
+
+export interface ParsedExplicitQuotaSignal {
+  kind: 'finite' | 'unlimited' | 'ambiguous' | 'none';
+  monthlyGb?: number;
+}
+
+export interface ResolveAuthoritativeRenewalQuotaParams {
+  renewRequest?: any;
+  extraNotes?: Record<string, any> | null;
+  durationMonths: number;
+  vpnAccount?: any;
+  vpnConfig?: any;
+  parentOrder?: any;
+  liveClientTotalBytes?: number | null;
+}
+
+export interface AuthoritativeRenewalQuotaResult {
+  resolved: boolean;
+  quotaMode?: 'finite' | 'unlimited';
+  canonicalPlanId?: CanonicalRenewalPlanId;
+  packageType?: CanonicalRenewalPackageType;
+  dataLimitLabel?: string;
+  monthlyQuotaGb?: number | null;
+  addedQuotaBytes?: number;
+  source?: string;
+  blockedReason?: string;
+  reason?: string;
+}
+
+/**
+ * Strips secrets, tokens, URLs, credentials, and verbose upstream/stack details before
+ * persisting a blocked reason into `renew_requests.notes` or returning diagnostics.
+ */
+export function sanitizeAutoRenewalBlockedReason(reason?: string | null): string | null {
+  if (reason === undefined || reason === null) return null;
+  const raw = String(reason).trim();
+  if (!raw) return null;
+
+  // Allow clean operational reason codes verbatim
+  if (/^[A-Za-z0-9_:-]{1,80}$/.test(raw)) {
+    return raw;
+  }
+
+  let sanitized = raw
+    .replace(/bot[0-9]+:[A-Za-z0-9_-]+/gi, 'bot[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, '[REDACTED_JWT]')
+    .replace(/\b(?:sb_secret|sb_publishable|sbp|sk|pk)_[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED_KEY]')
+    .replace(/\b(?:postgres(?:ql)?|mysql|redis|https?):\/\/[^\s'"<>]+/gi, '[REDACTED_URL]')
+    .replace(/\b(?:password|passwd|secret|token|api[_-]?key|service[_-]?role[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '[REDACTED_SECRET]')
+    .replace(/\r?\n.*$/s, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!sanitized) return 'PROVISIONING_HELD_FOR_MANUAL_REVIEW';
+  return sanitized.slice(0, 120);
+}
+
+/**
+ * Strictly parses an explicit quota signal from a structured field or plan label.
+ * NEVER matches a bare number like "100" without "GB" or "sim_100"/"sim 100", and
+ * NEVER interprets missing or unknown text as Unlimited.
+ */
+export function parseExplicitRenewalQuotaSignal(rawValue: unknown): ParsedExplicitQuotaSignal {
+  if (rawValue === undefined || rawValue === null) {
+    return { kind: 'none' };
+  }
+  const normalized = String(rawValue).trim().toLowerCase();
+  if (!normalized) {
+    return { kind: 'none' };
+  }
+
+  const hasUnlimited =
+    normalized === 'sim_unlimited' ||
+    normalized === 'router_unlimited' ||
+    /\b(?:unlimited|unlimit|sim_unlimited|router_unlimited)\b/i.test(normalized);
+
+  const hasSim100 =
+    normalized === 'sim_100' ||
+    /\bsim[\s_-]?100\b/i.test(normalized);
+
+  const gbMatches = Array.from(normalized.matchAll(/\b(\d{1,5})\s*gb\b/gi))
+    .map((m) => parseInt(m[1], 10))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 10000);
+
+  const distinctGbValues = new Set<number>(gbMatches);
+  if (hasSim100) {
+    distinctGbValues.add(100);
+  }
+  const hasFinite = distinctGbValues.size > 0;
+
+  if (hasUnlimited && hasFinite) {
+    return { kind: 'ambiguous' };
+  }
+  if (distinctGbValues.size > 1) {
+    return { kind: 'ambiguous' };
+  }
+  if (hasFinite) {
+    const monthlyGb = Array.from(distinctGbValues)[0];
+    return { kind: 'finite', monthlyGb };
+  }
+  if (hasUnlimited) {
+    return { kind: 'unlimited' };
+  }
+  return { kind: 'none' };
+}
+
+function normalizeCanonicalRenewalPlanId(raw: unknown): CanonicalRenewalPlanId | null {
+  const val = String(raw || '').trim().toLowerCase();
+  if (val === 'sim_100' || val === 'sim_unlimited' || val === 'router_unlimited') {
+    return val;
+  }
+  return null;
+}
+
+/**
+ * Validates a live 3X-UI client quota value (`totalGB` / `previousTotalBytes`).
+ * In 3X-UI, `0` represents Unlimited quota. Therefore:
+ * - Accepts ONLY valid non-negative safe integer numbers (`typeof === 'number'`) and
+ *   canonical decimal integer strings (`/^(?:0|[1-9]\d*)$/` after trimming).
+ * - Strictly rejects arrays (`[]`, `[0]`, `['']`), objects (`{}`), booleans, `null`, `undefined`,
+ *   empty or whitespace-only strings, negative numbers (including `-0` and `"-0"`),
+ *   fractional numbers/strings, hex/binary/octal/scientific-notation strings, `NaN`, `Infinity`,
+ *   and unsafe integers (`> Number.MAX_SAFE_INTEGER`).
+ * - Never coerces malformed quota information into `0` (Unlimited).
+ */
+export function parseVerifiedLiveTotalBytes(rawValue: unknown): { valid: boolean; totalBytes: number } {
+  if (typeof rawValue === 'number') {
+    if (
+      !Number.isFinite(rawValue) ||
+      !Number.isSafeInteger(rawValue) ||
+      rawValue < 0 ||
+      Object.is(rawValue, -0)
+    ) {
+      return { valid: false, totalBytes: -1 };
+    }
+    return { valid: true, totalBytes: rawValue === 0 ? 0 : rawValue };
+  }
+
+  if (typeof rawValue === 'string') {
+    const trimmed = rawValue.trim();
+    if (!/^(?:0|[1-9]\d*)$/.test(trimmed)) {
+      return { valid: false, totalBytes: -1 };
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || !Number.isSafeInteger(parsed) || parsed < 0 || String(parsed) !== trimmed) {
+      return { valid: false, totalBytes: -1 };
+    }
+    return { valid: true, totalBytes: parsed };
+  }
+
+  return { valid: false, totalBytes: -1 };
+}
+
+/**
+ * Resolves renewal quota entitlement from authoritative server-side metadata and package catalog
+ * with safe backward compatibility for existing pending renewal requests.
+ *
+ * Fail-closed guarantees:
+ * - Missing, unknown, ambiguous, or contradictory quota metadata is NEVER treated as Unlimited.
+ * - Invalid live quota values (negative, NaN, non-integer) are NEVER treated as Unlimited (0).
+ * - Legacy quota resolution cannot bypass verified package category (SIM vs ROUTER) or
+ *   tier-upgrade/downgrade restrictions.
+ */
+export function resolveAuthoritativeRenewalQuota(
+  params: ResolveAuthoritativeRenewalQuotaParams
+): AuthoritativeRenewalQuotaResult {
+  const extra = params.extraNotes && typeof params.extraNotes === 'object' ? params.extraNotes : {};
+  const renewReq = params.renewRequest || {};
+  const safeMonths = Math.max(1, Math.round(Number(params.durationMonths) || 1));
+  const BYTES_PER_GB = 1024 * 1024 * 1024;
+
+  const isTierOnlyLabel = (raw: string): boolean => {
+    const lower = raw.trim().toLowerCase();
+    return (
+      lower === 'sim 100gb' ||
+      lower === 'sim_100' ||
+      lower === 'sim unlimited' ||
+      lower === 'sim_unlimited' ||
+      lower === 'router unlimited' ||
+      lower === 'router_unlimited'
+    );
+  };
+
+  // 1a. Resolve existing account's authoritative package from vpnAccount / vpnConfig / parentOrder
+  const accountPkgCandidates = [
+    params.vpnConfig?.package_name,
+    params.parentOrder?.package_name,
+    params.vpnAccount?.package_name,
+    params.vpnAccount?.remark,
+  ]
+    .map((v) => String(v || '').trim())
+    .filter((v) => v.length > 0 && !isTierOnlyLabel(v));
+
+  let accountCanonicalPkg: ReturnType<typeof findCanonicalPackage> | undefined;
+  for (const cand of accountPkgCandidates) {
+    const found = findCanonicalPackage(cand);
+    if (found) {
+      accountCanonicalPkg = found;
+      break;
+    }
+  }
+
+  // 1b. Resolve renewal request's package from extraNotes / renewRequest
+  const requestPkgCandidates = [
+    extra.package_id,
+    extra.packageId,
+    extra.package_name,
+    extra.packageName,
+    renewReq.plan_name,
+  ]
+    .map((v) => String(v || '').trim())
+    .filter((v) => v.length > 0 && !isTierOnlyLabel(v));
+
+  let requestCanonicalPkg: ReturnType<typeof findCanonicalPackage> | undefined;
+  for (const cand of requestPkgCandidates) {
+    const found = findCanonicalPackage(cand);
+    if (found) {
+      requestCanonicalPkg = found;
+      break;
+    }
+  }
+
+  if (
+    accountCanonicalPkg &&
+    requestCanonicalPkg &&
+    accountCanonicalPkg.category !== requestCanonicalPkg.category
+  ) {
+    return {
+      resolved: false,
+      blockedReason: 'CONFLICTING_PACKAGE_CATEGORY_METADATA',
+      reason: `Renewal package category ('${requestCanonicalPkg.category}') conflicts with existing VPN account package category ('${accountCanonicalPkg.category}'). Held for manual reconciliation.`,
+    };
+  }
+
+  const canonicalPkg = accountCanonicalPkg || requestCanonicalPkg;
+  const explicitCategoryRaw = String(extra.category || '').trim().toUpperCase();
+  if (
+    (explicitCategoryRaw === 'SIM' || explicitCategoryRaw === 'ROUTER') &&
+    canonicalPkg?.category &&
+    explicitCategoryRaw !== canonicalPkg.category
+  ) {
+    return {
+      resolved: false,
+      blockedReason: 'CONFLICTING_PACKAGE_CATEGORY_METADATA',
+      reason: `Explicit metadata category ('${explicitCategoryRaw}') conflicts with authoritative package catalog category ('${canonicalPkg.category}'). Held for manual reconciliation.`,
+    };
+  }
+
+  const canonicalCategory: 'SIM' | 'ROUTER' | null =
+    canonicalPkg?.category === 'ROUTER' || canonicalPkg?.category === 'SIM'
+      ? canonicalPkg.category
+      : explicitCategoryRaw === 'ROUTER' || explicitCategoryRaw === 'SIM'
+      ? (explicitCategoryRaw as 'SIM' | 'ROUTER')
+      : null;
+
+  // Validate liveClientTotalBytes if provided (never treat negative/NaN/invalid values as 0 = Unlimited)
+  let liveTotalBytes: number | null = null;
+  if (params.liveClientTotalBytes !== undefined && params.liveClientTotalBytes !== null) {
+    const parsedLiveTotal = parseVerifiedLiveTotalBytes(params.liveClientTotalBytes);
+    if (!parsedLiveTotal.valid) {
+      return {
+        resolved: false,
+        blockedReason: 'INVALID_LIVE_CLIENT_QUOTA',
+        reason: `Live 3X-UI client quota (${String(params.liveClientTotalBytes)}) is invalid; refusing to interpret invalid quota as Unlimited.`,
+      };
+    }
+    liveTotalBytes = parsedLiveTotal.totalBytes;
+  }
+
+  const parsedDbAccTotal =
+    params.vpnAccount?.total_bytes !== undefined && params.vpnAccount?.total_bytes !== null
+      ? parseVerifiedLiveTotalBytes(params.vpnAccount.total_bytes)
+      : { valid: false, totalBytes: -1 };
+  const dbAccTotalBytes = parsedDbAccTotal.valid ? parsedDbAccTotal.totalBytes : 0;
+
+  const accLimitSig = parseExplicitRenewalQuotaSignal(params.vpnAccount?.data_limit);
+  const cfgLimitSig = parseExplicitRenewalQuotaSignal(params.vpnConfig?.data_limit);
+  const ordLimitSig = parseExplicitRenewalQuotaSignal(
+    params.parentOrder?.data_limit ?? params.parentOrder?.package_name
+  );
+
+  const existingAccountIsConclusivelyFinite =
+    (liveTotalBytes !== null && liveTotalBytes > 0) ||
+    dbAccTotalBytes > 0 ||
+    accLimitSig.kind === 'finite' ||
+    cfgLimitSig.kind === 'finite' ||
+    ordLimitSig.kind === 'finite';
+
+  const existingAccountIsConclusivelyUnlimited =
+    !existingAccountIsConclusivelyFinite &&
+    (accLimitSig.kind === 'unlimited' ||
+      cfgLimitSig.kind === 'unlimited' ||
+      ordLimitSig.kind === 'unlimited' ||
+      canonicalCategory === 'ROUTER');
+
+  const isSpecialOffer = Boolean(extra.is_special_offer || extra.offer_id || extra.offer_name);
+  const isServerVerified = extra.quota_verified_by_server === true;
+
+  const buildResolvedResult = (
+    quotaMode: 'finite' | 'unlimited',
+    monthlyQuotaGb: number | null,
+    planId: CanonicalRenewalPlanId,
+    source: string
+  ): AuthoritativeRenewalQuotaResult => {
+    // Category conflict checks
+    if (canonicalCategory === 'ROUTER' && (quotaMode === 'finite' || planId === 'sim_100')) {
+      return {
+        resolved: false,
+        blockedReason: 'CONFLICTING_PACKAGE_CATEGORY_METADATA',
+        reason: 'Router package cannot be renewed with a finite SIM 100GB quota. Held for manual reconciliation.',
+      };
+    }
+    if (canonicalCategory === 'SIM' && planId === 'router_unlimited') {
+      return {
+        resolved: false,
+        blockedReason: 'CONFLICTING_PACKAGE_CATEGORY_METADATA',
+        reason: 'SIM package cannot use router_unlimited metadata. Held for manual reconciliation.',
+      };
+    }
+    // Router packages always use router_unlimited
+    const finalPlanId: CanonicalRenewalPlanId =
+      quotaMode === 'finite'
+        ? 'sim_100'
+        : canonicalCategory === 'ROUTER' || planId === 'router_unlimited'
+        ? 'router_unlimited'
+        : 'sim_unlimited';
+
+    // Tier downgrade protection: an existing conclusively Unlimited account cannot downgrade to finite 100GB
+    if (quotaMode === 'finite' && existingAccountIsConclusivelyUnlimited) {
+      return {
+        resolved: false,
+        blockedReason: 'CONFLICTING_TIER_DOWNGRADE_METADATA',
+        reason:
+          'Renewal metadata claimed finite 100GB quota for an existing Unlimited VPN account. Tier downgrades are not supported; held for manual reconciliation.',
+      };
+    }
+
+    // Tier upgrade & Special Offer anti-tamper protection:
+    // An existing conclusively finite 100GB account must NEVER become Unlimited unless:
+    //   1. It is NOT a Special Offer renewal (or tier_upgrade_verified is explicitly true on server-verified metadata), AND
+    //   2. The renewal carries authoritative server-verified tier upgrade confirmation (`quota_verified_by_server === true && tier_upgrade_verified === true`).
+    // Legacy unverified metadata can NEVER bypass tier-upgrade validation.
+    if (
+      quotaMode === 'unlimited' &&
+      finalPlanId !== 'router_unlimited' &&
+      existingAccountIsConclusivelyFinite
+    ) {
+      if (isSpecialOffer && !(isServerVerified && extra.tier_upgrade_verified === true)) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_SPECIAL_OFFER_QUOTA_METADATA',
+          reason:
+            'Special Offer renewal claimed Unlimited quota for an existing finite 100GB VPN account. Held for manual reconciliation without modifying 3X-UI.',
+        };
+      }
+      if (!isServerVerified || extra.tier_upgrade_verified !== true) {
+        return {
+          resolved: false,
+          blockedReason: 'UNVERIFIED_LEGACY_TIER_UPGRADE',
+          reason:
+            'Renewal claimed Unlimited quota for an existing finite 100GB VPN account without server-verified tier upgrade confirmation. Held for manual reconciliation without modifying 3X-UI.',
+        };
+      }
+    }
+
+    const packageType: CanonicalRenewalPackageType =
+      finalPlanId === 'router_unlimited'
+        ? 'Router Unlimited'
+        : finalPlanId === 'sim_unlimited'
+        ? 'SIM Unlimited'
+        : 'SIM 100GB';
+
+    const effectiveMonthlyGb = quotaMode === 'finite' ? Math.max(1, monthlyQuotaGb || 100) : null;
+    const addedQuotaBytes = quotaMode === 'finite' && effectiveMonthlyGb ? effectiveMonthlyGb * BYTES_PER_GB * safeMonths : 0;
+
+    return {
+      resolved: true,
+      quotaMode,
+      canonicalPlanId: finalPlanId,
+      packageType,
+      dataLimitLabel: quotaMode === 'finite' && effectiveMonthlyGb ? `${effectiveMonthlyGb}GB` : 'Unlimited',
+      monthlyQuotaGb: effectiveMonthlyGb,
+      addedQuotaBytes,
+      source,
+    };
+  };
+
+  // Helper to validate finite GB value in metadata (either 100GB/month rate or cumulative 100*safeMonths GB)
+  const normalizeCanonicalFiniteMonthlyGb = (rawGb: number): number | null => {
+    if (rawGb === 100) return 100;
+    if (safeMonths > 1 && rawGb === 100 * safeMonths) return 100;
+    return null;
+  };
+
+  // 2. Authoritative server-verified metadata path (persisted by createRenewRequest)
+  if (isServerVerified) {
+    const verifiedPlanId = normalizeCanonicalRenewalPlanId(extra.verified_plan_id);
+    if (!verifiedPlanId) {
+      return {
+        resolved: false,
+        blockedReason: 'UNVERIFIED_RENEWAL_QUOTA_METADATA',
+        reason: 'Renewal metadata marked server-verified is missing a canonical verified_plan_id. Held for manual reconciliation.',
+      };
+    }
+
+    const expectedMode: 'finite' | 'unlimited' = verifiedPlanId === 'sim_100' ? 'finite' : 'unlimited';
+    const expectedMonthlyGb = expectedMode === 'finite' ? 100 : null;
+
+    // Cross-validate co-located fields for internal consistency (defense in depth against tampered/corrupted rows)
+    const rawQuotaMode = extra.quota_mode !== undefined && extra.quota_mode !== null ? String(extra.quota_mode).trim().toLowerCase() : '';
+    if (rawQuotaMode && rawQuotaMode !== expectedMode) {
+      return {
+        resolved: false,
+        blockedReason: 'CONFLICTING_QUOTA_METADATA',
+        reason: `Conflicting renewal quota_mode ('${rawQuotaMode}') vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+      };
+    }
+
+    if (extra.monthly_quota_gb !== undefined && extra.monthly_quota_gb !== null && extra.monthly_quota_gb !== '') {
+      const numGb = Number(extra.monthly_quota_gb);
+      if (expectedMode === 'unlimited' && Number.isFinite(numGb) && numGb > 0) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting monthly_quota_gb (${numGb}) for unlimited verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+        };
+      }
+      if (expectedMode === 'finite' && (!Number.isFinite(numGb) || numGb !== 100)) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting monthly_quota_gb (${String(extra.monthly_quota_gb)}) for finite verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+        };
+      }
+    }
+
+    const coLocatedFields: Array<{ name: string; val: unknown }> = [
+      { name: 'planId', val: extra.planId ?? extra.plan_id },
+      { name: 'package_type', val: extra.package_type ?? extra.packageType },
+      { name: 'data_limit', val: extra.data_limit ?? extra.dataLimit },
+      { name: 'plan_name', val: renewReq.plan_name ?? extra.plan_name ?? extra.planName },
+    ];
+
+    for (const field of coLocatedFields) {
+      const sig = parseExplicitRenewalQuotaSignal(field.val);
+      if (sig.kind === 'ambiguous') {
+        return {
+          resolved: false,
+          blockedReason: 'AMBIGUOUS_QUOTA_METADATA',
+          reason: `Ambiguous quota metadata in ${field.name}. Held for manual reconciliation.`,
+        };
+      }
+      if (sig.kind === 'finite' && expectedMode !== 'finite') {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting finite quota signal in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+        };
+      }
+      if (sig.kind === 'unlimited' && expectedMode !== 'unlimited') {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting unlimited quota signal in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+        };
+      }
+      if (sig.kind === 'finite' && expectedMode === 'finite' && sig.monthlyGb && sig.monthlyGb !== expectedMonthlyGb) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting monthly GB (${sig.monthlyGb}GB) in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`,
+        };
+      }
+    }
+
+    return buildResolvedResult(expectedMode, expectedMonthlyGb, verifiedPlanId, 'server_verified_metadata');
+  }
+
+  // 3. Legacy pending renewal compatibility path (older requests created before server-verified quota metadata)
+  const legacyFields: Array<{ name: string; val: unknown }> = [
+    { name: 'verified_plan_id', val: extra.verified_plan_id },
+    { name: 'planId', val: extra.planId ?? extra.plan_id ?? renewReq.plan_id },
+    { name: 'package_type', val: extra.package_type ?? extra.packageType },
+    { name: 'data_limit', val: extra.data_limit ?? extra.dataLimit },
+    { name: 'quota_mode', val: extra.quota_mode },
+    { name: 'plan_name', val: renewReq.plan_name ?? extra.plan_name ?? extra.planName },
+  ];
+
+  let foundFiniteGb: number | null = null;
+  let foundUnlimited = false;
+  let explicitCanonicalPlanId: CanonicalRenewalPlanId | null = null;
+
+  for (const field of legacyFields) {
+    if (field.val === undefined || field.val === null || String(field.val).trim() === '') continue;
+
+    const normalizedPlan = normalizeCanonicalRenewalPlanId(field.val);
+    if (normalizedPlan) {
+      if (explicitCanonicalPlanId && explicitCanonicalPlanId !== normalizedPlan) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting renewal plan IDs ('${explicitCanonicalPlanId}' vs '${normalizedPlan}'). Held for manual reconciliation.`,
+        };
+      }
+      explicitCanonicalPlanId = normalizedPlan;
+    }
+
+    if (field.name === 'quota_mode') {
+      const qm = String(field.val).trim().toLowerCase();
+      if (qm === 'finite') {
+        if (foundFiniteGb === null) foundFiniteGb = 100;
+        continue;
+      }
+      if (qm === 'unlimited') {
+        foundUnlimited = true;
+        continue;
+      }
+      return {
+        resolved: false,
+        blockedReason: 'AMBIGUOUS_QUOTA_METADATA',
+        reason: `Unrecognized legacy quota_mode '${qm}'. Held for manual reconciliation.`,
+      };
+    }
+
+    const sig = parseExplicitRenewalQuotaSignal(field.val);
+    if (sig.kind === 'ambiguous') {
+      return {
+        resolved: false,
+        blockedReason: 'AMBIGUOUS_QUOTA_METADATA',
+        reason: `Ambiguous renewal quota metadata in ${field.name}. Held for manual reconciliation.`,
+      };
+    }
+    if (sig.kind === 'finite' && sig.monthlyGb) {
+      const normalizedMonthly = normalizeCanonicalFiniteMonthlyGb(sig.monthlyGb);
+      if (normalizedMonthly === null) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Unrecognized non-canonical finite quota value (${sig.monthlyGb}GB for ${safeMonths} month(s)) in ${field.name}. Held for manual reconciliation.`,
+        };
+      }
+      if (foundFiniteGb !== null && foundFiniteGb !== normalizedMonthly) {
+        return {
+          resolved: false,
+          blockedReason: 'CONFLICTING_QUOTA_METADATA',
+          reason: `Conflicting finite quota values (${foundFiniteGb}GB vs ${normalizedMonthly}GB). Held for manual reconciliation.`,
+        };
+      }
+      foundFiniteGb = normalizedMonthly;
+    } else if (sig.kind === 'unlimited') {
+      foundUnlimited = true;
+    }
+  }
+
+  if (foundFiniteGb !== null && foundUnlimited) {
+    return {
+      resolved: false,
+      blockedReason: 'CONFLICTING_QUOTA_METADATA',
+      reason: 'Renewal metadata contains both finite and Unlimited quota indicators. Held for manual reconciliation.',
+    };
+  }
+
+  if (foundFiniteGb !== null) {
+    if (explicitCanonicalPlanId && explicitCanonicalPlanId !== 'sim_100') {
+      return {
+        resolved: false,
+        blockedReason: 'CONFLICTING_QUOTA_METADATA',
+        reason: `Finite quota indicator conflicts with plan ID '${explicitCanonicalPlanId}'. Held for manual reconciliation.`,
+      };
+    }
+    return buildResolvedResult('finite', foundFiniteGb, 'sim_100', 'legacy_explicit_metadata');
+  }
+
+  if (foundUnlimited) {
+    const inferredPlanId: CanonicalRenewalPlanId =
+      explicitCanonicalPlanId === 'router_unlimited' || canonicalCategory === 'ROUTER'
+        ? 'router_unlimited'
+        : 'sim_unlimited';
+    return buildResolvedResult('unlimited', null, inferredPlanId, 'legacy_explicit_metadata');
+  }
+
+  // 4. Authoritative server catalog fallback strictly for ROUTER packages (which only have Router Unlimited)
+  //    ONLY when no finite quota indicator exists on the live client or DB account.
+  if (canonicalCategory === 'ROUTER' && !existingAccountIsConclusivelyFinite) {
+    return buildResolvedResult('unlimited', null, 'router_unlimited', 'canonical_router_catalog');
+  }
+
+  // 5. FAIL CLOSED: Never default missing, unknown, or ambiguous SIM/legacy metadata to Unlimited!
+  return {
+    resolved: false,
+    blockedReason: 'UNVERIFIED_RENEWAL_QUOTA_METADATA',
+    reason:
+      'Renewal quota tier (100GB vs Unlimited) could not be conclusively verified from authoritative package metadata. Held for manual reconciliation without changing 3X-UI.',
+  };
+}
+
 export interface UpdateClientExpiryDeps {
   getInboundsFn?: (forceRefresh?: boolean) => Promise<XuiInbound[]>;
   requestApiFn?: <T>(endpoint: string, method?: 'GET' | 'POST', data?: any, options?: RequestApiOptions) => Promise<T>;
@@ -1691,6 +2291,11 @@ export interface UpdateClientExpiryDeps {
   beforeExternalMutation?: () => Promise<void>;
   afterExternalMutationCheck?: () => Promise<void>;
   signal?: AbortSignal;
+  verifiedQuota?: {
+    quotaMode: 'finite' | 'unlimited';
+    addedQuotaBytes: number;
+    canonicalPlanId?: CanonicalRenewalPlanId;
+  };
 }
 
 export const updateClientExpiry = async (
@@ -1783,35 +2388,81 @@ export const updateClientExpiry = async (
       const baseTime = currentExpiry > now ? currentExpiry : now;
       const new_expiryTime = addCalendarMonths(baseTime, durationMonths);
 
-      // Parse traffic / limit GB based on planName
-      let isLimitedPlan = false;
-      let packageDataLimitBytes = 0;
+      // Resolve traffic / data quota strictly from server-verified quota or explicit non-ambiguous planName.
+      // NEVER default missing, unknown, or ambiguous plan strings or invalid live totalGB to Unlimited (0).
       const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
-
-      if (planName) {
-        const lowerPlan = planName.toLowerCase();
-        if (lowerPlan.includes('unlimited') || lowerPlan.includes('unlimit')) {
-          isLimitedPlan = false;
-        } else if (lowerPlan.includes('100gb') || lowerPlan.includes('100 gb') || lowerPlan.includes('100')) {
-          isLimitedPlan = true;
-          packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
-        } else {
-          const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
-          if (gbMatch) {
-            isLimitedPlan = true;
-            packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024 * safeMonths;
-          }
-        }
+      const parsedLiveTotal = parseVerifiedLiveTotalBytes((c as any).totalGB);
+      if (!parsedLiveTotal.valid) {
+        const invalidLiveQuotaErr: any = new Error(
+          `Live 3X-UI client '${uuid}' has missing or invalid totalGB (${String((c as any).totalGB)}); refusing to interpret invalid quota as Unlimited.`
+        );
+        invalidLiveQuotaErr.statusCode = 409;
+        invalidLiveQuotaErr.code = 'INVALID_LIVE_CLIENT_QUOTA';
+        invalidLiveQuotaErr.beforeExternalWrite = true;
+        invalidLiveQuotaErr.xuiUncertain = false;
+        throw invalidLiveQuotaErr;
       }
+      const currentTotalBytes = parsedLiveTotal.totalBytes;
 
-      const currentTotalBytes = Number(c.totalGB || 0);
-      let newTotalBytes = currentTotalBytes; // default fallback if no plan specified
+      const inboundClientStats: any[] = Array.isArray((inbound as any).clientStats) ? (inbound as any).clientStats : [];
+      const liveStat =
+        inboundClientStats.find((s: any) => String(s.id || '').trim().toLowerCase() === normalizedTargetUuid) ||
+        inboundClientStats.find(
+          (s: any) => c.email && String(s.email || '').trim().toLowerCase() === String(c.email).trim().toLowerCase()
+        );
+      const liveUpBytes = Math.max(0, Math.trunc(Number(liveStat?.up ?? (c as any).up ?? 0) || 0));
+      const liveDownBytes = Math.max(0, Math.trunc(Number(liveStat?.down ?? (c as any).down ?? 0) || 0));
+      const liveUsedBytes = liveUpBytes + liveDownBytes;
 
-      if (planName) {
-        if (isLimitedPlan) {
-          newTotalBytes = currentTotalBytes + packageDataLimitBytes;
+      let newTotalBytes = currentTotalBytes;
+      if (deps?.verifiedQuota) {
+        if (deps.verifiedQuota.quotaMode === 'finite') {
+          const verifiedAddedBytes = Math.max(0, Math.trunc(Number(deps.verifiedQuota.addedQuotaBytes) || 0));
+          if (verifiedAddedBytes <= 0) {
+            const invalidQuotaErr: any = new Error(
+              'Verified finite renewal quota has non-positive addedQuotaBytes; refusing to modify 3X-UI.'
+            );
+            invalidQuotaErr.statusCode = 409;
+            invalidQuotaErr.code = 'UNVERIFIED_RENEWAL_QUOTA_METADATA';
+            invalidQuotaErr.beforeExternalWrite = true;
+            invalidQuotaErr.xuiUncertain = false;
+            throw invalidQuotaErr;
+          }
+          const baseBytes =
+            currentExpiry <= now && liveUsedBytes > 0
+              ? liveUsedBytes
+              : Math.max(currentTotalBytes, liveUsedBytes);
+          newTotalBytes = baseBytes + verifiedAddedBytes;
         } else {
-          newTotalBytes = 0; // Unlimited
+          newTotalBytes = 0; // Verified Unlimited
+        }
+      } else {
+        const parsedPlanSignal = parseExplicitRenewalQuotaSignal(planName);
+        const isCanonicalFiniteRate =
+          parsedPlanSignal.kind === 'finite' &&
+          (parsedPlanSignal.monthlyGb === 100 ||
+            (safeMonths > 1 && parsedPlanSignal.monthlyGb === 100 * safeMonths));
+        if (isCanonicalFiniteRate) {
+          const packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
+          const baseBytes =
+            currentExpiry <= now && liveUsedBytes > 0
+              ? liveUsedBytes
+              : Math.max(currentTotalBytes, liveUsedBytes);
+          newTotalBytes = baseBytes + packageDataLimitBytes;
+        } else if (parsedPlanSignal.kind === 'unlimited') {
+          newTotalBytes = 0; // Explicitly Unlimited
+        } else {
+          const unverifiedErr: any = new Error(
+            `Cannot verify renewal data quota tier (100GB vs Unlimited) from plan metadata ('${String(planName || '')}'). Refusing to default to Unlimited; manual reconciliation required.`
+          );
+          unverifiedErr.statusCode = 409;
+          unverifiedErr.code =
+            parsedPlanSignal.kind === 'ambiguous'
+              ? 'AMBIGUOUS_QUOTA_METADATA'
+              : 'UNVERIFIED_RENEWAL_QUOTA_METADATA';
+          unverifiedErr.beforeExternalWrite = true;
+          unverifiedErr.xuiUncertain = false;
+          throw unverifiedErr;
         }
       }
 
@@ -9995,12 +10646,34 @@ export function calculateApprovedRenewalEntitlement(params: {
 }): RenewalEntitlementCalculationResult {
   const nowMs = params.nowMs ?? Date.now();
   const prevExpiryMs = Math.max(0, Math.trunc(Number(params.previousExpiryMs) || 0));
-  const prevTotalBytes = Math.max(0, Math.trunc(Number(params.previousTotalBytes) || 0));
+  const parsedPrevTotal = parseVerifiedLiveTotalBytes(params.previousTotalBytes);
   const liveUpBytes = Math.max(0, Math.trunc(Number(params.liveUpBytes) || 0));
   const liveDownBytes = Math.max(0, Math.trunc(Number(params.liveDownBytes) || 0));
   const liveUsedBytes = liveUpBytes + liveDownBytes;
   const addedDurationMonths = Math.max(1, Math.trunc(Number(params.addedDurationMonths) || 1));
   const addedQuotaBytes = Math.max(0, Math.trunc(Number(params.addedQuotaBytes) || 0));
+
+  if (!parsedPrevTotal.valid) {
+    return {
+      eligible: false,
+      code: 'INVALID_PARAMETERS',
+      reason: `Live 3X-UI client quota (totalGB=${String(params.previousTotalBytes)}) is missing or invalid; refusing to interpret invalid quota as Unlimited.`,
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: -1,
+      previousWasUnlimited: false,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: -1,
+      grantedUnlimited: false,
+      grantedDataLimitStr: 'Invalid',
+    };
+  }
+
+  const prevTotalBytes = parsedPrevTotal.totalBytes;
   const prevWasUnlimited = prevTotalBytes === 0;
   const renewalIsUnlimited = addedQuotaBytes === 0;
 
@@ -10288,6 +10961,8 @@ export interface ProvisionProvisionalRenewalOptions {
   getInboundsFn?: typeof getInbounds;
   nowMs?: number;
   skipSideEffects?: boolean;
+  signal?: AbortSignal;
+  deadlineMs?: number;
 }
 
 export interface ProvisionProvisionalRenewalResult {
@@ -10334,9 +11009,53 @@ export async function provisionProvisionalRenewal(
   const getInboundsCall = options?.getInboundsFn || getInbounds;
   const nowMs = options?.nowMs ?? Date.now();
   const cleanRequestId = String(renewRequestId || '').trim();
+  const signal = options?.signal;
+  const deadlineMs =
+    typeof options?.deadlineMs === 'number' && Number.isFinite(options.deadlineMs)
+      ? options.deadlineMs
+      : undefined;
 
   if (!cleanRequestId) {
     throw new Error('Renewal request ID is required for provisional renewal.');
+  }
+
+  const assertCanDispatchBeforeExternalMutation = (stage: string): void => {
+    assertRequestNotTimedOutBeforeExternalMutation(signal, stage);
+    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      const deadlineErr: any = new Error(
+        `Execution deadline elapsed before ${stage}; aborted safely with zero external mutations.`
+      );
+      deadlineErr.statusCode = 504;
+      deadlineErr.code = 'REQUEST_TIMEOUT_BEFORE_MUTATION';
+      deadlineErr.blockedReason = 'REQUEST_TIMEOUT_BEFORE_MUTATION';
+      deadlineErr.beforeExternalWrite = true;
+      deadlineErr.xuiUncertain = false;
+      throw deadlineErr;
+    }
+  };
+
+  const getRemainingRequestTimeoutMs = (): number | undefined => {
+    if (deadlineMs === undefined) return undefined;
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) {
+      assertCanDispatchBeforeExternalMutation('provisional renewal 3X-UI dispatch');
+    }
+    return Math.max(1000, Math.min(20000, remaining));
+  };
+
+  // Abort cleanly BEFORE acquiring any durable lock if the request was already cancelled/timed out
+  try {
+    assertCanDispatchBeforeExternalMutation('provisional renewal lock acquisition');
+  } catch (preCancelErr: any) {
+    return {
+      success: false,
+      autoRenewed: false,
+      provisional: false,
+      provisioningStatus: 'pending',
+      fallbackToManual: true,
+      blockedReason: preCancelErr?.code || 'REQUEST_TIMEOUT_BEFORE_MUTATION',
+      message: preCancelErr?.message || 'Request timed out before automatic renewal started.',
+    };
   }
 
   const renewLockKey = `renew:${cleanRequestId}`;
@@ -10373,6 +11092,8 @@ export async function provisionProvisionalRenewal(
   let targetClientUuid: string | null = null;
 
   try {
+    assertCanDispatchBeforeExternalMutation('provisional renewal DB lookup');
+
     const { data: renewReq, error: reqErr } = await dbClient
       .from('renew_requests')
       .select('*')
@@ -10566,38 +11287,57 @@ export async function provisionProvisionalRenewal(
       };
     }
 
+    assertCanDispatchBeforeExternalMutation('provisional renewal client lock acquisition');
+
+    const makeClientLockFallbackError = (
+      result: ProvisionProvisionalRenewalResult,
+      uncertain: boolean,
+      message?: string
+    ) => {
+      const err: any = new Error(message || result.message || 'Provisional renewal did not complete.');
+      err.__provisionalFallbackResult = result;
+      err.xuiUncertain = uncertain;
+      err.beforeExternalWrite = !uncertain;
+      return err;
+    };
+
     // Acquire durable client-level lock `client:<uuid>` (Lock #2 in deterministic hierarchy)
-    return await withClientMutationLock(
-      {
-        dbClient,
-        clientUuid,
-        operationType: 'client_lock',
-        targetId: cleanRequestId,
-        requireDurableLock: true,
-        allowUncertainRecovery: false,
-        metadata: { renewRequestId: cleanRequestId, parentOrderId: parentOrder.id },
-      },
-      async (assertClientLockStillHeld) => {
-        // Check for any other unresolved renewal grant on this client UUID
-        await assertNoUnresolvedClientRenewalGrant({
+    try {
+      return await withClientMutationLock(
+        {
           dbClient,
           clientUuid,
-          excludeRenewRequestId: cleanRequestId,
-          operationDescription: 'automatic renewal provisioning',
-        });
+          operationType: 'client_lock',
+          targetId: cleanRequestId,
+          requireDurableLock: true,
+          allowUncertainRecovery: false,
+          metadata: { renewRequestId: cleanRequestId, parentOrderId: parentOrder.id },
+        },
+        async (assertClientLockStillHeld) => {
+          assertCanDispatchBeforeExternalMutation('provisional renewal grant check');
 
-        // Re-read fresh vpn_accounts, vpn_configs, and parent order INSIDE client:<uuid> lock
-        const { data: freshAcc } = await dbClient.from('vpn_accounts').select('*').eq('id', vpnAccount.id).maybeSingle();
-        if (freshAcc) vpnAccount = freshAcc;
+          // Check for any other unresolved renewal grant on this client UUID
+          await assertNoUnresolvedClientRenewalGrant({
+            dbClient,
+            clientUuid,
+            excludeRenewRequestId: cleanRequestId,
+            operationDescription: 'automatic renewal provisioning',
+          });
 
-        const { data: freshParent } = await dbClient.from('orders').select('*').eq('id', parentOrder.id).maybeSingle();
-        if (freshParent) parentOrder = freshParent;
+          // Re-read fresh vpn_accounts, vpn_configs, and parent order INSIDE client:<uuid> lock
+          const { data: freshAcc } = await dbClient.from('vpn_accounts').select('*').eq('id', vpnAccount.id).maybeSingle();
+          if (freshAcc) vpnAccount = freshAcc;
 
-        let { data: vpnConfig } = await dbClient.from('vpn_configs').select('*').eq('uuid', clientUuid).maybeSingle();
-        if (!vpnConfig && parentOrder.id) {
-          const { data: byOrdCfg } = await dbClient.from('vpn_configs').select('*').eq('order_id', parentOrder.id).maybeSingle();
-          if (byOrdCfg) vpnConfig = byOrdCfg;
-        }
+          const { data: freshParent } = await dbClient.from('orders').select('*').eq('id', parentOrder.id).maybeSingle();
+          if (freshParent) parentOrder = freshParent;
+
+          let { data: vpnConfig } = await dbClient.from('vpn_configs').select('*').eq('uuid', clientUuid).maybeSingle();
+          if (!vpnConfig && parentOrder.id) {
+            const { data: byOrdCfg } = await dbClient.from('vpn_configs').select('*').eq('order_id', parentOrder.id).maybeSingle();
+            if (byOrdCfg) vpnConfig = byOrdCfg;
+          }
+
+          assertCanDispatchBeforeExternalMutation('provisional renewal 3X-UI lookup');
 
         // Resolve live 3X-UI inbound and client
         const allInbounds = await getInboundsCall(true);
@@ -10700,7 +11440,21 @@ export async function provisionProvisionalRenewal(
           };
         }
 
-        const authoritativePrevTotalBytes = Math.max(0, Math.trunc(Number(matchedClient.totalGB ?? vpnAccount.total_bytes ?? 0) || 0));
+        const parsedLiveClientQuota = parseVerifiedLiveTotalBytes(matchedClient.totalGB);
+        if (!parsedLiveClientQuota.valid) {
+          return {
+            success: false,
+            autoRenewed: false,
+            provisional: false,
+            provisioningStatus: 'pending',
+            fallbackToManual: true,
+            blockedReason: 'INVALID_LIVE_CLIENT_QUOTA',
+            uuid: clientUuid,
+            inboundId,
+            message: `Live 3X-UI client totalGB (${String(matchedClient.totalGB)}) is missing or invalid; refusing to interpret invalid quota as Unlimited. Held for manual admin review.`,
+          };
+        }
+        const authoritativePrevTotalBytes = parsedLiveClientQuota.totalBytes;
         const clientStats: any[] = Array.isArray(matchedInbound.clientStats) ? matchedInbound.clientStats : [];
         const statRow =
           clientStats.find((s: any) => String(s.id || '').trim().toLowerCase() === clientUuid.toLowerCase()) ||
@@ -10723,19 +11477,44 @@ export async function provisionProvisionalRenewal(
         const rawLiveClientEnable: unknown = matchedClient.enable;
         const rawLiveInboundEnable: unknown = matchedInbound.enable;
 
-        // Determine requested renewal duration and quota from verified renew_requests record
+        // Determine requested renewal duration and quota authoritatively (fail-closed on missing/ambiguous/conflicting metadata)
         const durationMonths = Math.max(
           1,
           Math.trunc(Number(extra.durationMonths || renewReq.duration_months || 1) || 1)
         );
-        const combinedPlanStr = `${renewReq.plan_id || ''} ${renewReq.plan_name || ''} ${extra.package_type || ''} ${extra.data_limit || ''}`.toLowerCase();
-        const isFinite100GbPackage =
-          combinedPlanStr.includes('100gb') ||
-          combinedPlanStr.includes('100 gb') ||
-          combinedPlanStr.includes('sim_100') ||
-          String(extra.data_limit || '').toLowerCase().includes('100');
-        const ONE_HUNDRED_GB_BYTES = 100 * 1024 * 1024 * 1024;
-        const addedQuotaBytes = isFinite100GbPackage ? ONE_HUNDRED_GB_BYTES * durationMonths : 0;
+        const authoritativeQuota = resolveAuthoritativeRenewalQuota({
+          renewRequest: renewReq,
+          extraNotes: extra,
+          durationMonths,
+          vpnAccount,
+          vpnConfig,
+          parentOrder,
+          liveClientTotalBytes: authoritativePrevTotalBytes,
+        });
+
+        if (!authoritativeQuota.resolved) {
+          renewLockOutcome = 'failed';
+          renewLockError = authoritativeQuota.reason || authoritativeQuota.blockedReason || 'UNVERIFIED_RENEWAL_QUOTA_METADATA';
+          throw makeClientLockFallbackError(
+            {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: 'pending',
+              fallbackToManual: true,
+              blockedReason: authoritativeQuota.blockedReason || 'UNVERIFIED_RENEWAL_QUOTA_METADATA',
+              uuid: clientUuid,
+              inboundId,
+              message:
+                authoritativeQuota.reason ||
+                'Renewal quota tier could not be conclusively verified. Held for manual reconciliation without changing 3X-UI.',
+            },
+            false,
+            renewLockError
+          );
+        }
+
+        const addedQuotaBytes = authoritativeQuota.addedQuotaBytes ?? 0;
 
         const calc = calculateApprovedRenewalEntitlement({
           previousExpiryMs: authoritativePrevExpiryMs,
@@ -10834,6 +11613,8 @@ export async function provisionProvisionalRenewal(
           updated_at: prePersistIso,
         };
 
+        assertCanDispatchBeforeExternalMutation('provisional renewal grant pre-persistence');
+
         // Pre-persist entitlement grant row BEFORE modifying 3X-UI (fail closed if DB rejects snapshot)
         let grantRowId = existingGrant?.id || null;
         if (grantRowId) {
@@ -10901,9 +11682,16 @@ export async function provisionProvisionalRenewal(
                 return list.find((ib: any) => Number(ib.id) === Number(inboundId)) || null;
               };
 
+              assertCanDispatchBeforeExternalMutation('provisional renewal inbound fetch');
+
               const liveInboundObj = await fetchFreshInbound();
               if (!liveInboundObj) {
-                throw new Error(`Unable to fetch live inbound ${inboundId} from 3X-UI panel for renewal.`);
+                const missingIbErr: any = new Error(
+                  `Unable to fetch live inbound ${inboundId} from 3X-UI panel for renewal.`
+                );
+                missingIbErr.beforeExternalWrite = true;
+                missingIbErr.xuiUncertain = false;
+                throw missingIbErr;
               }
 
               // Re-verify inbound.enable === true inside the inbound write lock before any 3X-UI mutation
@@ -10912,6 +11700,8 @@ export async function provisionProvisionalRenewal(
                   `Inbound ${inboundId} is disabled or ambiguous (enable=${String(liveInboundObj.enable)}) inside write lock. Aborting automatic renewal.`
                 );
                 disabledIbErr.blockedReason = 'INBOUND_DISABLED_OR_AMBIGUOUS';
+                disabledIbErr.beforeExternalWrite = true;
+                disabledIbErr.xuiUncertain = false;
                 throw disabledIbErr;
               }
 
@@ -10931,7 +11721,13 @@ export async function provisionProvisionalRenewal(
                 (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
               );
               if (cIdx < 0) {
-                throw new Error(`Client ${clientUuid} no longer found on inbound ${inboundId} inside write lock.`);
+                const missingClientErr: any = new Error(
+                  `Client ${clientUuid} no longer found on inbound ${inboundId} inside write lock.`
+                );
+                missingClientErr.blockedReason = 'xui_client_not_found';
+                missingClientErr.beforeExternalWrite = true;
+                missingClientErr.xuiUncertain = false;
+                throw missingClientErr;
               }
 
               // Re-verify client.enable === true inside the inbound write lock before any 3X-UI mutation
@@ -10940,6 +11736,8 @@ export async function provisionProvisionalRenewal(
                   `Client ${clientUuid} is disabled or ambiguous (enable=${String(clientsList[cIdx].enable)}) inside write lock. Refusing unauthorized re-enable.`
                 );
                 disabledClientErr.blockedReason = 'CLIENT_DISABLED_OR_AMBIGUOUS';
+                disabledClientErr.beforeExternalWrite = true;
+                disabledClientErr.xuiUncertain = false;
                 throw disabledClientErr;
               }
 
@@ -10964,9 +11762,10 @@ export async function provisionProvisionalRenewal(
               delete updatePayload.trafficReset;
               delete updatePayload.lastTrafficResetTime;
 
-              // Verify all 3 locks are still held right before dispatching external 3X-UI mutation
+              // Verify cancellation/deadline and ALL 3 locks right before dispatching external 3X-UI mutation
               // and inside requestApi after authentication / re-authentication.
               const verifyAllLocksBeforeExternalMutation = async (): Promise<void> => {
+                assertCanDispatchBeforeExternalMutation('provisional renewal 3X-UI mutation');
                 await assertInboundLockStillHeld();
                 await assertClientLockStillHeld();
                 const renewStillHeld = await renewDurableProvisioningOperationLock({
@@ -10978,6 +11777,7 @@ export async function provisionProvisionalRenewal(
                   const fenceErr: any = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
                   fenceErr.statusCode = 409;
                   fenceErr.code = 'RENEW_LOCK_LOST';
+                  fenceErr.blockedReason = 'RENEW_LOCK_LOST';
                   fenceErr.beforeExternalWrite = true;
                   fenceErr.xuiUncertain = false;
                   throw fenceErr;
@@ -10985,56 +11785,88 @@ export async function provisionProvisionalRenewal(
               };
 
               await verifyAllLocksBeforeExternalMutation();
+              const mutationTimeoutMs = getRemainingRequestTimeoutMs();
 
               xuiWriteAttempted = true;
-              const updateRes = await requestApiCall<any>(
-                `/panel/api/inbounds/update/${inboundId}`,
-                'POST',
-                updatePayload,
-                {
-                  beforeSend: verifyAllLocksBeforeExternalMutation,
-                }
-              );
-              if (updateRes && updateRes.success === false) {
-                throw new Error(updateRes.msg || updateRes.message || '3X-UI panel rejected renewal inbound update.');
-              }
-
-              // MANDATORY READ-BACK VERIFICATION from live 3X-UI panel
-              const afterInbound = await fetchFreshInbound();
-              if (!afterInbound) {
-                throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal write.`);
-              }
-              if (afterInbound.enable !== true) {
-                throw new Error(
-                  `Read-back verification failed: inbound ${inboundId} is not enabled (enable=${String(afterInbound.enable)}) after renewal write.`
-                );
-              }
-              let afterSettings: any = {};
               try {
-                afterSettings =
-                  typeof afterInbound.settings === 'string'
-                    ? JSON.parse(afterInbound.settings)
-                    : afterInbound.settings || {};
-              } catch {
-                afterSettings = {};
-              }
-              const verifiedClient = (Array.isArray(afterSettings.clients) ? afterSettings.clients : []).find(
-                (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
-              );
-
-              if (
-                !verifiedClient ||
-                verifiedClient.enable !== true ||
-                Number(verifiedClient.expiryTime) !== calc.grantedExpiryMs ||
-                Number(verifiedClient.totalGB) !== calc.grantedTotalBytes
-              ) {
-                throw new Error(
-                  `Read-back verification failed for renewed client ${clientUuid} on inbound ${inboundId}: expected enable=true, expiryTime=${calc.grantedExpiryMs}, totalGB=${calc.grantedTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+                const updateRes = await requestApiCall<any>(
+                  `/panel/api/inbounds/update/${inboundId}`,
+                  'POST',
+                  updatePayload,
+                  {
+                    beforeSend: verifyAllLocksBeforeExternalMutation,
+                    signal,
+                    ...(mutationTimeoutMs !== undefined ? { timeoutMs: mutationTimeoutMs } : {}),
+                  }
                 );
-              }
+                if (updateRes && updateRes.success === false) {
+                  const rejErr: any = new Error(
+                    updateRes.msg || updateRes.message || '3X-UI panel rejected renewal inbound update.'
+                  );
+                  rejErr.xuiUncertain = true;
+                  rejErr.beforeExternalWrite = false;
+                  throw rejErr;
+                }
 
-              xuiWriteConfirmed = true;
-              invalidateInboundCache(inboundId);
+                // MANDATORY READ-BACK VERIFICATION from live 3X-UI panel
+                const afterInbound = await fetchFreshInbound();
+                if (!afterInbound) {
+                  const rbErr: any = new Error(
+                    `Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal write.`
+                  );
+                  rbErr.xuiUncertain = true;
+                  rbErr.beforeExternalWrite = false;
+                  throw rbErr;
+                }
+                if (afterInbound.enable !== true) {
+                  const rbErr: any = new Error(
+                    `Read-back verification failed: inbound ${inboundId} is not enabled (enable=${String(afterInbound.enable)}) after renewal write.`
+                  );
+                  rbErr.xuiUncertain = true;
+                  rbErr.beforeExternalWrite = false;
+                  throw rbErr;
+                }
+                let afterSettings: any = {};
+                try {
+                  afterSettings =
+                    typeof afterInbound.settings === 'string'
+                      ? JSON.parse(afterInbound.settings)
+                      : afterInbound.settings || {};
+                } catch {
+                  afterSettings = {};
+                }
+                const verifiedClient = (Array.isArray(afterSettings.clients) ? afterSettings.clients : []).find(
+                  (c: any) => String(c.id || '').trim().toLowerCase() === clientUuid.toLowerCase()
+                );
+
+                if (
+                  !verifiedClient ||
+                  verifiedClient.enable !== true ||
+                  Number(verifiedClient.expiryTime) !== calc.grantedExpiryMs ||
+                  Number(verifiedClient.totalGB) !== calc.grantedTotalBytes
+                ) {
+                  const rbErr: any = new Error(
+                    `Read-back verification failed for renewed client ${clientUuid} on inbound ${inboundId}: expected enable=true, expiryTime=${calc.grantedExpiryMs}, totalGB=${calc.grantedTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+                  );
+                  rbErr.xuiUncertain = true;
+                  rbErr.beforeExternalWrite = false;
+                  throw rbErr;
+                }
+
+                xuiWriteConfirmed = true;
+                invalidateInboundCache(inboundId);
+              } catch (postDispatchErr: any) {
+                if (
+                  postDispatchErr &&
+                  typeof postDispatchErr === 'object' &&
+                  postDispatchErr.beforeExternalWrite !== true &&
+                  postDispatchErr.xuiUncertain !== false
+                ) {
+                  postDispatchErr.xuiUncertain = true;
+                  postDispatchErr.beforeExternalWrite = false;
+                }
+                throw postDispatchErr;
+              }
             }
           );
         } catch (xuiErr: any) {
@@ -11078,17 +11910,21 @@ export async function provisionProvisionalRenewal(
               .eq('id', cleanRequestId);
           } catch (_e) {}
 
-          return {
+          const fallbackRes: ProvisionProvisionalRenewalResult = {
             success: false,
             autoRenewed: false,
             provisional: false,
             provisioningStatus: isUncertain ? 'uncertain' : 'pending',
             fallbackToManual: true,
-            blockedReason: xuiErr?.blockedReason || (isUncertain ? 'xui_write_uncertain' : 'xui_update_failed'),
+            blockedReason:
+              xuiErr?.blockedReason ||
+              xuiErr?.code ||
+              (isUncertain ? 'xui_write_uncertain' : 'xui_update_failed'),
             uuid: clientUuid,
             inboundId,
             message: errText,
           };
+          throw makeClientLockFallbackError(fallbackRes, isUncertain, errText);
         }
 
         // Step 6: Update Supabase records after confirmed 3X-UI read-back verification.
@@ -11217,7 +12053,7 @@ export async function provisionProvisionalRenewal(
               .eq('id', cleanRequestId);
           } catch (_e) {}
 
-          return {
+          const postDbFallbackRes: ProvisionProvisionalRenewalResult = {
             success: false,
             autoRenewed: false,
             provisional: false,
@@ -11228,6 +12064,7 @@ export async function provisionProvisionalRenewal(
             inboundId,
             message: `3X-UI renewal succeeded but database sync failed (${dbErrText}). Marked 'uncertain' for safe admin reconciliation.`,
           };
+          throw makeClientLockFallbackError(postDbFallbackRes, true, dbErrText);
         }
 
         if (!options?.skipSideEffects) {
@@ -11264,7 +12101,45 @@ export async function provisionProvisionalRenewal(
           message: 'VPN subscription renewed and provisionally activated pending payment verification.',
         };
       }
-    );
+      );
+    } catch (clientLockErr: any) {
+      if (clientLockErr?.__provisionalFallbackResult) {
+        return clientLockErr.__provisionalFallbackResult as ProvisionProvisionalRenewalResult;
+      }
+      if (clientLockErr?.beforeExternalWrite === true && clientLockErr?.xuiUncertain === false) {
+        renewLockOutcome = 'failed';
+        renewLockError = clientLockErr?.message || String(clientLockErr);
+        return {
+          success: false,
+          autoRenewed: false,
+          provisional: false,
+          provisioningStatus: 'pending',
+          fallbackToManual: true,
+          blockedReason: clientLockErr?.blockedReason || clientLockErr?.code || 'REQUEST_TIMEOUT_BEFORE_MUTATION',
+          uuid: clientUuid,
+          message: clientLockErr?.message || 'Automatic renewal aborted safely before 3X-UI mutation.',
+        };
+      }
+      throw clientLockErr;
+    }
+  } catch (outerErr: any) {
+    if (outerErr?.beforeExternalWrite === true && outerErr?.xuiUncertain === false) {
+      renewLockOutcome = 'failed';
+      renewLockError = outerErr?.message || String(outerErr);
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: 'pending',
+        fallbackToManual: true,
+        blockedReason: outerErr?.blockedReason || outerErr?.code || 'REQUEST_TIMEOUT_BEFORE_MUTATION',
+        uuid: targetClientUuid || undefined,
+        message: outerErr?.message || 'Automatic renewal aborted safely before 3X-UI mutation.',
+      };
+    }
+    renewLockOutcome = outerErr?.xuiUncertain === true ? 'uncertain' : 'failed';
+    renewLockError = outerErr?.message || String(outerErr);
+    throw outerErr;
   } finally {
     if (renewLockRes.tableAvailable) {
       await finalizeDurableProvisioningOperationLock({
@@ -11335,15 +12210,20 @@ export async function confirmProvisionalRenewal(
     throw conflictErr;
   }
 
-  if (grantRow.status === 'provisioning') {
+  if (grantRow.status === 'provisioning' || grantRow.status === 'uncertain') {
     const conflictErr: any = new Error(
-      `Renewal request '${cleanRequestId}' currently has an in-flight provisioning grant (status=provisioning). Please wait or verify live 3X-UI client state before approving.`
+      grantRow.status === 'uncertain'
+        ? `Renewal request '${cleanRequestId}' has an uncertain external 3X-UI state (grant status=uncertain). Manual reconciliation required before confirming.`
+        : `Renewal request '${cleanRequestId}' currently has an in-flight provisioning grant (status=provisioning). Please wait or verify live 3X-UI client state before approving.`
     );
     conflictErr.statusCode = 409;
+    conflictErr.code = 'RECONCILIATION_REQUIRED';
+    conflictErr.beforeExternalWrite = true;
+    conflictErr.xuiUncertain = false;
     throw conflictErr;
   }
 
-  const isUncertainReconciliation = grantRow.status === 'uncertain';
+  const isUncertainReconciliation = false;
   const clientUuid = String(grantRow.client_uuid || '').trim();
   const grantedExpiryMs = Number(grantRow.granted_expiry_ms || 0);
   const grantedTotalBytes = Number(grantRow.granted_total_bytes || 0);
@@ -11360,7 +12240,7 @@ export async function confirmProvisionalRenewal(
       operationType: 'client_lock',
       targetId: `approve_renew:${cleanRequestId}`,
       requireDurableLock: true,
-      allowUncertainRecovery: true,
+      allowUncertainRecovery: false,
       metadata: { renewRequestId: cleanRequestId, action: 'confirm_provisional_renewal' },
     },
     async (assertClientLockStillHeld) => {
@@ -11660,6 +12540,17 @@ export async function revokeProvisionalRenewal(
     throw conflictErr;
   }
 
+  if (grantRow.status === 'provisioning' || grantRow.status === 'uncertain') {
+    const conflictErr: any = new Error(
+      `Renewal request '${cleanRequestId}' has an unresolved or uncertain external 3X-UI state (grant status=${grantRow.status}); manual reconciliation required before rejection.`
+    );
+    conflictErr.statusCode = 409;
+    conflictErr.code = 'RECONCILIATION_REQUIRED';
+    conflictErr.beforeExternalWrite = true;
+    conflictErr.xuiUncertain = false;
+    throw conflictErr;
+  }
+
   const clientUuid = String(grantRow.client_uuid || '').trim();
   const inboundId = Number(grantRow.inbound_id || 0);
   const prevExpiryMs = Math.max(0, Math.trunc(Number(grantRow.previous_expiry_ms || 0)));
@@ -11686,7 +12577,7 @@ export async function revokeProvisionalRenewal(
       operationType: 'client_lock',
       targetId: `reject_renew:${cleanRequestId}`,
       requireDurableLock: true,
-      allowUncertainRecovery: true,
+      allowUncertainRecovery: false,
       metadata: { renewRequestId: cleanRequestId, action: 'revoke_provisional_renewal', reason },
     },
     async (assertClientLockStillHeld) => {

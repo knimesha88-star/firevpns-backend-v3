@@ -1173,17 +1173,90 @@ const logTelegramAdminAction = (entry: TelegramAdminAuditLogEntry): void => {
   );
 };
 
+/**
+ * Produces a concise, admin-actionable Telegram error message while strictly redacting
+ * bot tokens, Bearer tokens, JWTs, Supabase/API keys, database/panel URLs, credentials,
+ * customer secrets, stack traces, and raw upstream/SQL errors.
+ */
+export const sanitizeTelegramErrorMessage = (err: any): string => {
+  const code = String(err?.code || err?.blockedReason || '').trim().toUpperCase();
+  const mappedMessages: Record<string, string> = {
+    RECONCILIATION_REQUIRED:
+      'Uncertain prior state detected. Verify live 3X-UI and database state before reconciling.',
+    CLIENT_LOCK_UNCERTAIN:
+      'VPN client has an uncertain prior operation lock. Verify 3X-UI state before reconciling.',
+    INBOUND_LOCK_UNCERTAIN:
+      'Inbound write lock is in an uncertain state. Verify 3X-UI state before reconciling.',
+    OPERATION_IN_PROGRESS:
+      'Another operation is currently in progress for this request. Please wait and retry.',
+    CLIENT_LOCK_BUSY:
+      'Another operation is currently modifying this VPN client. Please wait and retry.',
+    UNVERIFIED_RENEWAL_QUOTA_METADATA:
+      'Renewal quota tier (100GB vs Unlimited) could not be verified. Held for manual reconciliation without changing 3X-UI.',
+    CONFLICTING_QUOTA_METADATA:
+      'Conflicting renewal quota metadata detected. Held for manual reconciliation without changing 3X-UI.',
+    CONFLICTING_SPECIAL_OFFER_QUOTA_METADATA:
+      'Special Offer quota metadata conflicts with existing 100GB account. Held for manual reconciliation without changing 3X-UI.',
+    CONFLICTING_PACKAGE_CATEGORY_METADATA:
+      'Package category conflicts with renewal quota metadata. Held for manual reconciliation without changing 3X-UI.',
+    AMBIGUOUS_QUOTA_METADATA:
+      'Ambiguous renewal quota metadata detected. Held for manual reconciliation without changing 3X-UI.',
+    LOCK_PERMISSION_ERROR:
+      'Database lock permission error prevented safe execution. Check Supabase RPC grants.',
+    LOCK_SERVICE_UNAVAILABLE:
+      'Lock service temporarily unavailable. No 3X-UI changes were made; please retry shortly.',
+    REQUEST_TIMEOUT_BEFORE_MUTATION:
+      'Request timed out before contacting 3X-UI. No panel changes were made; safe to retry.',
+  };
+
+  if (code && mappedMessages[code]) {
+    return mappedMessages[code];
+  }
+
+  const raw = String(err?.message || 'Unexpected processing error');
+
+  // Avoid leaking raw upstream HTTP/SQL/HTML dumps directly to Telegram chat
+  if (
+    /<!doctype|<html|select\s+.+\s+from|insert\s+into|update\s+.+\s+set|postgres|supabase|syntax error at or near|violates check constraint|econnrefused|enotfound/i.test(
+      raw
+    )
+  ) {
+    return 'Backend or upstream service error occurred. Check server logs and admin panel before retrying.';
+  }
+
+  const redacted = raw
+    .replace(/bot[0-9]+:[A-Za-z0-9_-]+/gi, 'bot[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, '[REDACTED_TOKEN]')
+    .replace(/\b(?:sb_secret|sb_publishable|sbp|sk|pk|xui|ghp|AIza)[A-Za-z0-9_-]{6,}\b/gi, '[REDACTED_KEY]')
+    .replace(/\b(?:postgres(?:ql)?|mysql|redis|https?):\/\/[^\s'"<>]+/gi, '[REDACTED_URL]')
+    .replace(
+      /\b(?:password|passwd|secret|token|api[_-]?key|service[_-]?role[_-]?key|cookie|session|authorization)\s*[:=]\s*[^\s,;]+/gi,
+      '[REDACTED_CREDENTIAL]'
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED_EMAIL]')
+    .replace(/\r?\n.*$/s, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!redacted) {
+    return 'Unexpected processing error. Check admin panel and server logs.';
+  }
+  return redacted.slice(0, 180);
+};
+
 export const answerTelegramCallbackQuery = async (
   callbackQueryId: string,
   text?: string,
-  showAlert = false
+  showAlert = false,
+  fetchFn: typeof fetch = fetch
 ): Promise<void> => {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken || !callbackQueryId) return;
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/answerCallbackQuery`;
-    await fetch(url, {
+    await fetchFn(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(6000),
@@ -1194,7 +1267,38 @@ export const answerTelegramCallbackQuery = async (
       }),
     });
   } catch (err: any) {
-    console.warn('[TelegramService] Failed to answerCallbackQuery:', err?.message || err);
+    console.warn('[TelegramService] Failed to answerCallbackQuery:', sanitizeTelegramErrorMessage(err));
+  }
+};
+
+export const sendTelegramFollowUpMessage = async (
+  chatId: string | number,
+  text: string,
+  replyToMessageId?: number,
+  fetchFn: typeof fetch = fetch
+): Promise<void> => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken || !chatId || !text) return;
+
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const bodyPayload: Record<string, any> = {
+      chat_id: chatId,
+      text: String(text).slice(0, 1000),
+      disable_web_page_preview: true,
+    };
+    if (replyToMessageId && Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+      bodyPayload.reply_to_message_id = replyToMessageId;
+      bodyPayload.allow_sending_without_reply = true;
+    }
+    await fetchFn(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(6000),
+      body: JSON.stringify(bodyPayload),
+    });
+  } catch (err: any) {
+    console.warn('[TelegramService] Failed to send follow-up error message:', sanitizeTelegramErrorMessage(err));
   }
 };
 
@@ -1688,8 +1792,39 @@ const fetchOrderFromSupabaseForTelegram = async (rawOrderId: string): Promise<an
   return byOrderId || null;
 };
 
-export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<void> => {
+export interface HandleTelegramCallbackQueryDeps {
+  dbClient?: any;
+  fetchFn?: typeof fetch;
+  verifyAdminFn?: (fromUserId: any, messageChatId: any) => Promise<{ authorized: boolean; reason?: string }>;
+  answerCallbackFn?: (callbackQueryId: string, text?: string, showAlert?: boolean) => Promise<void>;
+  sendFollowUpFn?: (chatId: string | number, text: string, replyToMessageId?: number) => Promise<void>;
+  editRenewMessageFn?: typeof editTelegramRenewMessage;
+  editOrderMessageFn?: typeof editTelegramOrderMessage;
+  executeRenewalApprovalFn?: (requestId: string, options?: any) => Promise<any>;
+  executeRenewalRejectionFn?: (requestId: string, reason?: string, options?: any) => Promise<any>;
+  executeOrderApprovalFn?: (orderId: string, inboundId?: any, options?: any) => Promise<any>;
+  executeOrderRejectionFn?: (orderId: string, reason?: string, options?: any) => Promise<any>;
+}
+
+export const handleTelegramCallbackQuery = async (
+  callbackQuery: any,
+  deps?: HandleTelegramCallbackQueryDeps
+): Promise<void> => {
   if (!callbackQuery || !callbackQuery.id) return;
+
+  const dbClient = deps?.dbClient || supabaseAdmin;
+  const fetchFn = deps?.fetchFn || fetch;
+  const verifyAdminFn = deps?.verifyAdminFn || verifyTelegramAdminAuthorization;
+  const answerCallback =
+    deps?.answerCallbackFn ||
+    ((qid: string, text?: string, showAlert = false) =>
+      answerTelegramCallbackQuery(qid, text, showAlert, fetchFn));
+  const sendFollowUp =
+    deps?.sendFollowUpFn ||
+    ((chatId: string | number, text: string, replyToMessageId?: number) =>
+      sendTelegramFollowUpMessage(chatId, text, replyToMessageId, fetchFn));
+  const editRenewMsg = deps?.editRenewMessageFn || editTelegramRenewMessage;
+  const editOrderMsg = deps?.editOrderMessageFn || editTelegramOrderMessage;
 
   const callbackQueryId = String(callbackQuery.id);
   const fromUser = callbackQuery.from || {};
@@ -1718,7 +1853,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       outcome: 'IGNORED_MALFORMED_CALLBACK_DATA',
       timestamp,
     });
-    await answerTelegramCallbackQuery(callbackQueryId, '⚠️ Unsupported or invalid button action.', true);
+    await answerCallback(callbackQueryId, '⚠️ Unsupported or invalid button action.', true);
     return;
   }
 
@@ -1734,7 +1869,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
   const targetOrderId = match[2].trim();
 
   // 1. Verify Admin Authorization FIRST before trusting ID or performing any DB query
-  const authCheck = await verifyTelegramAdminAuthorization(fromUserId, messageChatId);
+  const authCheck = await verifyAdminFn(fromUserId, messageChatId);
   if (!authCheck.authorized) {
     logTelegramAdminAction({
       adminId: fromUserId || 'unknown',
@@ -1744,7 +1879,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       outcome: `DENIED: ${authCheck.reason || 'Unauthorized user'}`,
       timestamp,
     });
-    await answerTelegramCallbackQuery(
+    await answerCallback(
       callbackQueryId,
       '⛔ Unauthorized: Only authorized FIREVPNs administrators can approve or reject orders and renewals.',
       true
@@ -1754,7 +1889,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
 
   // 2. Prevent duplicate concurrent processing on rapid double-clicks
   if (inFlightTelegramOrderActions.has(targetOrderId)) {
-    await answerTelegramCallbackQuery(
+    await answerCallback(
       callbackQueryId,
       '⏳ This request is currently being processed. Please wait...',
       false
@@ -1765,10 +1900,11 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
   inFlightTelegramOrderActions.add(targetOrderId);
   let lockedDbId = '';
   let lockedCanonicalOrderId = '';
+  let callbackQueryAnswered = false;
 
   try {
     if (isRenewCallback) {
-      const { data: renewRow } = await supabaseAdmin
+      const { data: renewRow } = await dbClient
         .from('renew_requests')
         .select('*')
         .eq('id', targetOrderId)
@@ -1855,19 +1991,22 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       const adminDisplayLabel = `${fromUsername} (ID: ${fromUserId})`;
 
       if (actionVerb === 'APPROVE_RENEW') {
-        await answerTelegramCallbackQuery(
+        await answerCallback(
           callbackQueryId,
           `⏳ Approving renewal #${lockedCanonicalOrderId}...`,
           false
         );
+        callbackQueryAnswered = true;
 
-        const { executeRenewalApproval } = await import('../controllers/renewController.js');
-        const result = await executeRenewalApproval(renewRow.id, {
+        const executeRenewalApprovalFn =
+          deps?.executeRenewalApprovalFn ||
+          (await import('../controllers/renewController.js')).executeRenewalApproval;
+        const result = await executeRenewalApprovalFn(renewRow.id, {
           adminLabel: `Telegram Admin ${adminDisplayLabel}`,
         });
 
         if (messageChatId && messageId) {
-          await editTelegramRenewMessage({
+          await editRenewMsg({
             chatId: messageChatId,
             messageId,
             originalText: originalMessageText,
@@ -1888,19 +2027,22 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
           timestamp,
         });
       } else {
-        await answerTelegramCallbackQuery(
+        await answerCallback(
           callbackQueryId,
           `⏳ Rejecting renewal #${lockedCanonicalOrderId}...`,
           false
         );
+        callbackQueryAnswered = true;
 
-        const { executeRenewalRejection } = await import('../controllers/renewController.js');
-        await executeRenewalRejection(renewRow.id, 'Rejected by Admin via Telegram', {
+        const executeRenewalRejectionFn =
+          deps?.executeRenewalRejectionFn ||
+          (await import('../controllers/renewController.js')).executeRenewalRejection;
+        await executeRenewalRejectionFn(renewRow.id, 'Rejected by Admin via Telegram', {
           adminLabel: `Telegram Admin ${adminDisplayLabel}`,
         });
 
         if (messageChatId && messageId) {
-          await editTelegramRenewMessage({
+          await editRenewMsg({
             chatId: messageChatId,
             messageId,
             originalText: originalMessageText,
@@ -2061,14 +2203,17 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
     // 5. Execute Approve Order or Reject Order using existing backend workflow
     if (actionVerb === 'APPROVE_ORDER') {
       // Answer callback query promptly so Telegram button stops spinning during 3X-UI provisioning
-      await answerTelegramCallbackQuery(
+      await answerCallback(
         callbackQueryId,
         `⏳ Approving order #${lockedCanonicalOrderId} & provisioning VPN...`,
         false
       );
+      callbackQueryAnswered = true;
 
-      const { executeOrderApproval } = await import('../controllers/adminController.js');
-      const result = await executeOrderApproval(order.id, undefined, {
+      const executeOrderApprovalFn =
+        deps?.executeOrderApprovalFn ||
+        (await import('../controllers/adminController.js')).executeOrderApproval;
+      const result = await executeOrderApprovalFn(order.id, undefined, {
         adminLabel: `Telegram Admin ${adminDisplayLabel}`,
       });
 
@@ -2085,7 +2230,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       }
 
       if (messageChatId && messageId) {
-        await editTelegramOrderMessage({
+        await editOrderMsg({
           chatId: messageChatId,
           messageId,
           originalText: originalMessageText,
@@ -2106,19 +2251,22 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       });
     } else {
       // REJECT_ORDER
-      const { executeOrderRejection } = await import('../controllers/adminController.js');
-      await executeOrderRejection(order.id, 'Rejected by Admin via Telegram', {
+      const executeOrderRejectionFn =
+        deps?.executeOrderRejectionFn ||
+        (await import('../controllers/adminController.js')).executeOrderRejection;
+      await executeOrderRejectionFn(order.id, 'Rejected by Admin via Telegram', {
         adminLabel: `Telegram Admin ${adminDisplayLabel}`,
       });
 
-      await answerTelegramCallbackQuery(
+      await answerCallback(
         callbackQueryId,
         `❌ Order #${lockedCanonicalOrderId} has been REJECTED.`,
         false
       );
+      callbackQueryAnswered = true;
 
       if (messageChatId && messageId) {
-        await editTelegramOrderMessage({
+        await editOrderMsg({
           chatId: messageChatId,
           messageId,
           originalText: originalMessageText,
@@ -2139,9 +2287,7 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       });
     }
   } catch (err: any) {
-    const safeErrorMessage = String(err?.message || 'Unexpected processing error')
-      .replace(/bot[0-9]+:[A-Za-z0-9_-]+/g, 'bot[REDACTED]')
-      .slice(0, 160);
+    const safeErrorMessage = sanitizeTelegramErrorMessage(err);
 
     logTelegramAdminAction({
       adminId: fromUserId || 'unknown',
@@ -2152,11 +2298,28 @@ export const handleTelegramCallbackQuery = async (callbackQuery: any): Promise<v
       timestamp,
     });
 
-    await answerTelegramCallbackQuery(
-      callbackQueryId,
-      `⚠️ Action failed: ${safeErrorMessage}`,
-      true
-    );
+    if (!callbackQueryAnswered) {
+      await answerCallback(
+        callbackQueryId,
+        `⚠️ Action failed: ${safeErrorMessage}`,
+        true
+      );
+    } else if (messageChatId) {
+      const actionTitle =
+        actionVerb === 'APPROVE_RENEW'
+          ? 'Renewal Approval'
+          : actionVerb === 'REJECT_RENEW'
+          ? 'Renewal Rejection'
+          : actionVerb === 'APPROVE_ORDER'
+          ? 'Order Approval'
+          : 'Order Rejection';
+      const targetRef = lockedCanonicalOrderId || targetOrderId;
+      await sendFollowUp(
+        messageChatId,
+        `⚠️ ${actionTitle} Failed (#${targetRef})\nReason: ${safeErrorMessage}`,
+        messageId > 0 ? messageId : undefined
+      );
+    }
   } finally {
     inFlightTelegramOrderActions.delete(targetOrderId);
     if (lockedDbId) inFlightTelegramOrderActions.delete(lockedDbId);

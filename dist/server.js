@@ -4012,6 +4012,75 @@ var init_specialOfferService = __esm({
   }
 });
 
+// src/utils/apiTimeoutRoutes.ts
+function normalizeApiRoutePath(rawPath) {
+  let clean = String(rawPath || "").split("?")[0].trim();
+  if (!clean.startsWith("/")) {
+    clean = `/${clean}`;
+  }
+  if (clean.toLowerCase().startsWith("/api/")) {
+    clean = clean.slice(4);
+  } else if (clean.toLowerCase() === "/api") {
+    clean = "/";
+  }
+  return clean.replace(/\/+$/, "") || "/";
+}
+function isExtendedTimeoutBackendApiRequest(method, path3) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
+  if (normalizedMethod !== "POST") {
+    return false;
+  }
+  const normalizedPath = normalizeApiRoutePath(path3);
+  if (EXACT_EXTENDED_ADMIN_POST_PATHS.has(normalizedPath)) {
+    return true;
+  }
+  if (EXACT_EXTENDED_TELEGRAM_POST_PATHS.has(normalizedPath)) {
+    return true;
+  }
+  if (EXACT_EXTENDED_ADMIN_POST_PATTERNS.some((pattern) => pattern.test(normalizedPath))) {
+    return true;
+  }
+  if (EXACT_CLAIM_TRIAL_POST_PATTERNS.some((pattern) => pattern.test(normalizedPath))) {
+    return true;
+  }
+  return false;
+}
+function getBackendApiTimeoutMs(method, path3) {
+  return isExtendedTimeoutBackendApiRequest(method, path3) ? BACKEND_EXTENDED_API_TIMEOUT_MS : BACKEND_DEFAULT_API_TIMEOUT_MS;
+}
+var BACKEND_EXTENDED_API_TIMEOUT_MS, BACKEND_DEFAULT_API_TIMEOUT_MS, EXACT_EXTENDED_ADMIN_POST_PATHS, EXACT_EXTENDED_TELEGRAM_POST_PATHS, EXACT_EXTENDED_ADMIN_POST_PATTERNS, EXACT_CLAIM_TRIAL_POST_PATTERNS;
+var init_apiTimeoutRoutes = __esm({
+  "src/utils/apiTimeoutRoutes.ts"() {
+    "use strict";
+    BACKEND_EXTENDED_API_TIMEOUT_MS = 7e4;
+    BACKEND_DEFAULT_API_TIMEOUT_MS = 25e3;
+    EXACT_EXTENDED_ADMIN_POST_PATHS = /* @__PURE__ */ new Set([
+      "/admin/approve-order",
+      "/admin/reject-order",
+      "/admin/verify-payment",
+      "/renew/orders",
+      "/renew/request"
+    ]);
+    EXACT_EXTENDED_TELEGRAM_POST_PATHS = /* @__PURE__ */ new Set([
+      "/telegram/webhook",
+      "/telegram/callback"
+    ]);
+    EXACT_EXTENDED_ADMIN_POST_PATTERNS = [
+      /^\/admin\/orders\/[^/]+\/approve$/,
+      /^\/admin\/orders\/[^/]+\/reject$/,
+      /^\/admin\/orders\/[^/]+\/verify-payment$/,
+      /^\/renew\/approve\/[^/]+$/,
+      /^\/renew\/reject\/[^/]+$/
+    ];
+    EXACT_CLAIM_TRIAL_POST_PATTERNS = [
+      /^\/vpn\/claim-trial$/,
+      /^\/client\/claim-trial$/,
+      /^\/trial\/claim-trial$/,
+      /^\/claim-trial$/
+    ];
+  }
+});
+
 // src/api/services/paymentSlipService.ts
 import crypto4 from "crypto";
 async function ensurePaymentSlipsBucketExists() {
@@ -4803,9 +4872,119 @@ __export(renewController_exports, {
   isUserAuthorizedForAutoActivateRenewals: () => isUserAuthorizedForAutoActivateRenewals,
   notifyOrderApprove: () => notifyOrderApprove,
   notifyOrderReject: () => notifyOrderReject,
+  persistAutoRenewalBlockedReasonCas: () => persistAutoRenewalBlockedReasonCas,
   rejectRenewRequest: () => rejectRenewRequest,
   validateRenewPrice: () => validateRenewPrice
 });
+async function persistAutoRenewalBlockedReasonCas(params) {
+  const { dbClient, renewRequestId } = params;
+  const canonicalBase = params.canonicalExtraMetadata && typeof params.canonicalExtraMetadata === "object" ? { ...params.canonicalExtraMetadata } : {};
+  const maxAttempts = Math.max(1, Math.min(3, Math.trunc(Number(params.maxAttempts) || 2)));
+  const sanitizedReason = sanitizeAutoRenewalBlockedReason(params.blockedReason) || "PROVISIONING_HELD_FOR_MANUAL_REVIEW";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const effectiveNowIso = params.nowIso || (/* @__PURE__ */ new Date()).toISOString();
+    const { data: latestReqRow, error: readErr } = await dbClient.from("renew_requests").select("id, status, provisioning_status, notes").eq("id", renewRequestId).maybeSingle();
+    if (readErr) {
+      console.warn(
+        `[RenewController] Supabase read error while preparing auto_renewal_blocked_reason for request ${renewRequestId} (attempt ${attempt}/${maxAttempts}):`,
+        readErr?.message || readErr
+      );
+      return {
+        persisted: false,
+        reason: "SUPABASE_READ_ERROR",
+        attempts: attempt,
+        sanitizedBlockedReason: sanitizedReason,
+        errorMessage: String(readErr?.message || readErr)
+      };
+    }
+    if (!latestReqRow) {
+      return {
+        persisted: false,
+        reason: "ROW_NOT_FOUND",
+        attempts: attempt,
+        sanitizedBlockedReason: sanitizedReason
+      };
+    }
+    const currentStatus = String(latestReqRow.status ?? "pending").trim().toLowerCase();
+    const currentProvStatus = String(latestReqRow.provisioning_status ?? "").trim().toLowerCase();
+    if (currentStatus !== "pending" || currentProvStatus === "completed" || currentProvStatus === "approved" || currentProvStatus === "revoked") {
+      return {
+        persisted: false,
+        reason: "CONCURRENT_ADMIN_STATE_CHANGE",
+        attempts: attempt,
+        sanitizedBlockedReason: sanitizedReason
+      };
+    }
+    const originalNotes = latestReqRow.notes === null || latestReqRow.notes === void 0 ? null : String(latestReqRow.notes);
+    let mergedNotesObj = { ...canonicalBase };
+    if (originalNotes !== null && originalNotes.length > 0) {
+      const trimmed = originalNotes.trim();
+      if (trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(originalNotes);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            mergedNotesObj = { ...canonicalBase, ...parsed };
+            for (const key of CANONICAL_QUOTA_METADATA_KEYS) {
+              if (canonicalBase[key] !== void 0) {
+                mergedNotesObj[key] = canonicalBase[key];
+              }
+            }
+          } else {
+            mergedNotesObj = { ...canonicalBase, legacy_notes: originalNotes };
+          }
+        } catch {
+          mergedNotesObj = { ...canonicalBase, legacy_notes: originalNotes };
+        }
+      } else {
+        mergedNotesObj = { ...canonicalBase, legacy_notes: originalNotes };
+      }
+    }
+    mergedNotesObj.auto_renewal_blocked_reason = sanitizedReason;
+    mergedNotesObj.auto_renewal_held_at = effectiveNowIso;
+    let updateBuilder = dbClient.from("renew_requests").update({
+      notes: JSON.stringify(mergedNotesObj),
+      updated_at: effectiveNowIso
+    }).eq("id", renewRequestId).eq("status", "pending");
+    if (originalNotes === null) {
+      updateBuilder = updateBuilder.is("notes", null);
+    } else {
+      updateBuilder = updateBuilder.eq("notes", originalNotes);
+    }
+    const { data: updatedRows, error: updateErr } = await updateBuilder.select("id, notes");
+    if (updateErr) {
+      console.warn(
+        `[RenewController] Supabase update error while persisting auto_renewal_blocked_reason for request ${renewRequestId} (attempt ${attempt}/${maxAttempts}):`,
+        updateErr?.message || updateErr
+      );
+      return {
+        persisted: false,
+        reason: "SUPABASE_UPDATE_ERROR",
+        attempts: attempt,
+        sanitizedBlockedReason: sanitizedReason,
+        errorMessage: String(updateErr?.message || updateErr)
+      };
+    }
+    const matchedRowCount = Array.isArray(updatedRows) ? updatedRows.length : updatedRows && typeof updatedRows === "object" && updatedRows.id ? 1 : 0;
+    if (matchedRowCount > 0) {
+      return {
+        persisted: true,
+        reason: "PERSISTED",
+        attempts: attempt,
+        sanitizedBlockedReason: sanitizedReason,
+        mergedNotes: mergedNotesObj
+      };
+    }
+  }
+  console.warn(
+    `[RenewController] Skipped persisting auto_renewal_blocked_reason for request ${renewRequestId} after ${maxAttempts} CAS attempts due to concurrent notes/status modification.`
+  );
+  return {
+    persisted: false,
+    reason: "CAS_CONFLICT_SKIPPED",
+    attempts: maxAttempts,
+    sanitizedBlockedReason: sanitizedReason
+  };
+}
 function isPaymentSlipStoragePathOwnedByUser(params) {
   const raw = String(params.slipUrl || "").trim();
   let decodedOnce = raw;
@@ -4874,7 +5053,7 @@ function isPaymentSlipStoragePathOwnedByUser(params) {
   }
   return { valid: true };
 }
-var isAutoActivateNewOrdersEnabled, getAutoActivateNewOrdersAllowlist, isUserAuthorizedForAutoActivateNewOrders, isAutoActivateRenewalsEnabled, getAutoActivateRenewalsAllowlist, isUserAuthorizedForAutoActivateRenewals, getSafeOrderSourceLabel, evaluateAutoActivationDebugContext, resolveAutoActivationSkipReason, logAutoActivationDebug, ALLOWED_SLIP_STORAGE_BUCKETS, ALLOWED_NEW_ORDER_SLIP_FOLDERS, validateRenewPrice, createRenewRequest, executeRenewalApproval, approveRenewRequest, executeRenewalRejection, rejectRenewRequest, createOrder, createOrderNotification, notifyOrderApprove, notifyOrderReject;
+var CANONICAL_QUOTA_METADATA_KEYS, isAutoActivateNewOrdersEnabled, getAutoActivateNewOrdersAllowlist, isUserAuthorizedForAutoActivateNewOrders, isAutoActivateRenewalsEnabled, getAutoActivateRenewalsAllowlist, isUserAuthorizedForAutoActivateRenewals, getSafeOrderSourceLabel, evaluateAutoActivationDebugContext, resolveAutoActivationSkipReason, logAutoActivationDebug, ALLOWED_SLIP_STORAGE_BUCKETS, ALLOWED_NEW_ORDER_SLIP_FOLDERS, validateRenewPrice, createRenewRequest, executeRenewalApproval, approveRenewRequest, executeRenewalRejection, rejectRenewRequest, createOrder, createOrderNotification, notifyOrderApprove, notifyOrderReject;
 var init_renewController = __esm({
   "src/api/controllers/renewController.ts"() {
     "use strict";
@@ -4884,7 +5063,26 @@ var init_renewController = __esm({
     init_notificationService();
     init_emailService();
     init_specialOfferService();
+    init_apiTimeoutRoutes();
     init_paymentSlipService();
+    CANONICAL_QUOTA_METADATA_KEYS = [
+      "planId",
+      "verified_plan_id",
+      "package_type",
+      "data_limit",
+      "category",
+      "quota_mode",
+      "monthly_quota_gb",
+      "quota_verified_by_server",
+      "tier_upgrade_verified",
+      "plan_name",
+      "package_id",
+      "package_name",
+      "duration_months",
+      "durationMonths",
+      "duration_label",
+      "duration"
+    ];
     isAutoActivateNewOrdersEnabled = () => String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ENABLED || "false").trim().toLowerCase() === "true";
     getAutoActivateNewOrdersAllowlist = () => String(process.env.AUTO_ACTIVATE_NEW_ORDERS_ALLOWLIST || "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
     isUserAuthorizedForAutoActivateNewOrders = (uid, email) => {
@@ -4999,6 +5197,7 @@ var init_renewController = __esm({
           return;
         }
         const data = req.body || {};
+        const requestDeadlineMs = typeof req.timeoutDeadlineMs === "number" && Number.isFinite(req.timeoutDeadlineMs) ? req.timeoutDeadlineMs : Date.now() + getBackendApiTimeoutMs("POST", "/renew/request");
         const customerEmail = authEmail;
         const requestedDuration = Number(data.durationMonths || data.duration || 1);
         const rawSlipUrl = String(data.slipUrl || data.slip_url || "").trim();
@@ -5084,6 +5283,58 @@ var init_renewController = __esm({
             return;
           }
         }
+        const submittedQuotaHints = [
+          { name: "planId", val: data.planId ?? data.plan_id },
+          { name: "packageType", val: data.packageType ?? data.package_type },
+          { name: "dataLimit", val: data.dataLimit ?? data.data_limit }
+        ];
+        let submittedFiniteGb = null;
+        let submittedUnlimited = false;
+        for (const hint of submittedQuotaHints) {
+          if (hint.val === void 0 || hint.val === null || String(hint.val).trim() === "") continue;
+          const parsedHint = parseExplicitRenewalQuotaSignal(hint.val);
+          if (parsedHint.kind === "ambiguous") {
+            res.status(400).json({
+              success: false,
+              code: "AMBIGUOUS_QUOTA_METADATA",
+              error: `Invalid or ambiguous renewal quota metadata in ${hint.name}.`
+            });
+            return;
+          }
+          if (parsedHint.kind === "finite" && parsedHint.monthlyGb) {
+            if (parsedHint.monthlyGb !== 100) {
+              res.status(400).json({
+                success: false,
+                code: "INVALID_QUOTA_METADATA",
+                error: `Unsupported renewal data quota (${parsedHint.monthlyGb}GB). Only standard SIM 100GB or Unlimited packages are supported.`
+              });
+              return;
+            }
+            submittedFiniteGb = parsedHint.monthlyGb;
+          } else if (parsedHint.kind === "unlimited") {
+            submittedUnlimited = true;
+          }
+        }
+        if (submittedFiniteGb !== null && submittedUnlimited) {
+          res.status(400).json({
+            success: false,
+            code: "CONFLICTING_QUOTA_METADATA",
+            error: "Conflicting renewal quota metadata submitted (both 100GB and Unlimited specified)."
+          });
+          return;
+        }
+        let verifiedTargetVpnConfig = null;
+        if (verifiedTargetVpnAccount?.uuid || requestedUuid) {
+          try {
+            const lookupUuid = String(verifiedTargetVpnAccount?.uuid || requestedUuid).trim();
+            const { data: cfgRow } = await dbClient.from("vpn_configs").select("id, uuid, package_name, data_limit, order_id").eq("uuid", lookupUuid).maybeSingle();
+            if (cfgRow) verifiedTargetVpnConfig = cfgRow;
+          } catch (_cfgErr) {
+          }
+        }
+        const existingAccLimitSig = parseExplicitRenewalQuotaSignal(verifiedTargetVpnAccount?.data_limit);
+        const existingCfgLimitSig = parseExplicitRenewalQuotaSignal(verifiedTargetVpnConfig?.data_limit);
+        const existingAccountIsFinite100Gb = Number(verifiedTargetVpnAccount?.total_bytes || 0) > 0 || existingAccLimitSig.kind === "finite" || existingCfgLimitSig.kind === "finite";
         const verified = await verifyRenewalCheckoutPrice({
           durationMonths: requestedDuration,
           offerId: data.offerId || data.offer_id || null,
@@ -5099,6 +5350,22 @@ var init_renewController = __esm({
           vpnAccountUuid: requestedUuid || null,
           vpnAccountId: requestedAccountId || null
         });
+        if (verified.category === "ROUTER" && submittedFiniteGb !== null) {
+          res.status(400).json({
+            success: false,
+            code: "CONFLICTING_PACKAGE_CATEGORY_METADATA",
+            error: "Router packages do not support the SIM 100GB tier."
+          });
+          return;
+        }
+        if (verified.isSpecialOffer && verified.category !== "ROUTER" && verified.planId !== "sim_100" && existingAccountIsFinite100Gb) {
+          res.status(400).json({
+            success: false,
+            code: "CONFLICTING_SPECIAL_OFFER_QUOTA_METADATA",
+            error: "Invalid renewal quota metadata: an existing 100GB VPN account cannot claim Unlimited quota via a 100GB Special Offer renewal."
+          });
+          return;
+        }
         const submittedAmount = data.expectedAmount !== void 0 ? Number(data.expectedAmount) : data.amount !== void 0 ? Number(data.amount) : void 0;
         if (submittedAmount !== void 0 && Number.isFinite(submittedAmount) && Math.round(submittedAmount) !== verified.finalPrice) {
           res.status(400).json({
@@ -5110,9 +5377,21 @@ var init_renewController = __esm({
           return;
         }
         let renewalRecordId = data.renewalId || data.id || null;
-        const effectivePlanDisplay = verified.isSpecialOffer && verified.appliedOffer ? `${verified.packageName} (${verified.appliedOffer.name} - ${verified.durationLabel})` : data.planName || data.plan || `${verified.packageName} (${verified.planName})`;
+        const verifiedPlanId = verified.planId === "router_unlimited" ? "router_unlimited" : verified.planId === "sim_unlimited" ? "sim_unlimited" : "sim_100";
+        const verifiedPackageType = verifiedPlanId === "router_unlimited" ? "Router Unlimited" : verifiedPlanId === "sim_unlimited" ? "SIM Unlimited" : "SIM 100GB";
+        const verifiedQuotaMode = verifiedPlanId === "sim_100" ? "finite" : "unlimited";
+        const verifiedDataLimit = verifiedQuotaMode === "finite" ? "100GB" : "Unlimited";
+        const verifiedMonthlyQuotaGb = verifiedQuotaMode === "finite" ? 100 : null;
+        const effectivePlanDisplay = verified.isSpecialOffer && verified.appliedOffer ? `${verified.packageName} - ${verifiedPackageType} (${verified.appliedOffer.name} - ${verified.durationLabel})` : `${verified.packageName} (${verifiedPackageType})`;
         const extraMetadata = {
-          planId: data.planId || null,
+          planId: verifiedPlanId,
+          verified_plan_id: verifiedPlanId,
+          package_type: verifiedPackageType,
+          data_limit: verifiedDataLimit,
+          category: verified.category,
+          quota_mode: verifiedQuotaMode,
+          monthly_quota_gb: verifiedMonthlyQuotaGb,
+          quota_verified_by_server: true,
           plan_name: effectivePlanDisplay,
           package_id: verified.packageId,
           package_name: verified.packageName,
@@ -5153,16 +5432,27 @@ var init_renewController = __esm({
           }
           if (String(existingRow.status || "pending").toLowerCase() === "pending") {
             let mergedExtra = { ...extraMetadata };
-            if (existingRow.notes && String(existingRow.notes).startsWith("{")) {
-              try {
-                mergedExtra = { ...JSON.parse(existingRow.notes), ...extraMetadata };
-              } catch {
+            if (typeof existingRow.notes === "string" && existingRow.notes.length > 0) {
+              if (existingRow.notes.trim().startsWith("{")) {
+                try {
+                  const parsedExisting = JSON.parse(existingRow.notes);
+                  delete parsedExisting.plan_id;
+                  delete parsedExisting.packageType;
+                  delete parsedExisting.dataLimit;
+                  delete parsedExisting.tier_upgrade_verified;
+                  mergedExtra = { ...parsedExisting, ...extraMetadata };
+                } catch {
+                  mergedExtra = { legacy_notes: existingRow.notes, ...extraMetadata };
+                }
+              } else {
+                mergedExtra = { legacy_notes: existingRow.notes, ...extraMetadata };
               }
             }
             await dbClient.from("renew_requests").update({
+              plan_name: effectivePlanDisplay,
               amount: verified.finalPrice,
               notes: JSON.stringify(mergedExtra)
-            }).eq("id", existingRow.id);
+            }).eq("id", existingRow.id).eq("status", "pending");
           }
         } else {
           const insertPayload = {
@@ -5233,7 +5523,9 @@ var init_renewController = __esm({
                     `[RenewController] AUTO_ACTIVATE_RENEWALS_ENABLED=true: Receipt claimed (${slipCheck.sha256.slice(0, 12)}...). Provisioning provisional renewal for request ${renewalRecordId}...`
                   );
                   provisionalResult = await provisionProvisionalRenewal(String(renewalRecordId), {
-                    dbClient
+                    dbClient,
+                    signal: req.timeoutSignal,
+                    deadlineMs: requestDeadlineMs
                   });
                   if (provisionalResult?.success && provisionalResult?.autoRenewed === true && provisionalResult?.provisioningStatus === "provisional") {
                     autoRenewed = true;
@@ -5247,10 +5539,27 @@ var init_renewController = __esm({
               }
             } catch (autoErr) {
               autoRenewed = false;
-              autoRenewalBlockedReason = autoRenewalBlockedReason || "PROVISIONING_ERROR";
+              autoRenewalBlockedReason = autoRenewalBlockedReason || autoErr?.blockedReason || autoErr?.code || "PROVISIONING_ERROR";
               console.error(
                 `[RenewController] Provisional automatic renewal failed for request ${renewalRecordId} (preserved in pending queue for manual admin review):`,
                 autoErr?.message || autoErr
+              );
+            }
+          }
+          if (!autoRenewed && autoRenewalBlockedReason) {
+            const sanitizedReason = sanitizeAutoRenewalBlockedReason(autoRenewalBlockedReason) || "PROVISIONING_HELD_FOR_MANUAL_REVIEW";
+            autoRenewalBlockedReason = sanitizedReason;
+            try {
+              await persistAutoRenewalBlockedReasonCas({
+                dbClient,
+                renewRequestId: String(renewalRecordId),
+                blockedReason: sanitizedReason,
+                canonicalExtraMetadata: extraMetadata
+              });
+            } catch (persistReasonErr) {
+              console.warn(
+                `[RenewController] Failed to persist sanitized auto_renewal_blocked_reason for request ${renewalRecordId}:`,
+                persistReasonErr?.message || persistReasonErr
               );
             }
           }
@@ -5545,6 +5854,42 @@ var init_renewController = __esm({
             }
             const oldExpiryIso2 = oldExpiryMs && !isNaN(oldExpiryMs) ? new Date(oldExpiryMs).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
             const planName = data.plan_name || data.planName || data.plan || parsedNotes?.plan_name || parsedNotes?.planName || "";
+            let targetVpnConfig = null;
+            let targetParentOrder = null;
+            try {
+              const { data: cfgRow } = await dbClient.from("vpn_configs").select("*").eq("uuid", targetUuid).maybeSingle();
+              if (cfgRow) targetVpnConfig = cfgRow;
+            } catch {
+            }
+            try {
+              if (targetVpnAcc?.order_id) {
+                const { data: ordRow } = await dbClient.from("orders").select("*").eq("id", targetVpnAcc.order_id).maybeSingle();
+                if (ordRow) targetParentOrder = ordRow;
+              }
+              if (!targetParentOrder) {
+                const { data: ordRowByUuid } = await dbClient.from("orders").select("*").eq("client_uuid", targetUuid).order("created_at", { ascending: false }).limit(1).maybeSingle();
+                if (ordRowByUuid) targetParentOrder = ordRowByUuid;
+              }
+            } catch {
+            }
+            const resolvedManualQuota = resolveAuthoritativeRenewalQuota({
+              renewRequest: data,
+              extraNotes: parsedNotes,
+              durationMonths,
+              vpnAccount: targetVpnAcc,
+              vpnConfig: targetVpnConfig,
+              parentOrder: targetParentOrder
+            });
+            if (!resolvedManualQuota.resolved || !resolvedManualQuota.quotaMode) {
+              const quotaErr = new Error(
+                resolvedManualQuota.reason || "Renewal quota tier (100GB vs Unlimited) could not be conclusively verified. Held for manual reconciliation without modifying 3X-UI."
+              );
+              quotaErr.statusCode = 409;
+              quotaErr.code = resolvedManualQuota.blockedReason || "UNVERIFIED_RENEWAL_QUOTA_METADATA";
+              quotaErr.beforeExternalWrite = true;
+              quotaErr.xuiUncertain = false;
+              throw quotaErr;
+            }
             const verifyRenewalAndClientLocksBeforeExternalMutation = async () => {
               await assertClientLockStillHeld();
               await assertRenewLockStillHeld("before_external_write");
@@ -5574,7 +5919,12 @@ var init_renewController = __esm({
               allowUncertainRecovery: false,
               beforeExternalMutation: verifyRenewalAndClientLocksBeforeExternalMutation,
               afterExternalMutationCheck: verifyRenewalAndClientLocksAfterExternalMutation,
-              signal: options?.signal
+              signal: options?.signal,
+              verifiedQuota: {
+                quotaMode: resolvedManualQuota.quotaMode,
+                addedQuotaBytes: resolvedManualQuota.addedQuotaBytes ?? 0,
+                canonicalPlanId: resolvedManualQuota.canonicalPlanId
+              }
             });
             if (!verifiedEnable || !new_expiryMs2 || new_expiryMs2 <= Date.now()) {
               throw new Error(
@@ -5629,6 +5979,7 @@ var init_renewController = __esm({
           const accUpdatePayload = {
             expiry_date: new_expiryIso,
             expiry_time: new_expiryMs,
+            total_bytes: newTotalBytes,
             data_limit: dataLimitStr,
             status: "active",
             updated_at: nowIso
@@ -6798,7 +7149,7 @@ async function finalizeTelegramDispatch(params) {
   } catch {
   }
 }
-var formatDateTime, renewTelegramMessageCache, sendRenewNotification, sendRenewApprovedNotification, sendNewSupportTicketNotification, orderTelegramMessageCache, inFlightTelegramOrderActions, isMissingNotificationRpcError, formatColomboTimestamp, resolvePaymentSlipSummaryForTelegram, sendNewOrderNotification, sendOrderApprovedNotification, sendTrialRequestNotification, sendOrderRejectedNotification, escapeTelegramHtml, redactTelegramSecrets, sendLiveChatNotification, logTelegramAdminAction, answerTelegramCallbackQuery, removeTelegramMessageInlineKeyboard, buildUpdatedOrderTelegramText, editTelegramOrderMessage, syncOrderTelegramInlineMessage, buildUpdatedRenewTelegramText, editTelegramRenewMessage, syncRenewTelegramInlineMessage, verifyTelegramAdminAuthorization, fetchOrderFromSupabaseForTelegram, handleTelegramCallbackQuery, handleTelegramUpdate, telegramPollingInitialized, lastTelegramUpdateOffset, startTelegramBotPolling;
+var formatDateTime, renewTelegramMessageCache, sendRenewNotification, sendRenewApprovedNotification, sendNewSupportTicketNotification, orderTelegramMessageCache, inFlightTelegramOrderActions, isMissingNotificationRpcError, formatColomboTimestamp, resolvePaymentSlipSummaryForTelegram, sendNewOrderNotification, sendOrderApprovedNotification, sendTrialRequestNotification, sendOrderRejectedNotification, escapeTelegramHtml, redactTelegramSecrets, sendLiveChatNotification, logTelegramAdminAction, sanitizeTelegramErrorMessage, answerTelegramCallbackQuery, sendTelegramFollowUpMessage, removeTelegramMessageInlineKeyboard, buildUpdatedOrderTelegramText, editTelegramOrderMessage, syncOrderTelegramInlineMessage, buildUpdatedRenewTelegramText, editTelegramRenewMessage, syncRenewTelegramInlineMessage, verifyTelegramAdminAuthorization, fetchOrderFromSupabaseForTelegram, handleTelegramCallbackQuery, handleTelegramUpdate, telegramPollingInitialized, lastTelegramUpdateOffset, startTelegramBotPolling;
 var init_telegramService = __esm({
   "src/api/services/telegramService.ts"() {
     "use strict";
@@ -7602,12 +7953,47 @@ ${reason}`;
         `[TelegramAdminAudit] timestamp="${entry.timestamp}" adminId="${entry.adminId}" adminUsername="${entry.adminUsername || "N/A"}" orderId="${entry.orderId}" action="${entry.action}" outcome="${entry.outcome}"`
       );
     };
-    answerTelegramCallbackQuery = async (callbackQueryId, text, showAlert = false) => {
+    sanitizeTelegramErrorMessage = (err) => {
+      const code = String(err?.code || err?.blockedReason || "").trim().toUpperCase();
+      const mappedMessages = {
+        RECONCILIATION_REQUIRED: "Uncertain prior state detected. Verify live 3X-UI and database state before reconciling.",
+        CLIENT_LOCK_UNCERTAIN: "VPN client has an uncertain prior operation lock. Verify 3X-UI state before reconciling.",
+        INBOUND_LOCK_UNCERTAIN: "Inbound write lock is in an uncertain state. Verify 3X-UI state before reconciling.",
+        OPERATION_IN_PROGRESS: "Another operation is currently in progress for this request. Please wait and retry.",
+        CLIENT_LOCK_BUSY: "Another operation is currently modifying this VPN client. Please wait and retry.",
+        UNVERIFIED_RENEWAL_QUOTA_METADATA: "Renewal quota tier (100GB vs Unlimited) could not be verified. Held for manual reconciliation without changing 3X-UI.",
+        CONFLICTING_QUOTA_METADATA: "Conflicting renewal quota metadata detected. Held for manual reconciliation without changing 3X-UI.",
+        CONFLICTING_SPECIAL_OFFER_QUOTA_METADATA: "Special Offer quota metadata conflicts with existing 100GB account. Held for manual reconciliation without changing 3X-UI.",
+        CONFLICTING_PACKAGE_CATEGORY_METADATA: "Package category conflicts with renewal quota metadata. Held for manual reconciliation without changing 3X-UI.",
+        AMBIGUOUS_QUOTA_METADATA: "Ambiguous renewal quota metadata detected. Held for manual reconciliation without changing 3X-UI.",
+        LOCK_PERMISSION_ERROR: "Database lock permission error prevented safe execution. Check Supabase RPC grants.",
+        LOCK_SERVICE_UNAVAILABLE: "Lock service temporarily unavailable. No 3X-UI changes were made; please retry shortly.",
+        REQUEST_TIMEOUT_BEFORE_MUTATION: "Request timed out before contacting 3X-UI. No panel changes were made; safe to retry."
+      };
+      if (code && mappedMessages[code]) {
+        return mappedMessages[code];
+      }
+      const raw = String(err?.message || "Unexpected processing error");
+      if (/<!doctype|<html|select\s+.+\s+from|insert\s+into|update\s+.+\s+set|postgres|supabase|syntax error at or near|violates check constraint|econnrefused|enotfound/i.test(
+        raw
+      )) {
+        return "Backend or upstream service error occurred. Check server logs and admin panel before retrying.";
+      }
+      const redacted = raw.replace(/bot[0-9]+:[A-Za-z0-9_-]+/gi, "bot[REDACTED]").replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]").replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, "[REDACTED_TOKEN]").replace(/\b(?:sb_secret|sb_publishable|sbp|sk|pk|xui|ghp|AIza)[A-Za-z0-9_-]{6,}\b/gi, "[REDACTED_KEY]").replace(/\b(?:postgres(?:ql)?|mysql|redis|https?):\/\/[^\s'"<>]+/gi, "[REDACTED_URL]").replace(
+        /\b(?:password|passwd|secret|token|api[_-]?key|service[_-]?role[_-]?key|cookie|session|authorization)\s*[:=]\s*[^\s,;]+/gi,
+        "[REDACTED_CREDENTIAL]"
+      ).replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]").replace(/\r?\n.*$/s, "").replace(/\s+/g, " ").trim();
+      if (!redacted) {
+        return "Unexpected processing error. Check admin panel and server logs.";
+      }
+      return redacted.slice(0, 180);
+    };
+    answerTelegramCallbackQuery = async (callbackQueryId, text, showAlert = false, fetchFn = fetch) => {
       const botToken = process.env.TELEGRAM_BOT_TOKEN;
       if (!botToken || !callbackQueryId) return;
       try {
         const url = `https://api.telegram.org/bot${botToken}/answerCallbackQuery`;
-        await fetch(url, {
+        await fetchFn(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: AbortSignal.timeout(6e3),
@@ -7618,7 +8004,31 @@ ${reason}`;
           })
         });
       } catch (err) {
-        console.warn("[TelegramService] Failed to answerCallbackQuery:", err?.message || err);
+        console.warn("[TelegramService] Failed to answerCallbackQuery:", sanitizeTelegramErrorMessage(err));
+      }
+    };
+    sendTelegramFollowUpMessage = async (chatId, text, replyToMessageId, fetchFn = fetch) => {
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      if (!botToken || !chatId || !text) return;
+      try {
+        const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+        const bodyPayload = {
+          chat_id: chatId,
+          text: String(text).slice(0, 1e3),
+          disable_web_page_preview: true
+        };
+        if (replyToMessageId && Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+          bodyPayload.reply_to_message_id = replyToMessageId;
+          bodyPayload.allow_sending_without_reply = true;
+        }
+        await fetchFn(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(6e3),
+          body: JSON.stringify(bodyPayload)
+        });
+      } catch (err) {
+        console.warn("[TelegramService] Failed to send follow-up error message:", sanitizeTelegramErrorMessage(err));
       }
     };
     removeTelegramMessageInlineKeyboard = async (chatId, messageId) => {
@@ -7981,8 +8391,15 @@ ${statusSection}`;
       const { data: byOrderId } = await supabaseAdmin.from("orders").select("*").eq("order_id", cleanId).maybeSingle();
       return byOrderId || null;
     };
-    handleTelegramCallbackQuery = async (callbackQuery) => {
+    handleTelegramCallbackQuery = async (callbackQuery, deps) => {
       if (!callbackQuery || !callbackQuery.id) return;
+      const dbClient = deps?.dbClient || supabaseAdmin;
+      const fetchFn = deps?.fetchFn || fetch;
+      const verifyAdminFn = deps?.verifyAdminFn || verifyTelegramAdminAuthorization;
+      const answerCallback = deps?.answerCallbackFn || ((qid, text, showAlert = false) => answerTelegramCallbackQuery(qid, text, showAlert, fetchFn));
+      const sendFollowUp = deps?.sendFollowUpFn || ((chatId, text, replyToMessageId) => sendTelegramFollowUpMessage(chatId, text, replyToMessageId, fetchFn));
+      const editRenewMsg = deps?.editRenewMessageFn || editTelegramRenewMessage;
+      const editOrderMsg = deps?.editOrderMessageFn || editTelegramOrderMessage;
       const callbackQueryId = String(callbackQuery.id);
       const fromUser = callbackQuery.from || {};
       const fromUserId = fromUser.id;
@@ -8005,14 +8422,14 @@ ${statusSection}`;
           outcome: "IGNORED_MALFORMED_CALLBACK_DATA",
           timestamp
         });
-        await answerTelegramCallbackQuery(callbackQueryId, "\u26A0\uFE0F Unsupported or invalid button action.", true);
+        await answerCallback(callbackQueryId, "\u26A0\uFE0F Unsupported or invalid button action.", true);
         return;
       }
       const rawVerb = match[1];
       const isRenewCallback = rawVerb === "approve_renew" || rawVerb === "reject_renew";
       const actionVerb = isRenewCallback ? rawVerb === "approve_renew" ? "APPROVE_RENEW" : "REJECT_RENEW" : rawVerb.startsWith("approve") ? "APPROVE_ORDER" : "REJECT_ORDER";
       const targetOrderId = match[2].trim();
-      const authCheck = await verifyTelegramAdminAuthorization(fromUserId, messageChatId);
+      const authCheck = await verifyAdminFn(fromUserId, messageChatId);
       if (!authCheck.authorized) {
         logTelegramAdminAction({
           adminId: fromUserId || "unknown",
@@ -8022,7 +8439,7 @@ ${statusSection}`;
           outcome: `DENIED: ${authCheck.reason || "Unauthorized user"}`,
           timestamp
         });
-        await answerTelegramCallbackQuery(
+        await answerCallback(
           callbackQueryId,
           "\u26D4 Unauthorized: Only authorized FIREVPNs administrators can approve or reject orders and renewals.",
           true
@@ -8030,7 +8447,7 @@ ${statusSection}`;
         return;
       }
       if (inFlightTelegramOrderActions.has(targetOrderId)) {
-        await answerTelegramCallbackQuery(
+        await answerCallback(
           callbackQueryId,
           "\u23F3 This request is currently being processed. Please wait...",
           false
@@ -8040,9 +8457,10 @@ ${statusSection}`;
       inFlightTelegramOrderActions.add(targetOrderId);
       let lockedDbId = "";
       let lockedCanonicalOrderId = "";
+      let callbackQueryAnswered = false;
       try {
         if (isRenewCallback) {
-          const { data: renewRow } = await supabaseAdmin.from("renew_requests").select("*").eq("id", targetOrderId).maybeSingle();
+          const { data: renewRow } = await dbClient.from("renew_requests").select("*").eq("id", targetOrderId).maybeSingle();
           if (!renewRow) {
             logTelegramAdminAction({
               adminId: fromUserId,
@@ -8119,17 +8537,18 @@ ${statusSection}`;
           }
           const adminDisplayLabel2 = `${fromUsername} (ID: ${fromUserId})`;
           if (actionVerb === "APPROVE_RENEW") {
-            await answerTelegramCallbackQuery(
+            await answerCallback(
               callbackQueryId,
               `\u23F3 Approving renewal #${lockedCanonicalOrderId}...`,
               false
             );
-            const { executeRenewalApproval: executeRenewalApproval2 } = await Promise.resolve().then(() => (init_renewController(), renewController_exports));
-            const result = await executeRenewalApproval2(renewRow.id, {
+            callbackQueryAnswered = true;
+            const executeRenewalApprovalFn = deps?.executeRenewalApprovalFn || (await Promise.resolve().then(() => (init_renewController(), renewController_exports))).executeRenewalApproval;
+            const result = await executeRenewalApprovalFn(renewRow.id, {
               adminLabel: `Telegram Admin ${adminDisplayLabel2}`
             });
             if (messageChatId && messageId) {
-              await editTelegramRenewMessage({
+              await editRenewMsg({
                 chatId: messageChatId,
                 messageId,
                 originalText: originalMessageText,
@@ -8149,17 +8568,18 @@ ${statusSection}`;
               timestamp
             });
           } else {
-            await answerTelegramCallbackQuery(
+            await answerCallback(
               callbackQueryId,
               `\u23F3 Rejecting renewal #${lockedCanonicalOrderId}...`,
               false
             );
-            const { executeRenewalRejection: executeRenewalRejection2 } = await Promise.resolve().then(() => (init_renewController(), renewController_exports));
-            await executeRenewalRejection2(renewRow.id, "Rejected by Admin via Telegram", {
+            callbackQueryAnswered = true;
+            const executeRenewalRejectionFn = deps?.executeRenewalRejectionFn || (await Promise.resolve().then(() => (init_renewController(), renewController_exports))).executeRenewalRejection;
+            await executeRenewalRejectionFn(renewRow.id, "Rejected by Admin via Telegram", {
               adminLabel: `Telegram Admin ${adminDisplayLabel2}`
             });
             if (messageChatId && messageId) {
-              await editTelegramRenewMessage({
+              await editRenewMsg({
                 chatId: messageChatId,
                 messageId,
                 originalText: originalMessageText,
@@ -8278,13 +8698,14 @@ ${statusSection}`;
         }
         const adminDisplayLabel = `${fromUsername} (ID: ${fromUserId})`;
         if (actionVerb === "APPROVE_ORDER") {
-          await answerTelegramCallbackQuery(
+          await answerCallback(
             callbackQueryId,
             `\u23F3 Approving order #${lockedCanonicalOrderId} & provisioning VPN...`,
             false
           );
-          const { executeOrderApproval: executeOrderApproval2 } = await Promise.resolve().then(() => (init_adminController(), adminController_exports));
-          const result = await executeOrderApproval2(order.id, void 0, {
+          callbackQueryAnswered = true;
+          const executeOrderApprovalFn = deps?.executeOrderApprovalFn || (await Promise.resolve().then(() => (init_adminController(), adminController_exports))).executeOrderApproval;
+          const result = await executeOrderApprovalFn(order.id, void 0, {
             adminLabel: `Telegram Admin ${adminDisplayLabel}`
           });
           if (result?.deduplicated) {
@@ -8299,7 +8720,7 @@ ${statusSection}`;
             return;
           }
           if (messageChatId && messageId) {
-            await editTelegramOrderMessage({
+            await editOrderMsg({
               chatId: messageChatId,
               messageId,
               originalText: originalMessageText,
@@ -8318,17 +8739,18 @@ ${statusSection}`;
             timestamp
           });
         } else {
-          const { executeOrderRejection: executeOrderRejection2 } = await Promise.resolve().then(() => (init_adminController(), adminController_exports));
-          await executeOrderRejection2(order.id, "Rejected by Admin via Telegram", {
+          const executeOrderRejectionFn = deps?.executeOrderRejectionFn || (await Promise.resolve().then(() => (init_adminController(), adminController_exports))).executeOrderRejection;
+          await executeOrderRejectionFn(order.id, "Rejected by Admin via Telegram", {
             adminLabel: `Telegram Admin ${adminDisplayLabel}`
           });
-          await answerTelegramCallbackQuery(
+          await answerCallback(
             callbackQueryId,
             `\u274C Order #${lockedCanonicalOrderId} has been REJECTED.`,
             false
           );
+          callbackQueryAnswered = true;
           if (messageChatId && messageId) {
-            await editTelegramOrderMessage({
+            await editOrderMsg({
               chatId: messageChatId,
               messageId,
               originalText: originalMessageText,
@@ -8348,7 +8770,7 @@ ${statusSection}`;
           });
         }
       } catch (err) {
-        const safeErrorMessage = String(err?.message || "Unexpected processing error").replace(/bot[0-9]+:[A-Za-z0-9_-]+/g, "bot[REDACTED]").slice(0, 160);
+        const safeErrorMessage = sanitizeTelegramErrorMessage(err);
         logTelegramAdminAction({
           adminId: fromUserId || "unknown",
           adminUsername: fromUsername,
@@ -8357,11 +8779,22 @@ ${statusSection}`;
           outcome: `ERROR: ${safeErrorMessage}`,
           timestamp
         });
-        await answerTelegramCallbackQuery(
-          callbackQueryId,
-          `\u26A0\uFE0F Action failed: ${safeErrorMessage}`,
-          true
-        );
+        if (!callbackQueryAnswered) {
+          await answerCallback(
+            callbackQueryId,
+            `\u26A0\uFE0F Action failed: ${safeErrorMessage}`,
+            true
+          );
+        } else if (messageChatId) {
+          const actionTitle = actionVerb === "APPROVE_RENEW" ? "Renewal Approval" : actionVerb === "REJECT_RENEW" ? "Renewal Rejection" : actionVerb === "APPROVE_ORDER" ? "Order Approval" : "Order Rejection";
+          const targetRef = lockedCanonicalOrderId || targetOrderId;
+          await sendFollowUp(
+            messageChatId,
+            `\u26A0\uFE0F ${actionTitle} Failed (#${targetRef})
+Reason: ${safeErrorMessage}`,
+            messageId > 0 ? messageId : void 0
+          );
+        }
       } finally {
         inFlightTelegramOrderActions.delete(targetOrderId);
         if (lockedDbId) inFlightTelegramOrderActions.delete(lockedDbId);
@@ -8492,6 +8925,385 @@ function isDefinitiveNonAppliedMutationError(err) {
     return false;
   }
   return false;
+}
+function sanitizeAutoRenewalBlockedReason(reason) {
+  if (reason === void 0 || reason === null) return null;
+  const raw = String(reason).trim();
+  if (!raw) return null;
+  if (/^[A-Za-z0-9_:-]{1,80}$/.test(raw)) {
+    return raw;
+  }
+  let sanitized = raw.replace(/bot[0-9]+:[A-Za-z0-9_-]+/gi, "bot[REDACTED]").replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]").replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g, "[REDACTED_JWT]").replace(/\b(?:sb_secret|sb_publishable|sbp|sk|pk)_[A-Za-z0-9_-]{8,}\b/gi, "[REDACTED_KEY]").replace(/\b(?:postgres(?:ql)?|mysql|redis|https?):\/\/[^\s'"<>]+/gi, "[REDACTED_URL]").replace(/\b(?:password|passwd|secret|token|api[_-]?key|service[_-]?role[_-]?key)\s*[:=]\s*[^\s,;]+/gi, "[REDACTED_SECRET]").replace(/\r?\n.*$/s, "").replace(/\s+/g, " ").trim();
+  if (!sanitized) return "PROVISIONING_HELD_FOR_MANUAL_REVIEW";
+  return sanitized.slice(0, 120);
+}
+function parseExplicitRenewalQuotaSignal(rawValue) {
+  if (rawValue === void 0 || rawValue === null) {
+    return { kind: "none" };
+  }
+  const normalized = String(rawValue).trim().toLowerCase();
+  if (!normalized) {
+    return { kind: "none" };
+  }
+  const hasUnlimited = normalized === "sim_unlimited" || normalized === "router_unlimited" || /\b(?:unlimited|unlimit|sim_unlimited|router_unlimited)\b/i.test(normalized);
+  const hasSim100 = normalized === "sim_100" || /\bsim[\s_-]?100\b/i.test(normalized);
+  const gbMatches = Array.from(normalized.matchAll(/\b(\d{1,5})\s*gb\b/gi)).map((m) => parseInt(m[1], 10)).filter((n) => Number.isFinite(n) && n > 0 && n <= 1e4);
+  const distinctGbValues = new Set(gbMatches);
+  if (hasSim100) {
+    distinctGbValues.add(100);
+  }
+  const hasFinite = distinctGbValues.size > 0;
+  if (hasUnlimited && hasFinite) {
+    return { kind: "ambiguous" };
+  }
+  if (distinctGbValues.size > 1) {
+    return { kind: "ambiguous" };
+  }
+  if (hasFinite) {
+    const monthlyGb = Array.from(distinctGbValues)[0];
+    return { kind: "finite", monthlyGb };
+  }
+  if (hasUnlimited) {
+    return { kind: "unlimited" };
+  }
+  return { kind: "none" };
+}
+function normalizeCanonicalRenewalPlanId(raw) {
+  const val = String(raw || "").trim().toLowerCase();
+  if (val === "sim_100" || val === "sim_unlimited" || val === "router_unlimited") {
+    return val;
+  }
+  return null;
+}
+function parseVerifiedLiveTotalBytes(rawValue) {
+  if (typeof rawValue === "number") {
+    if (!Number.isFinite(rawValue) || !Number.isSafeInteger(rawValue) || rawValue < 0 || Object.is(rawValue, -0)) {
+      return { valid: false, totalBytes: -1 };
+    }
+    return { valid: true, totalBytes: rawValue === 0 ? 0 : rawValue };
+  }
+  if (typeof rawValue === "string") {
+    const trimmed = rawValue.trim();
+    if (!/^(?:0|[1-9]\d*)$/.test(trimmed)) {
+      return { valid: false, totalBytes: -1 };
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || !Number.isSafeInteger(parsed) || parsed < 0 || String(parsed) !== trimmed) {
+      return { valid: false, totalBytes: -1 };
+    }
+    return { valid: true, totalBytes: parsed };
+  }
+  return { valid: false, totalBytes: -1 };
+}
+function resolveAuthoritativeRenewalQuota(params) {
+  const extra = params.extraNotes && typeof params.extraNotes === "object" ? params.extraNotes : {};
+  const renewReq = params.renewRequest || {};
+  const safeMonths = Math.max(1, Math.round(Number(params.durationMonths) || 1));
+  const BYTES_PER_GB = 1024 * 1024 * 1024;
+  const isTierOnlyLabel = (raw) => {
+    const lower = raw.trim().toLowerCase();
+    return lower === "sim 100gb" || lower === "sim_100" || lower === "sim unlimited" || lower === "sim_unlimited" || lower === "router unlimited" || lower === "router_unlimited";
+  };
+  const accountPkgCandidates = [
+    params.vpnConfig?.package_name,
+    params.parentOrder?.package_name,
+    params.vpnAccount?.package_name,
+    params.vpnAccount?.remark
+  ].map((v) => String(v || "").trim()).filter((v) => v.length > 0 && !isTierOnlyLabel(v));
+  let accountCanonicalPkg;
+  for (const cand of accountPkgCandidates) {
+    const found = findCanonicalPackage(cand);
+    if (found) {
+      accountCanonicalPkg = found;
+      break;
+    }
+  }
+  const requestPkgCandidates = [
+    extra.package_id,
+    extra.packageId,
+    extra.package_name,
+    extra.packageName,
+    renewReq.plan_name
+  ].map((v) => String(v || "").trim()).filter((v) => v.length > 0 && !isTierOnlyLabel(v));
+  let requestCanonicalPkg;
+  for (const cand of requestPkgCandidates) {
+    const found = findCanonicalPackage(cand);
+    if (found) {
+      requestCanonicalPkg = found;
+      break;
+    }
+  }
+  if (accountCanonicalPkg && requestCanonicalPkg && accountCanonicalPkg.category !== requestCanonicalPkg.category) {
+    return {
+      resolved: false,
+      blockedReason: "CONFLICTING_PACKAGE_CATEGORY_METADATA",
+      reason: `Renewal package category ('${requestCanonicalPkg.category}') conflicts with existing VPN account package category ('${accountCanonicalPkg.category}'). Held for manual reconciliation.`
+    };
+  }
+  const canonicalPkg = accountCanonicalPkg || requestCanonicalPkg;
+  const explicitCategoryRaw = String(extra.category || "").trim().toUpperCase();
+  if ((explicitCategoryRaw === "SIM" || explicitCategoryRaw === "ROUTER") && canonicalPkg?.category && explicitCategoryRaw !== canonicalPkg.category) {
+    return {
+      resolved: false,
+      blockedReason: "CONFLICTING_PACKAGE_CATEGORY_METADATA",
+      reason: `Explicit metadata category ('${explicitCategoryRaw}') conflicts with authoritative package catalog category ('${canonicalPkg.category}'). Held for manual reconciliation.`
+    };
+  }
+  const canonicalCategory = canonicalPkg?.category === "ROUTER" || canonicalPkg?.category === "SIM" ? canonicalPkg.category : explicitCategoryRaw === "ROUTER" || explicitCategoryRaw === "SIM" ? explicitCategoryRaw : null;
+  let liveTotalBytes = null;
+  if (params.liveClientTotalBytes !== void 0 && params.liveClientTotalBytes !== null) {
+    const parsedLiveTotal = parseVerifiedLiveTotalBytes(params.liveClientTotalBytes);
+    if (!parsedLiveTotal.valid) {
+      return {
+        resolved: false,
+        blockedReason: "INVALID_LIVE_CLIENT_QUOTA",
+        reason: `Live 3X-UI client quota (${String(params.liveClientTotalBytes)}) is invalid; refusing to interpret invalid quota as Unlimited.`
+      };
+    }
+    liveTotalBytes = parsedLiveTotal.totalBytes;
+  }
+  const parsedDbAccTotal = params.vpnAccount?.total_bytes !== void 0 && params.vpnAccount?.total_bytes !== null ? parseVerifiedLiveTotalBytes(params.vpnAccount.total_bytes) : { valid: false, totalBytes: -1 };
+  const dbAccTotalBytes = parsedDbAccTotal.valid ? parsedDbAccTotal.totalBytes : 0;
+  const accLimitSig = parseExplicitRenewalQuotaSignal(params.vpnAccount?.data_limit);
+  const cfgLimitSig = parseExplicitRenewalQuotaSignal(params.vpnConfig?.data_limit);
+  const ordLimitSig = parseExplicitRenewalQuotaSignal(
+    params.parentOrder?.data_limit ?? params.parentOrder?.package_name
+  );
+  const existingAccountIsConclusivelyFinite = liveTotalBytes !== null && liveTotalBytes > 0 || dbAccTotalBytes > 0 || accLimitSig.kind === "finite" || cfgLimitSig.kind === "finite" || ordLimitSig.kind === "finite";
+  const existingAccountIsConclusivelyUnlimited = !existingAccountIsConclusivelyFinite && (accLimitSig.kind === "unlimited" || cfgLimitSig.kind === "unlimited" || ordLimitSig.kind === "unlimited" || canonicalCategory === "ROUTER");
+  const isSpecialOffer = Boolean(extra.is_special_offer || extra.offer_id || extra.offer_name);
+  const isServerVerified = extra.quota_verified_by_server === true;
+  const buildResolvedResult = (quotaMode, monthlyQuotaGb, planId, source) => {
+    if (canonicalCategory === "ROUTER" && (quotaMode === "finite" || planId === "sim_100")) {
+      return {
+        resolved: false,
+        blockedReason: "CONFLICTING_PACKAGE_CATEGORY_METADATA",
+        reason: "Router package cannot be renewed with a finite SIM 100GB quota. Held for manual reconciliation."
+      };
+    }
+    if (canonicalCategory === "SIM" && planId === "router_unlimited") {
+      return {
+        resolved: false,
+        blockedReason: "CONFLICTING_PACKAGE_CATEGORY_METADATA",
+        reason: "SIM package cannot use router_unlimited metadata. Held for manual reconciliation."
+      };
+    }
+    const finalPlanId = quotaMode === "finite" ? "sim_100" : canonicalCategory === "ROUTER" || planId === "router_unlimited" ? "router_unlimited" : "sim_unlimited";
+    if (quotaMode === "finite" && existingAccountIsConclusivelyUnlimited) {
+      return {
+        resolved: false,
+        blockedReason: "CONFLICTING_TIER_DOWNGRADE_METADATA",
+        reason: "Renewal metadata claimed finite 100GB quota for an existing Unlimited VPN account. Tier downgrades are not supported; held for manual reconciliation."
+      };
+    }
+    if (quotaMode === "unlimited" && finalPlanId !== "router_unlimited" && existingAccountIsConclusivelyFinite) {
+      if (isSpecialOffer && !(isServerVerified && extra.tier_upgrade_verified === true)) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_SPECIAL_OFFER_QUOTA_METADATA",
+          reason: "Special Offer renewal claimed Unlimited quota for an existing finite 100GB VPN account. Held for manual reconciliation without modifying 3X-UI."
+        };
+      }
+      if (!isServerVerified || extra.tier_upgrade_verified !== true) {
+        return {
+          resolved: false,
+          blockedReason: "UNVERIFIED_LEGACY_TIER_UPGRADE",
+          reason: "Renewal claimed Unlimited quota for an existing finite 100GB VPN account without server-verified tier upgrade confirmation. Held for manual reconciliation without modifying 3X-UI."
+        };
+      }
+    }
+    const packageType = finalPlanId === "router_unlimited" ? "Router Unlimited" : finalPlanId === "sim_unlimited" ? "SIM Unlimited" : "SIM 100GB";
+    const effectiveMonthlyGb = quotaMode === "finite" ? Math.max(1, monthlyQuotaGb || 100) : null;
+    const addedQuotaBytes = quotaMode === "finite" && effectiveMonthlyGb ? effectiveMonthlyGb * BYTES_PER_GB * safeMonths : 0;
+    return {
+      resolved: true,
+      quotaMode,
+      canonicalPlanId: finalPlanId,
+      packageType,
+      dataLimitLabel: quotaMode === "finite" && effectiveMonthlyGb ? `${effectiveMonthlyGb}GB` : "Unlimited",
+      monthlyQuotaGb: effectiveMonthlyGb,
+      addedQuotaBytes,
+      source
+    };
+  };
+  const normalizeCanonicalFiniteMonthlyGb = (rawGb) => {
+    if (rawGb === 100) return 100;
+    if (safeMonths > 1 && rawGb === 100 * safeMonths) return 100;
+    return null;
+  };
+  if (isServerVerified) {
+    const verifiedPlanId = normalizeCanonicalRenewalPlanId(extra.verified_plan_id);
+    if (!verifiedPlanId) {
+      return {
+        resolved: false,
+        blockedReason: "UNVERIFIED_RENEWAL_QUOTA_METADATA",
+        reason: "Renewal metadata marked server-verified is missing a canonical verified_plan_id. Held for manual reconciliation."
+      };
+    }
+    const expectedMode = verifiedPlanId === "sim_100" ? "finite" : "unlimited";
+    const expectedMonthlyGb = expectedMode === "finite" ? 100 : null;
+    const rawQuotaMode = extra.quota_mode !== void 0 && extra.quota_mode !== null ? String(extra.quota_mode).trim().toLowerCase() : "";
+    if (rawQuotaMode && rawQuotaMode !== expectedMode) {
+      return {
+        resolved: false,
+        blockedReason: "CONFLICTING_QUOTA_METADATA",
+        reason: `Conflicting renewal quota_mode ('${rawQuotaMode}') vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+      };
+    }
+    if (extra.monthly_quota_gb !== void 0 && extra.monthly_quota_gb !== null && extra.monthly_quota_gb !== "") {
+      const numGb = Number(extra.monthly_quota_gb);
+      if (expectedMode === "unlimited" && Number.isFinite(numGb) && numGb > 0) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting monthly_quota_gb (${numGb}) for unlimited verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+        };
+      }
+      if (expectedMode === "finite" && (!Number.isFinite(numGb) || numGb !== 100)) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting monthly_quota_gb (${String(extra.monthly_quota_gb)}) for finite verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+        };
+      }
+    }
+    const coLocatedFields = [
+      { name: "planId", val: extra.planId ?? extra.plan_id },
+      { name: "package_type", val: extra.package_type ?? extra.packageType },
+      { name: "data_limit", val: extra.data_limit ?? extra.dataLimit },
+      { name: "plan_name", val: renewReq.plan_name ?? extra.plan_name ?? extra.planName }
+    ];
+    for (const field of coLocatedFields) {
+      const sig = parseExplicitRenewalQuotaSignal(field.val);
+      if (sig.kind === "ambiguous") {
+        return {
+          resolved: false,
+          blockedReason: "AMBIGUOUS_QUOTA_METADATA",
+          reason: `Ambiguous quota metadata in ${field.name}. Held for manual reconciliation.`
+        };
+      }
+      if (sig.kind === "finite" && expectedMode !== "finite") {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting finite quota signal in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+        };
+      }
+      if (sig.kind === "unlimited" && expectedMode !== "unlimited") {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting unlimited quota signal in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+        };
+      }
+      if (sig.kind === "finite" && expectedMode === "finite" && sig.monthlyGb && sig.monthlyGb !== expectedMonthlyGb) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting monthly GB (${sig.monthlyGb}GB) in ${field.name} vs verified_plan_id ('${verifiedPlanId}'). Held for manual reconciliation.`
+        };
+      }
+    }
+    return buildResolvedResult(expectedMode, expectedMonthlyGb, verifiedPlanId, "server_verified_metadata");
+  }
+  const legacyFields = [
+    { name: "verified_plan_id", val: extra.verified_plan_id },
+    { name: "planId", val: extra.planId ?? extra.plan_id ?? renewReq.plan_id },
+    { name: "package_type", val: extra.package_type ?? extra.packageType },
+    { name: "data_limit", val: extra.data_limit ?? extra.dataLimit },
+    { name: "quota_mode", val: extra.quota_mode },
+    { name: "plan_name", val: renewReq.plan_name ?? extra.plan_name ?? extra.planName }
+  ];
+  let foundFiniteGb = null;
+  let foundUnlimited = false;
+  let explicitCanonicalPlanId = null;
+  for (const field of legacyFields) {
+    if (field.val === void 0 || field.val === null || String(field.val).trim() === "") continue;
+    const normalizedPlan = normalizeCanonicalRenewalPlanId(field.val);
+    if (normalizedPlan) {
+      if (explicitCanonicalPlanId && explicitCanonicalPlanId !== normalizedPlan) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting renewal plan IDs ('${explicitCanonicalPlanId}' vs '${normalizedPlan}'). Held for manual reconciliation.`
+        };
+      }
+      explicitCanonicalPlanId = normalizedPlan;
+    }
+    if (field.name === "quota_mode") {
+      const qm = String(field.val).trim().toLowerCase();
+      if (qm === "finite") {
+        if (foundFiniteGb === null) foundFiniteGb = 100;
+        continue;
+      }
+      if (qm === "unlimited") {
+        foundUnlimited = true;
+        continue;
+      }
+      return {
+        resolved: false,
+        blockedReason: "AMBIGUOUS_QUOTA_METADATA",
+        reason: `Unrecognized legacy quota_mode '${qm}'. Held for manual reconciliation.`
+      };
+    }
+    const sig = parseExplicitRenewalQuotaSignal(field.val);
+    if (sig.kind === "ambiguous") {
+      return {
+        resolved: false,
+        blockedReason: "AMBIGUOUS_QUOTA_METADATA",
+        reason: `Ambiguous renewal quota metadata in ${field.name}. Held for manual reconciliation.`
+      };
+    }
+    if (sig.kind === "finite" && sig.monthlyGb) {
+      const normalizedMonthly = normalizeCanonicalFiniteMonthlyGb(sig.monthlyGb);
+      if (normalizedMonthly === null) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Unrecognized non-canonical finite quota value (${sig.monthlyGb}GB for ${safeMonths} month(s)) in ${field.name}. Held for manual reconciliation.`
+        };
+      }
+      if (foundFiniteGb !== null && foundFiniteGb !== normalizedMonthly) {
+        return {
+          resolved: false,
+          blockedReason: "CONFLICTING_QUOTA_METADATA",
+          reason: `Conflicting finite quota values (${foundFiniteGb}GB vs ${normalizedMonthly}GB). Held for manual reconciliation.`
+        };
+      }
+      foundFiniteGb = normalizedMonthly;
+    } else if (sig.kind === "unlimited") {
+      foundUnlimited = true;
+    }
+  }
+  if (foundFiniteGb !== null && foundUnlimited) {
+    return {
+      resolved: false,
+      blockedReason: "CONFLICTING_QUOTA_METADATA",
+      reason: "Renewal metadata contains both finite and Unlimited quota indicators. Held for manual reconciliation."
+    };
+  }
+  if (foundFiniteGb !== null) {
+    if (explicitCanonicalPlanId && explicitCanonicalPlanId !== "sim_100") {
+      return {
+        resolved: false,
+        blockedReason: "CONFLICTING_QUOTA_METADATA",
+        reason: `Finite quota indicator conflicts with plan ID '${explicitCanonicalPlanId}'. Held for manual reconciliation.`
+      };
+    }
+    return buildResolvedResult("finite", foundFiniteGb, "sim_100", "legacy_explicit_metadata");
+  }
+  if (foundUnlimited) {
+    const inferredPlanId = explicitCanonicalPlanId === "router_unlimited" || canonicalCategory === "ROUTER" ? "router_unlimited" : "sim_unlimited";
+    return buildResolvedResult("unlimited", null, inferredPlanId, "legacy_explicit_metadata");
+  }
+  if (canonicalCategory === "ROUTER" && !existingAccountIsConclusivelyFinite) {
+    return buildResolvedResult("unlimited", null, "router_unlimited", "canonical_router_catalog");
+  }
+  return {
+    resolved: false,
+    blockedReason: "UNVERIFIED_RENEWAL_QUOTA_METADATA",
+    reason: "Renewal quota tier (100GB vs Unlimited) could not be conclusively verified from authoritative package metadata. Held for manual reconciliation without changing 3X-UI."
+  };
 }
 function calculateOrderDurationAndExpiry(params) {
   const now = params.nowMs ?? Date.now();
@@ -8999,12 +9811,32 @@ async function withClientMutationLock(params, fn) {
 function calculateApprovedRenewalEntitlement(params) {
   const nowMs = params.nowMs ?? Date.now();
   const prevExpiryMs = Math.max(0, Math.trunc(Number(params.previousExpiryMs) || 0));
-  const prevTotalBytes = Math.max(0, Math.trunc(Number(params.previousTotalBytes) || 0));
+  const parsedPrevTotal = parseVerifiedLiveTotalBytes(params.previousTotalBytes);
   const liveUpBytes = Math.max(0, Math.trunc(Number(params.liveUpBytes) || 0));
   const liveDownBytes = Math.max(0, Math.trunc(Number(params.liveDownBytes) || 0));
   const liveUsedBytes = liveUpBytes + liveDownBytes;
   const addedDurationMonths = Math.max(1, Math.trunc(Number(params.addedDurationMonths) || 1));
   const addedQuotaBytes = Math.max(0, Math.trunc(Number(params.addedQuotaBytes) || 0));
+  if (!parsedPrevTotal.valid) {
+    return {
+      eligible: false,
+      code: "INVALID_PARAMETERS",
+      reason: `Live 3X-UI client quota (totalGB=${String(params.previousTotalBytes)}) is missing or invalid; refusing to interpret invalid quota as Unlimited.`,
+      previousExpiryMs: prevExpiryMs,
+      previousTotalBytes: -1,
+      previousWasUnlimited: false,
+      liveUpBytes,
+      liveDownBytes,
+      liveUsedBytes,
+      addedDurationMonths,
+      addedQuotaBytes,
+      grantedExpiryMs: prevExpiryMs,
+      grantedTotalBytes: -1,
+      grantedUnlimited: false,
+      grantedDataLimitStr: "Invalid"
+    };
+  }
+  const prevTotalBytes = parsedPrevTotal.totalBytes;
   const prevWasUnlimited = prevTotalBytes === 0;
   const renewalIsUnlimited = addedQuotaBytes === 0;
   const dbStatusLower = String(params.dbAccountStatus || "active").trim().toLowerCase();
@@ -9220,8 +10052,45 @@ async function provisionProvisionalRenewal(renewRequestId, options) {
   const getInboundsCall = options?.getInboundsFn || getInbounds;
   const nowMs = options?.nowMs ?? Date.now();
   const cleanRequestId = String(renewRequestId || "").trim();
+  const signal = options?.signal;
+  const deadlineMs = typeof options?.deadlineMs === "number" && Number.isFinite(options.deadlineMs) ? options.deadlineMs : void 0;
   if (!cleanRequestId) {
     throw new Error("Renewal request ID is required for provisional renewal.");
+  }
+  const assertCanDispatchBeforeExternalMutation = (stage) => {
+    assertRequestNotTimedOutBeforeExternalMutation(signal, stage);
+    if (deadlineMs !== void 0 && Date.now() >= deadlineMs) {
+      const deadlineErr = new Error(
+        `Execution deadline elapsed before ${stage}; aborted safely with zero external mutations.`
+      );
+      deadlineErr.statusCode = 504;
+      deadlineErr.code = "REQUEST_TIMEOUT_BEFORE_MUTATION";
+      deadlineErr.blockedReason = "REQUEST_TIMEOUT_BEFORE_MUTATION";
+      deadlineErr.beforeExternalWrite = true;
+      deadlineErr.xuiUncertain = false;
+      throw deadlineErr;
+    }
+  };
+  const getRemainingRequestTimeoutMs = () => {
+    if (deadlineMs === void 0) return void 0;
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) {
+      assertCanDispatchBeforeExternalMutation("provisional renewal 3X-UI dispatch");
+    }
+    return Math.max(1e3, Math.min(2e4, remaining));
+  };
+  try {
+    assertCanDispatchBeforeExternalMutation("provisional renewal lock acquisition");
+  } catch (preCancelErr) {
+    return {
+      success: false,
+      autoRenewed: false,
+      provisional: false,
+      provisioningStatus: "pending",
+      fallbackToManual: true,
+      blockedReason: preCancelErr?.code || "REQUEST_TIMEOUT_BEFORE_MUTATION",
+      message: preCancelErr?.message || "Request timed out before automatic renewal started."
+    };
   }
   const renewLockKey = `renew:${cleanRequestId}`;
   const renewLockRes = await acquireDurableProvisioningOperationLock({
@@ -9249,6 +10118,7 @@ async function provisionProvisionalRenewal(renewRequestId, options) {
   let renewLockError = null;
   let targetClientUuid = null;
   try {
+    assertCanDispatchBeforeExternalMutation("provisional renewal DB lookup");
     const { data: renewReq, error: reqErr } = await dbClient.from("renew_requests").select("*").eq("id", cleanRequestId).maybeSingle();
     if (reqErr || !renewReq) {
       renewLockOutcome = "failed";
@@ -9392,557 +10262,693 @@ async function provisionProvisionalRenewal(renewRequestId, options) {
         message: "Parent VPN order is not yet payment-verified. Automatic renewal held for manual admin review."
       };
     }
-    return await withClientMutationLock(
-      {
-        dbClient,
-        clientUuid,
-        operationType: "client_lock",
-        targetId: cleanRequestId,
-        requireDurableLock: true,
-        allowUncertainRecovery: false,
-        metadata: { renewRequestId: cleanRequestId, parentOrderId: parentOrder.id }
-      },
-      async (assertClientLockStillHeld) => {
-        await assertNoUnresolvedClientRenewalGrant({
+    assertCanDispatchBeforeExternalMutation("provisional renewal client lock acquisition");
+    const makeClientLockFallbackError = (result, uncertain, message) => {
+      const err = new Error(message || result.message || "Provisional renewal did not complete.");
+      err.__provisionalFallbackResult = result;
+      err.xuiUncertain = uncertain;
+      err.beforeExternalWrite = !uncertain;
+      return err;
+    };
+    try {
+      return await withClientMutationLock(
+        {
           dbClient,
           clientUuid,
-          excludeRenewRequestId: cleanRequestId,
-          operationDescription: "automatic renewal provisioning"
-        });
-        const { data: freshAcc } = await dbClient.from("vpn_accounts").select("*").eq("id", vpnAccount.id).maybeSingle();
-        if (freshAcc) vpnAccount = freshAcc;
-        const { data: freshParent } = await dbClient.from("orders").select("*").eq("id", parentOrder.id).maybeSingle();
-        if (freshParent) parentOrder = freshParent;
-        let { data: vpnConfig } = await dbClient.from("vpn_configs").select("*").eq("uuid", clientUuid).maybeSingle();
-        if (!vpnConfig && parentOrder.id) {
-          const { data: byOrdCfg } = await dbClient.from("vpn_configs").select("*").eq("order_id", parentOrder.id).maybeSingle();
-          if (byOrdCfg) vpnConfig = byOrdCfg;
-        }
-        const allInbounds = await getInboundsCall(true);
-        let matchedInbound = null;
-        let matchedClient = null;
-        for (const ib of allInbounds) {
-          let sObj = {};
-          try {
-            sObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings || {};
-          } catch {
-            continue;
+          operationType: "client_lock",
+          targetId: cleanRequestId,
+          requireDurableLock: true,
+          allowUncertainRecovery: false,
+          metadata: { renewRequestId: cleanRequestId, parentOrderId: parentOrder.id }
+        },
+        async (assertClientLockStillHeld) => {
+          assertCanDispatchBeforeExternalMutation("provisional renewal grant check");
+          await assertNoUnresolvedClientRenewalGrant({
+            dbClient,
+            clientUuid,
+            excludeRenewRequestId: cleanRequestId,
+            operationDescription: "automatic renewal provisioning"
+          });
+          const { data: freshAcc } = await dbClient.from("vpn_accounts").select("*").eq("id", vpnAccount.id).maybeSingle();
+          if (freshAcc) vpnAccount = freshAcc;
+          const { data: freshParent } = await dbClient.from("orders").select("*").eq("id", parentOrder.id).maybeSingle();
+          if (freshParent) parentOrder = freshParent;
+          let { data: vpnConfig } = await dbClient.from("vpn_configs").select("*").eq("uuid", clientUuid).maybeSingle();
+          if (!vpnConfig && parentOrder.id) {
+            const { data: byOrdCfg } = await dbClient.from("vpn_configs").select("*").eq("order_id", parentOrder.id).maybeSingle();
+            if (byOrdCfg) vpnConfig = byOrdCfg;
           }
-          const cList = Array.isArray(sObj.clients) ? sObj.clients : [];
-          const found = cList.find(
-            (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
-          );
-          if (found) {
-            matchedInbound = ib;
-            matchedClient = found;
-            break;
-          }
-        }
-        if (!matchedInbound || !matchedClient || !matchedInbound.id) {
-          return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: "pending",
-            fallbackToManual: true,
-            blockedReason: "xui_client_not_found",
-            message: "Target VPN client was not found on live 3X-UI panel. Held for manual admin review."
-          };
-        }
-        const inboundId = Number(matchedInbound.id);
-        const liveExpiryRaw = Number(matchedClient.expiryTime || 0);
-        const liveExpiryMs = liveExpiryRaw > 0 && liveExpiryRaw < 1e10 ? liveExpiryRaw * 1e3 : Math.max(0, Math.trunc(liveExpiryRaw));
-        let dbExpiryMs = 0;
-        if (vpnAccount.expiry_time && Number(vpnAccount.expiry_time) > 0) {
-          const rawAccExp = Number(vpnAccount.expiry_time);
-          dbExpiryMs = rawAccExp < 1e10 ? rawAccExp * 1e3 : Math.trunc(rawAccExp);
-        } else if (vpnAccount.expiry_date) {
-          const parsed = new Date(vpnAccount.expiry_date).getTime();
-          if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
-        } else if (parentOrder.expiry_date) {
-          const parsed = new Date(parentOrder.expiry_date).getTime();
-          if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
-        }
-        const MAX_EXPIRY_DISCREPANCY_MS = 5 * 60 * 1e3;
-        const dbExpiryCandidates = [];
-        if (dbExpiryMs > 0) dbExpiryCandidates.push({ label: "vpn_accounts", ms: dbExpiryMs });
-        if (vpnConfig?.expiry_date) {
-          const cfgMs = new Date(vpnConfig.expiry_date).getTime();
-          if (!Number.isNaN(cfgMs) && cfgMs > 0) dbExpiryCandidates.push({ label: "vpn_configs", ms: cfgMs });
-        }
-        if (parentOrder?.expiry_date) {
-          const ordMs = new Date(parentOrder.expiry_date).getTime();
-          if (!Number.isNaN(ordMs) && ordMs > 0) dbExpiryCandidates.push({ label: "orders", ms: ordMs });
-        }
-        if (liveExpiryMs > 0) {
-          const excessiveDrift = dbExpiryCandidates.find(
-            (cand) => Math.abs(liveExpiryMs - cand.ms) > MAX_EXPIRY_DISCREPANCY_MS
-          );
-          if (excessiveDrift) {
-            console.warn(
-              `[AutoRenew] Expiry discrepancy > 5m for client ${clientUuid} (${excessiveDrift.label}): live=${liveExpiryMs}, db=${excessiveDrift.ms}. Falling back to manual review.`
+          assertCanDispatchBeforeExternalMutation("provisional renewal 3X-UI lookup");
+          const allInbounds = await getInboundsCall(true);
+          let matchedInbound = null;
+          let matchedClient = null;
+          for (const ib of allInbounds) {
+            let sObj = {};
+            try {
+              sObj = typeof ib.settings === "string" ? JSON.parse(ib.settings) : ib.settings || {};
+            } catch {
+              continue;
+            }
+            const cList = Array.isArray(sObj.clients) ? sObj.clients : [];
+            const found = cList.find(
+              (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
             );
+            if (found) {
+              matchedInbound = ib;
+              matchedClient = found;
+              break;
+            }
+          }
+          if (!matchedInbound || !matchedClient || !matchedInbound.id) {
             return {
               success: false,
               autoRenewed: false,
               provisional: false,
               provisioningStatus: "pending",
               fallbackToManual: true,
-              blockedReason: "expiry_discrepancy_exceeds_threshold",
-              message: "Database and 3X-UI expiry timestamps differ by more than 5 minutes. Held for manual admin verification."
+              blockedReason: "xui_client_not_found",
+              message: "Target VPN client was not found on live 3X-UI panel. Held for manual admin review."
             };
           }
-        }
-        const authoritativePrevExpiryMs = liveExpiryMs > 0 ? liveExpiryMs : dbExpiryMs;
-        if (authoritativePrevExpiryMs <= 0) {
-          return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: "pending",
-            fallbackToManual: true,
-            blockedReason: "missing_previous_expiry",
-            message: "Previous VPN expiry timestamp could not be determined. Held for manual admin review."
-          };
-        }
-        const authoritativePrevTotalBytes = Math.max(0, Math.trunc(Number(matchedClient.totalGB ?? vpnAccount.total_bytes ?? 0) || 0));
-        const clientStats = Array.isArray(matchedInbound.clientStats) ? matchedInbound.clientStats : [];
-        const statRow = clientStats.find((s) => String(s.id || "").trim().toLowerCase() === clientUuid.toLowerCase()) || clientStats.find(
-          (s) => matchedClient.email && String(s.email || "").trim().toLowerCase() === String(matchedClient.email).trim().toLowerCase()
-        );
-        const liveUpBytes = Math.max(
-          0,
-          Math.trunc(Number(statRow?.up ?? matchedClient.up ?? vpnAccount.up_bytes ?? 0) || 0)
-        );
-        const liveDownBytes = Math.max(
-          0,
-          Math.trunc(Number(statRow?.down ?? matchedClient.down ?? vpnAccount.down_bytes ?? 0) || 0)
-        );
-        const rawLiveClientEnable = matchedClient.enable;
-        const rawLiveInboundEnable = matchedInbound.enable;
-        const durationMonths = Math.max(
-          1,
-          Math.trunc(Number(extra.durationMonths || renewReq.duration_months || 1) || 1)
-        );
-        const combinedPlanStr = `${renewReq.plan_id || ""} ${renewReq.plan_name || ""} ${extra.package_type || ""} ${extra.data_limit || ""}`.toLowerCase();
-        const isFinite100GbPackage = combinedPlanStr.includes("100gb") || combinedPlanStr.includes("100 gb") || combinedPlanStr.includes("sim_100") || String(extra.data_limit || "").toLowerCase().includes("100");
-        const ONE_HUNDRED_GB_BYTES = 100 * 1024 * 1024 * 1024;
-        const addedQuotaBytes = isFinite100GbPackage ? ONE_HUNDRED_GB_BYTES * durationMonths : 0;
-        const calc = calculateApprovedRenewalEntitlement({
-          previousExpiryMs: authoritativePrevExpiryMs,
-          previousTotalBytes: authoritativePrevTotalBytes,
-          liveUpBytes,
-          liveDownBytes,
-          liveEnable: rawLiveClientEnable,
-          inboundEnable: rawLiveInboundEnable,
-          dbAccountStatus: vpnAccount.status,
-          addedDurationMonths: durationMonths,
-          addedQuotaBytes,
-          nowMs
-        });
-        if (!calc.eligible) {
-          return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: "pending",
-            fallbackToManual: true,
-            blockedReason: calc.code || "ineligible_for_auto_renewal",
-            message: calc.reason || "Account is not eligible for automatic renewal. Held for manual admin review."
-          };
-        }
-        if (calc.grantedExpiryMs <= calc.previousExpiryMs) {
-          return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: "pending",
-            fallbackToManual: true,
-            blockedReason: "non_increasing_granted_expiry",
-            message: "Calculated renewal expiry is not strictly greater than previous expiry. Held for manual admin review."
-          };
-        }
-        const verifiedPrevEnable = rawLiveClientEnable === true;
-        const normalizedPrevStatus = String(vpnAccount.status || "active").trim() || "active";
-        const preRenewalSnapshot = buildVerifiedPreRenewalDbSnapshot({
-          capturedAtMs: nowMs,
-          clientUuid,
-          inboundId,
-          previousExpiryMs: calc.previousExpiryMs,
-          previousTotalBytes: calc.previousTotalBytes,
-          previousUpBytes: calc.liveUpBytes,
-          previousDownBytes: calc.liveDownBytes,
-          previousEnable: verifiedPrevEnable,
-          grantedExpiryMs: calc.grantedExpiryMs,
-          grantedTotalBytes: calc.grantedTotalBytes,
-          grantedDataLimit: calc.grantedDataLimitStr,
-          vpnAccount: { ...vpnAccount, status: normalizedPrevStatus },
-          parentOrder,
-          vpnConfig,
-          liveClient: matchedClient
-        });
-        const prePersistIso = new Date(nowMs).toISOString();
-        const packageName = String(
-          extra.package_name || renewReq.plan_name || vpnConfig?.package_name || parentOrder.package_name || "FIREVPN Package"
-        ).trim();
-        const preGrantPayload = {
-          grant_type: "renewal",
-          source_id: cleanRequestId,
-          renew_request_id: cleanRequestId,
-          order_id: parentOrder.id,
-          user_id: requestUserId || vpnAccount.user_id || parentOrder.customer_id,
-          user_email: requestEmail || vpnAccount.email || parentOrder.email || "",
-          vpn_account_id: vpnAccount.id,
-          client_uuid: clientUuid,
-          sub_id: matchedClient.subId ? String(matchedClient.subId) : null,
-          inbound_id: inboundId,
-          remark: matchedClient.email || vpnAccount.remark || "",
-          package_name: packageName,
-          duration_months: durationMonths,
-          previous_expiry_ms: calc.previousExpiryMs,
-          previous_total_bytes: calc.previousTotalBytes,
-          previous_was_unlimited: calc.previousWasUnlimited,
-          previous_enable: verifiedPrevEnable,
-          previous_status: normalizedPrevStatus,
-          previous_up_bytes: calc.liveUpBytes,
-          previous_down_bytes: calc.liveDownBytes,
-          pre_renewal_db_snapshot: preRenewalSnapshot,
-          added_duration_months: durationMonths,
-          granted_expiry_ms: calc.grantedExpiryMs,
-          added_quota_bytes: calc.addedQuotaBytes,
-          granted_total_bytes: calc.grantedTotalBytes,
-          granted_unlimited: calc.grantedUnlimited,
-          provisional: true,
-          status: "provisioning",
-          updated_at: prePersistIso
-        };
-        let grantRowId = existingGrant?.id || null;
-        if (grantRowId) {
-          const { error: updGrantErr } = await dbClient.from("vpn_entitlement_grants").update(preGrantPayload).eq("id", grantRowId);
-          if (updGrantErr) {
-            throw new Error(`Failed to pre-persist renewal entitlement grant before 3X-UI update: ${updGrantErr.message}`);
+          const inboundId = Number(matchedInbound.id);
+          const liveExpiryRaw = Number(matchedClient.expiryTime || 0);
+          const liveExpiryMs = liveExpiryRaw > 0 && liveExpiryRaw < 1e10 ? liveExpiryRaw * 1e3 : Math.max(0, Math.trunc(liveExpiryRaw));
+          let dbExpiryMs = 0;
+          if (vpnAccount.expiry_time && Number(vpnAccount.expiry_time) > 0) {
+            const rawAccExp = Number(vpnAccount.expiry_time);
+            dbExpiryMs = rawAccExp < 1e10 ? rawAccExp * 1e3 : Math.trunc(rawAccExp);
+          } else if (vpnAccount.expiry_date) {
+            const parsed = new Date(vpnAccount.expiry_date).getTime();
+            if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
+          } else if (parentOrder.expiry_date) {
+            const parsed = new Date(parentOrder.expiry_date).getTime();
+            if (!Number.isNaN(parsed) && parsed > 0) dbExpiryMs = parsed;
           }
-        } else {
-          const { data: insGrant, error: insGrantErr } = await dbClient.from("vpn_entitlement_grants").insert({ ...preGrantPayload, created_at: prePersistIso }).select("id").maybeSingle();
-          if (insGrantErr || !insGrant?.id) {
-            throw new Error(
-              `Failed to pre-persist renewal entitlement grant before 3X-UI update: ${insGrantErr?.message || "No grant ID returned"}`
+          const MAX_EXPIRY_DISCREPANCY_MS = 5 * 60 * 1e3;
+          const dbExpiryCandidates = [];
+          if (dbExpiryMs > 0) dbExpiryCandidates.push({ label: "vpn_accounts", ms: dbExpiryMs });
+          if (vpnConfig?.expiry_date) {
+            const cfgMs = new Date(vpnConfig.expiry_date).getTime();
+            if (!Number.isNaN(cfgMs) && cfgMs > 0) dbExpiryCandidates.push({ label: "vpn_configs", ms: cfgMs });
+          }
+          if (parentOrder?.expiry_date) {
+            const ordMs = new Date(parentOrder.expiry_date).getTime();
+            if (!Number.isNaN(ordMs) && ordMs > 0) dbExpiryCandidates.push({ label: "orders", ms: ordMs });
+          }
+          if (liveExpiryMs > 0) {
+            const excessiveDrift = dbExpiryCandidates.find(
+              (cand) => Math.abs(liveExpiryMs - cand.ms) > MAX_EXPIRY_DISCREPANCY_MS
+            );
+            if (excessiveDrift) {
+              console.warn(
+                `[AutoRenew] Expiry discrepancy > 5m for client ${clientUuid} (${excessiveDrift.label}): live=${liveExpiryMs}, db=${excessiveDrift.ms}. Falling back to manual review.`
+              );
+              return {
+                success: false,
+                autoRenewed: false,
+                provisional: false,
+                provisioningStatus: "pending",
+                fallbackToManual: true,
+                blockedReason: "expiry_discrepancy_exceeds_threshold",
+                message: "Database and 3X-UI expiry timestamps differ by more than 5 minutes. Held for manual admin verification."
+              };
+            }
+          }
+          const authoritativePrevExpiryMs = liveExpiryMs > 0 ? liveExpiryMs : dbExpiryMs;
+          if (authoritativePrevExpiryMs <= 0) {
+            return {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: "pending",
+              fallbackToManual: true,
+              blockedReason: "missing_previous_expiry",
+              message: "Previous VPN expiry timestamp could not be determined. Held for manual admin review."
+            };
+          }
+          const parsedLiveClientQuota = parseVerifiedLiveTotalBytes(matchedClient.totalGB);
+          if (!parsedLiveClientQuota.valid) {
+            return {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: "pending",
+              fallbackToManual: true,
+              blockedReason: "INVALID_LIVE_CLIENT_QUOTA",
+              uuid: clientUuid,
+              inboundId,
+              message: `Live 3X-UI client totalGB (${String(matchedClient.totalGB)}) is missing or invalid; refusing to interpret invalid quota as Unlimited. Held for manual admin review.`
+            };
+          }
+          const authoritativePrevTotalBytes = parsedLiveClientQuota.totalBytes;
+          const clientStats = Array.isArray(matchedInbound.clientStats) ? matchedInbound.clientStats : [];
+          const statRow = clientStats.find((s) => String(s.id || "").trim().toLowerCase() === clientUuid.toLowerCase()) || clientStats.find(
+            (s) => matchedClient.email && String(s.email || "").trim().toLowerCase() === String(matchedClient.email).trim().toLowerCase()
+          );
+          const liveUpBytes = Math.max(
+            0,
+            Math.trunc(Number(statRow?.up ?? matchedClient.up ?? vpnAccount.up_bytes ?? 0) || 0)
+          );
+          const liveDownBytes = Math.max(
+            0,
+            Math.trunc(Number(statRow?.down ?? matchedClient.down ?? vpnAccount.down_bytes ?? 0) || 0)
+          );
+          const rawLiveClientEnable = matchedClient.enable;
+          const rawLiveInboundEnable = matchedInbound.enable;
+          const durationMonths = Math.max(
+            1,
+            Math.trunc(Number(extra.durationMonths || renewReq.duration_months || 1) || 1)
+          );
+          const authoritativeQuota = resolveAuthoritativeRenewalQuota({
+            renewRequest: renewReq,
+            extraNotes: extra,
+            durationMonths,
+            vpnAccount,
+            vpnConfig,
+            parentOrder,
+            liveClientTotalBytes: authoritativePrevTotalBytes
+          });
+          if (!authoritativeQuota.resolved) {
+            renewLockOutcome = "failed";
+            renewLockError = authoritativeQuota.reason || authoritativeQuota.blockedReason || "UNVERIFIED_RENEWAL_QUOTA_METADATA";
+            throw makeClientLockFallbackError(
+              {
+                success: false,
+                autoRenewed: false,
+                provisional: false,
+                provisioningStatus: "pending",
+                fallbackToManual: true,
+                blockedReason: authoritativeQuota.blockedReason || "UNVERIFIED_RENEWAL_QUOTA_METADATA",
+                uuid: clientUuid,
+                inboundId,
+                message: authoritativeQuota.reason || "Renewal quota tier could not be conclusively verified. Held for manual reconciliation without changing 3X-UI."
+              },
+              false,
+              renewLockError
             );
           }
-          grantRowId = insGrant.id;
-        }
-        const preExtraNotes = {
-          ...extra,
-          old_expiry: new Date(calc.previousExpiryMs).toISOString(),
-          new_expiry: new Date(calc.grantedExpiryMs).toISOString()
-        };
-        const { error: preReqErr } = await dbClient.from("renew_requests").update({
-          provisioning_status: "provisioning",
-          notes: JSON.stringify(preExtraNotes),
-          updated_at: prePersistIso
-        }).eq("id", cleanRequestId);
-        if (preReqErr) {
-          throw new Error(`Failed to update renew_requests status to provisioning before 3X-UI write: ${preReqErr.message}`);
-        }
-        let xuiWriteAttempted = false;
-        let xuiWriteConfirmed = false;
-        try {
-          await withInboundWriteLock(
-            {
-              dbClient,
-              inboundId,
-              targetId: `renew:${cleanRequestId}`,
-              clientUuid,
-              requireDurableLock: true
-            },
-            async (assertInboundLockStillHeld) => {
-              const fetchFreshInbound = async () => {
-                try {
-                  const res = await requestApiCall(`/panel/api/inbounds/get/${inboundId}`, "GET");
-                  const obj = res?.obj || res;
-                  if (obj && typeof obj === "object" && obj.id !== void 0) return obj;
-                } catch (_e) {
-                }
-                const list = await getInboundsCall(true);
-                return list.find((ib) => Number(ib.id) === Number(inboundId)) || null;
-              };
-              const liveInboundObj = await fetchFreshInbound();
-              if (!liveInboundObj) {
-                throw new Error(`Unable to fetch live inbound ${inboundId} from 3X-UI panel for renewal.`);
-              }
-              if (liveInboundObj.enable !== true) {
-                const disabledIbErr = new Error(
-                  `Inbound ${inboundId} is disabled or ambiguous (enable=${String(liveInboundObj.enable)}) inside write lock. Aborting automatic renewal.`
-                );
-                disabledIbErr.blockedReason = "INBOUND_DISABLED_OR_AMBIGUOUS";
-                throw disabledIbErr;
-              }
-              let settingsObj = {};
-              if (typeof liveInboundObj.settings === "string") {
-                try {
-                  settingsObj = JSON.parse(liveInboundObj.settings);
-                } catch {
-                  settingsObj = { clients: [] };
-                }
-              } else if (liveInboundObj.settings && typeof liveInboundObj.settings === "object") {
-                settingsObj = { ...liveInboundObj.settings };
-              }
-              const clientsList = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
-              const cIdx = clientsList.findIndex(
-                (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
-              );
-              if (cIdx < 0) {
-                throw new Error(`Client ${clientUuid} no longer found on inbound ${inboundId} inside write lock.`);
-              }
-              if (clientsList[cIdx].enable !== true) {
-                const disabledClientErr = new Error(
-                  `Client ${clientUuid} is disabled or ambiguous (enable=${String(clientsList[cIdx].enable)}) inside write lock. Refusing unauthorized re-enable.`
-                );
-                disabledClientErr.blockedReason = "CLIENT_DISABLED_OR_AMBIGUOUS";
-                throw disabledClientErr;
-              }
-              clientsList[cIdx] = {
-                ...clientsList[cIdx],
-                id: clientUuid,
-                expiryTime: calc.grantedExpiryMs,
-                totalGB: calc.grantedTotalBytes,
-                enable: true
-              };
-              settingsObj.clients = clientsList;
-              const updatePayload = {
-                ...liveInboundObj,
-                id: inboundId,
-                settings: JSON.stringify(settingsObj)
-              };
-              delete updatePayload.up;
-              delete updatePayload.down;
-              delete updatePayload.clientStats;
-              delete updatePayload.trafficReset;
-              delete updatePayload.lastTrafficResetTime;
-              const verifyAllLocksBeforeExternalMutation = async () => {
-                await assertInboundLockStillHeld();
-                await assertClientLockStillHeld();
-                const renewStillHeld = await renewDurableProvisioningOperationLock({
-                  dbClient,
-                  operationKey: renewLockKey,
-                  lockOwnerId: renewLockRes.lockOwnerId
-                });
-                if (!renewStillHeld) {
-                  const fenceErr = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
-                  fenceErr.statusCode = 409;
-                  fenceErr.code = "RENEW_LOCK_LOST";
-                  fenceErr.beforeExternalWrite = true;
-                  fenceErr.xuiUncertain = false;
-                  throw fenceErr;
-                }
-              };
-              await verifyAllLocksBeforeExternalMutation();
-              xuiWriteAttempted = true;
-              const updateRes = await requestApiCall(
-                `/panel/api/inbounds/update/${inboundId}`,
-                "POST",
-                updatePayload,
-                {
-                  beforeSend: verifyAllLocksBeforeExternalMutation
-                }
-              );
-              if (updateRes && updateRes.success === false) {
-                throw new Error(updateRes.msg || updateRes.message || "3X-UI panel rejected renewal inbound update.");
-              }
-              const afterInbound = await fetchFreshInbound();
-              if (!afterInbound) {
-                throw new Error(`Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal write.`);
-              }
-              if (afterInbound.enable !== true) {
-                throw new Error(
-                  `Read-back verification failed: inbound ${inboundId} is not enabled (enable=${String(afterInbound.enable)}) after renewal write.`
-                );
-              }
-              let afterSettings = {};
-              try {
-                afterSettings = typeof afterInbound.settings === "string" ? JSON.parse(afterInbound.settings) : afterInbound.settings || {};
-              } catch {
-                afterSettings = {};
-              }
-              const verifiedClient = (Array.isArray(afterSettings.clients) ? afterSettings.clients : []).find(
-                (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
-              );
-              if (!verifiedClient || verifiedClient.enable !== true || Number(verifiedClient.expiryTime) !== calc.grantedExpiryMs || Number(verifiedClient.totalGB) !== calc.grantedTotalBytes) {
-                throw new Error(
-                  `Read-back verification failed for renewed client ${clientUuid} on inbound ${inboundId}: expected enable=true, expiryTime=${calc.grantedExpiryMs}, totalGB=${calc.grantedTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
-                );
-              }
-              xuiWriteConfirmed = true;
-              invalidateInboundCache(inboundId);
-            }
-          );
-        } catch (xuiErr) {
-          const errText = xuiErr?.message || String(xuiErr);
-          const isUncertain = Boolean(
-            xuiWriteAttempted && !xuiWriteConfirmed && xuiErr?.beforeExternalWrite !== true && xuiErr?.xuiUncertain !== false
-          );
-          renewLockOutcome = isUncertain ? "uncertain" : "failed";
-          renewLockError = errText;
-          try {
-            if (isUncertain) {
-              await dbClient.from("vpn_entitlement_grants").update({
-                status: "uncertain",
-                last_error: errText,
-                updated_at: (/* @__PURE__ */ new Date()).toISOString()
-              }).eq("id", grantRowId);
-            } else if (grantRowId) {
-              await dbClient.from("vpn_entitlement_grants").delete().eq("id", grantRowId);
-            }
-          } catch (_e) {
+          const addedQuotaBytes = authoritativeQuota.addedQuotaBytes ?? 0;
+          const calc = calculateApprovedRenewalEntitlement({
+            previousExpiryMs: authoritativePrevExpiryMs,
+            previousTotalBytes: authoritativePrevTotalBytes,
+            liveUpBytes,
+            liveDownBytes,
+            liveEnable: rawLiveClientEnable,
+            inboundEnable: rawLiveInboundEnable,
+            dbAccountStatus: vpnAccount.status,
+            addedDurationMonths: durationMonths,
+            addedQuotaBytes,
+            nowMs
+          });
+          if (!calc.eligible) {
+            return {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: "pending",
+              fallbackToManual: true,
+              blockedReason: calc.code || "ineligible_for_auto_renewal",
+              message: calc.reason || "Account is not eligible for automatic renewal. Held for manual admin review."
+            };
           }
-          try {
-            await dbClient.from("renew_requests").update({
-              provisioning_status: isUncertain ? "uncertain" : "pending",
-              updated_at: (/* @__PURE__ */ new Date()).toISOString()
-            }).eq("id", cleanRequestId);
-          } catch (_e) {
+          if (calc.grantedExpiryMs <= calc.previousExpiryMs) {
+            return {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: "pending",
+              fallbackToManual: true,
+              blockedReason: "non_increasing_granted_expiry",
+              message: "Calculated renewal expiry is not strictly greater than previous expiry. Held for manual admin review."
+            };
           }
-          return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: isUncertain ? "uncertain" : "pending",
-            fallbackToManual: true,
-            blockedReason: xuiErr?.blockedReason || (isUncertain ? "xui_write_uncertain" : "xui_update_failed"),
-            uuid: clientUuid,
+          const verifiedPrevEnable = rawLiveClientEnable === true;
+          const normalizedPrevStatus = String(vpnAccount.status || "active").trim() || "active";
+          const preRenewalSnapshot = buildVerifiedPreRenewalDbSnapshot({
+            capturedAtMs: nowMs,
+            clientUuid,
             inboundId,
-            message: errText
-          };
-        }
-        const finalNowIso = (/* @__PURE__ */ new Date()).toISOString();
-        const grantedExpiryIso = new Date(calc.grantedExpiryMs).toISOString();
-        const dataAllowanceLabel = calc.addedQuotaBytes > 0 ? `${Math.round(calc.addedQuotaBytes / (1024 * 1024 * 1024))} GB` : "Unlimited";
-        try {
-          const { error: accUpdErr } = await dbClient.from("vpn_accounts").update({
-            expiry_time: calc.grantedExpiryMs,
-            expiry_date: grantedExpiryIso,
-            total_bytes: calc.grantedTotalBytes,
-            data_limit: calc.grantedDataLimitStr,
-            status: "active",
-            enable: true,
-            updated_at: finalNowIso
-          }).eq("id", vpnAccount.id);
-          if (accUpdErr) {
-            throw new Error(`Failed to update vpn_accounts after 3X-UI renewal: ${accUpdErr.message}`);
-          }
-          if (vpnConfig?.id) {
-            const { error: cfgUpdErr } = await dbClient.from("vpn_configs").update({
-              expiry_date: grantedExpiryIso,
-              data_limit: calc.grantedDataLimitStr,
-              enabled: true,
-              status: "active"
-            }).eq("id", vpnConfig.id);
-            if (cfgUpdErr) {
-              throw new Error(`Failed to update vpn_configs after 3X-UI renewal: ${cfgUpdErr.message}`);
-            }
-          }
-          const { error: ordUpdErr } = await dbClient.from("orders").update({
-            expiry_date: grantedExpiryIso,
-            updated_at: finalNowIso
-          }).eq("id", parentOrder.id);
-          if (ordUpdErr) {
-            throw new Error(`Failed to update orders.expiry_date after 3X-UI renewal: ${ordUpdErr.message}`);
-          }
-          const { error: grantPromErr } = await dbClient.from("vpn_entitlement_grants").update({
-            status: "provisional",
+            previousExpiryMs: calc.previousExpiryMs,
+            previousTotalBytes: calc.previousTotalBytes,
+            previousUpBytes: calc.liveUpBytes,
+            previousDownBytes: calc.liveDownBytes,
+            previousEnable: verifiedPrevEnable,
+            grantedExpiryMs: calc.grantedExpiryMs,
+            grantedTotalBytes: calc.grantedTotalBytes,
+            grantedDataLimit: calc.grantedDataLimitStr,
+            vpnAccount: { ...vpnAccount, status: normalizedPrevStatus },
+            parentOrder,
+            vpnConfig,
+            liveClient: matchedClient
+          });
+          const prePersistIso = new Date(nowMs).toISOString();
+          const packageName = String(
+            extra.package_name || renewReq.plan_name || vpnConfig?.package_name || parentOrder.package_name || "FIREVPN Package"
+          ).trim();
+          const preGrantPayload = {
+            grant_type: "renewal",
+            source_id: cleanRequestId,
+            renew_request_id: cleanRequestId,
+            order_id: parentOrder.id,
+            user_id: requestUserId || vpnAccount.user_id || parentOrder.customer_id,
+            user_email: requestEmail || vpnAccount.email || parentOrder.email || "",
+            vpn_account_id: vpnAccount.id,
+            client_uuid: clientUuid,
+            sub_id: matchedClient.subId ? String(matchedClient.subId) : null,
+            inbound_id: inboundId,
+            remark: matchedClient.email || vpnAccount.remark || "",
+            package_name: packageName,
+            duration_months: durationMonths,
+            previous_expiry_ms: calc.previousExpiryMs,
+            previous_total_bytes: calc.previousTotalBytes,
+            previous_was_unlimited: calc.previousWasUnlimited,
+            previous_enable: verifiedPrevEnable,
+            previous_status: normalizedPrevStatus,
+            previous_up_bytes: calc.liveUpBytes,
+            previous_down_bytes: calc.liveDownBytes,
+            pre_renewal_db_snapshot: preRenewalSnapshot,
+            added_duration_months: durationMonths,
+            granted_expiry_ms: calc.grantedExpiryMs,
+            added_quota_bytes: calc.addedQuotaBytes,
+            granted_total_bytes: calc.grantedTotalBytes,
+            granted_unlimited: calc.grantedUnlimited,
             provisional: true,
-            last_error: null,
-            updated_at: finalNowIso
-          }).eq("id", grantRowId);
-          if (grantPromErr) {
-            throw new Error(`Failed to promote renewal vpn_entitlement_grants to provisional: ${grantPromErr.message}`);
+            status: "provisioning",
+            updated_at: prePersistIso
+          };
+          assertCanDispatchBeforeExternalMutation("provisional renewal grant pre-persistence");
+          let grantRowId = existingGrant?.id || null;
+          if (grantRowId) {
+            const { error: updGrantErr } = await dbClient.from("vpn_entitlement_grants").update(preGrantPayload).eq("id", grantRowId);
+            if (updGrantErr) {
+              throw new Error(`Failed to pre-persist renewal entitlement grant before 3X-UI update: ${updGrantErr.message}`);
+            }
+          } else {
+            const { data: insGrant, error: insGrantErr } = await dbClient.from("vpn_entitlement_grants").insert({ ...preGrantPayload, created_at: prePersistIso }).select("id").maybeSingle();
+            if (insGrantErr || !insGrant?.id) {
+              throw new Error(
+                `Failed to pre-persist renewal entitlement grant before 3X-UI update: ${insGrantErr?.message || "No grant ID returned"}`
+              );
+            }
+            grantRowId = insGrant.id;
           }
-          const updatedExtra = {
+          const preExtraNotes = {
             ...extra,
             old_expiry: new Date(calc.previousExpiryMs).toISOString(),
-            new_expiry: grantedExpiryIso,
-            data_allowance: dataAllowanceLabel,
-            provisional_renewal: true,
-            calculation_mode: calc.mode
+            new_expiry: new Date(calc.grantedExpiryMs).toISOString()
           };
-          const { error: reqUpdErr } = await dbClient.from("renew_requests").update({
-            status: "pending",
-            provisioning_status: "provisional",
-            notes: JSON.stringify(updatedExtra),
-            updated_at: finalNowIso
+          const { error: preReqErr } = await dbClient.from("renew_requests").update({
+            provisioning_status: "provisioning",
+            notes: JSON.stringify(preExtraNotes),
+            updated_at: prePersistIso
           }).eq("id", cleanRequestId);
-          if (reqUpdErr) {
-            throw new Error(`Failed to update renew_requests provisioning_status to provisional: ${reqUpdErr.message}`);
+          if (preReqErr) {
+            throw new Error(`Failed to update renew_requests status to provisioning before 3X-UI write: ${preReqErr.message}`);
           }
-        } catch (postXuiDbErr) {
-          const dbErrText = postXuiDbErr?.message || String(postXuiDbErr);
-          console.error(
-            `[AutoRenew] CRITICAL: Database sync failed AFTER confirmed 3X-UI renewal write for request ${cleanRequestId} (client ${clientUuid}):`,
-            dbErrText
-          );
-          renewLockOutcome = "uncertain";
-          renewLockError = dbErrText;
+          let xuiWriteAttempted = false;
+          let xuiWriteConfirmed = false;
           try {
-            await dbClient.from("vpn_entitlement_grants").update({
-              status: "uncertain",
-              last_error: dbErrText,
-              updated_at: (/* @__PURE__ */ new Date()).toISOString()
+            await withInboundWriteLock(
+              {
+                dbClient,
+                inboundId,
+                targetId: `renew:${cleanRequestId}`,
+                clientUuid,
+                requireDurableLock: true
+              },
+              async (assertInboundLockStillHeld) => {
+                const fetchFreshInbound = async () => {
+                  try {
+                    const res = await requestApiCall(`/panel/api/inbounds/get/${inboundId}`, "GET");
+                    const obj = res?.obj || res;
+                    if (obj && typeof obj === "object" && obj.id !== void 0) return obj;
+                  } catch (_e) {
+                  }
+                  const list = await getInboundsCall(true);
+                  return list.find((ib) => Number(ib.id) === Number(inboundId)) || null;
+                };
+                assertCanDispatchBeforeExternalMutation("provisional renewal inbound fetch");
+                const liveInboundObj = await fetchFreshInbound();
+                if (!liveInboundObj) {
+                  const missingIbErr = new Error(
+                    `Unable to fetch live inbound ${inboundId} from 3X-UI panel for renewal.`
+                  );
+                  missingIbErr.beforeExternalWrite = true;
+                  missingIbErr.xuiUncertain = false;
+                  throw missingIbErr;
+                }
+                if (liveInboundObj.enable !== true) {
+                  const disabledIbErr = new Error(
+                    `Inbound ${inboundId} is disabled or ambiguous (enable=${String(liveInboundObj.enable)}) inside write lock. Aborting automatic renewal.`
+                  );
+                  disabledIbErr.blockedReason = "INBOUND_DISABLED_OR_AMBIGUOUS";
+                  disabledIbErr.beforeExternalWrite = true;
+                  disabledIbErr.xuiUncertain = false;
+                  throw disabledIbErr;
+                }
+                let settingsObj = {};
+                if (typeof liveInboundObj.settings === "string") {
+                  try {
+                    settingsObj = JSON.parse(liveInboundObj.settings);
+                  } catch {
+                    settingsObj = { clients: [] };
+                  }
+                } else if (liveInboundObj.settings && typeof liveInboundObj.settings === "object") {
+                  settingsObj = { ...liveInboundObj.settings };
+                }
+                const clientsList = Array.isArray(settingsObj.clients) ? [...settingsObj.clients] : [];
+                const cIdx = clientsList.findIndex(
+                  (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
+                );
+                if (cIdx < 0) {
+                  const missingClientErr = new Error(
+                    `Client ${clientUuid} no longer found on inbound ${inboundId} inside write lock.`
+                  );
+                  missingClientErr.blockedReason = "xui_client_not_found";
+                  missingClientErr.beforeExternalWrite = true;
+                  missingClientErr.xuiUncertain = false;
+                  throw missingClientErr;
+                }
+                if (clientsList[cIdx].enable !== true) {
+                  const disabledClientErr = new Error(
+                    `Client ${clientUuid} is disabled or ambiguous (enable=${String(clientsList[cIdx].enable)}) inside write lock. Refusing unauthorized re-enable.`
+                  );
+                  disabledClientErr.blockedReason = "CLIENT_DISABLED_OR_AMBIGUOUS";
+                  disabledClientErr.beforeExternalWrite = true;
+                  disabledClientErr.xuiUncertain = false;
+                  throw disabledClientErr;
+                }
+                clientsList[cIdx] = {
+                  ...clientsList[cIdx],
+                  id: clientUuid,
+                  expiryTime: calc.grantedExpiryMs,
+                  totalGB: calc.grantedTotalBytes,
+                  enable: true
+                };
+                settingsObj.clients = clientsList;
+                const updatePayload = {
+                  ...liveInboundObj,
+                  id: inboundId,
+                  settings: JSON.stringify(settingsObj)
+                };
+                delete updatePayload.up;
+                delete updatePayload.down;
+                delete updatePayload.clientStats;
+                delete updatePayload.trafficReset;
+                delete updatePayload.lastTrafficResetTime;
+                const verifyAllLocksBeforeExternalMutation = async () => {
+                  assertCanDispatchBeforeExternalMutation("provisional renewal 3X-UI mutation");
+                  await assertInboundLockStillHeld();
+                  await assertClientLockStillHeld();
+                  const renewStillHeld = await renewDurableProvisioningOperationLock({
+                    dbClient,
+                    operationKey: renewLockKey,
+                    lockOwnerId: renewLockRes.lockOwnerId
+                  });
+                  if (!renewStillHeld) {
+                    const fenceErr = new Error(`Lost durable renewal lock '${renewLockKey}' before 3X-UI write.`);
+                    fenceErr.statusCode = 409;
+                    fenceErr.code = "RENEW_LOCK_LOST";
+                    fenceErr.blockedReason = "RENEW_LOCK_LOST";
+                    fenceErr.beforeExternalWrite = true;
+                    fenceErr.xuiUncertain = false;
+                    throw fenceErr;
+                  }
+                };
+                await verifyAllLocksBeforeExternalMutation();
+                const mutationTimeoutMs = getRemainingRequestTimeoutMs();
+                xuiWriteAttempted = true;
+                try {
+                  const updateRes = await requestApiCall(
+                    `/panel/api/inbounds/update/${inboundId}`,
+                    "POST",
+                    updatePayload,
+                    {
+                      beforeSend: verifyAllLocksBeforeExternalMutation,
+                      signal,
+                      ...mutationTimeoutMs !== void 0 ? { timeoutMs: mutationTimeoutMs } : {}
+                    }
+                  );
+                  if (updateRes && updateRes.success === false) {
+                    const rejErr = new Error(
+                      updateRes.msg || updateRes.message || "3X-UI panel rejected renewal inbound update."
+                    );
+                    rejErr.xuiUncertain = true;
+                    rejErr.beforeExternalWrite = false;
+                    throw rejErr;
+                  }
+                  const afterInbound = await fetchFreshInbound();
+                  if (!afterInbound) {
+                    const rbErr = new Error(
+                      `Read-back verification failed: unable to re-fetch inbound ${inboundId} after renewal write.`
+                    );
+                    rbErr.xuiUncertain = true;
+                    rbErr.beforeExternalWrite = false;
+                    throw rbErr;
+                  }
+                  if (afterInbound.enable !== true) {
+                    const rbErr = new Error(
+                      `Read-back verification failed: inbound ${inboundId} is not enabled (enable=${String(afterInbound.enable)}) after renewal write.`
+                    );
+                    rbErr.xuiUncertain = true;
+                    rbErr.beforeExternalWrite = false;
+                    throw rbErr;
+                  }
+                  let afterSettings = {};
+                  try {
+                    afterSettings = typeof afterInbound.settings === "string" ? JSON.parse(afterInbound.settings) : afterInbound.settings || {};
+                  } catch {
+                    afterSettings = {};
+                  }
+                  const verifiedClient = (Array.isArray(afterSettings.clients) ? afterSettings.clients : []).find(
+                    (c) => String(c.id || "").trim().toLowerCase() === clientUuid.toLowerCase()
+                  );
+                  if (!verifiedClient || verifiedClient.enable !== true || Number(verifiedClient.expiryTime) !== calc.grantedExpiryMs || Number(verifiedClient.totalGB) !== calc.grantedTotalBytes) {
+                    const rbErr = new Error(
+                      `Read-back verification failed for renewed client ${clientUuid} on inbound ${inboundId}: expected enable=true, expiryTime=${calc.grantedExpiryMs}, totalGB=${calc.grantedTotalBytes}; got enable=${String(verifiedClient?.enable)}, expiryTime=${String(verifiedClient?.expiryTime)}, totalGB=${String(verifiedClient?.totalGB)}.`
+                    );
+                    rbErr.xuiUncertain = true;
+                    rbErr.beforeExternalWrite = false;
+                    throw rbErr;
+                  }
+                  xuiWriteConfirmed = true;
+                  invalidateInboundCache(inboundId);
+                } catch (postDispatchErr) {
+                  if (postDispatchErr && typeof postDispatchErr === "object" && postDispatchErr.beforeExternalWrite !== true && postDispatchErr.xuiUncertain !== false) {
+                    postDispatchErr.xuiUncertain = true;
+                    postDispatchErr.beforeExternalWrite = false;
+                  }
+                  throw postDispatchErr;
+                }
+              }
+            );
+          } catch (xuiErr) {
+            const errText = xuiErr?.message || String(xuiErr);
+            const isUncertain = Boolean(
+              xuiWriteAttempted && !xuiWriteConfirmed && xuiErr?.beforeExternalWrite !== true && xuiErr?.xuiUncertain !== false
+            );
+            renewLockOutcome = isUncertain ? "uncertain" : "failed";
+            renewLockError = errText;
+            try {
+              if (isUncertain) {
+                await dbClient.from("vpn_entitlement_grants").update({
+                  status: "uncertain",
+                  last_error: errText,
+                  updated_at: (/* @__PURE__ */ new Date()).toISOString()
+                }).eq("id", grantRowId);
+              } else if (grantRowId) {
+                await dbClient.from("vpn_entitlement_grants").delete().eq("id", grantRowId);
+              }
+            } catch (_e) {
+            }
+            try {
+              await dbClient.from("renew_requests").update({
+                provisioning_status: isUncertain ? "uncertain" : "pending",
+                updated_at: (/* @__PURE__ */ new Date()).toISOString()
+              }).eq("id", cleanRequestId);
+            } catch (_e) {
+            }
+            const fallbackRes = {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: isUncertain ? "uncertain" : "pending",
+              fallbackToManual: true,
+              blockedReason: xuiErr?.blockedReason || xuiErr?.code || (isUncertain ? "xui_write_uncertain" : "xui_update_failed"),
+              uuid: clientUuid,
+              inboundId,
+              message: errText
+            };
+            throw makeClientLockFallbackError(fallbackRes, isUncertain, errText);
+          }
+          const finalNowIso = (/* @__PURE__ */ new Date()).toISOString();
+          const grantedExpiryIso = new Date(calc.grantedExpiryMs).toISOString();
+          const dataAllowanceLabel = calc.addedQuotaBytes > 0 ? `${Math.round(calc.addedQuotaBytes / (1024 * 1024 * 1024))} GB` : "Unlimited";
+          try {
+            const { error: accUpdErr } = await dbClient.from("vpn_accounts").update({
+              expiry_time: calc.grantedExpiryMs,
+              expiry_date: grantedExpiryIso,
+              total_bytes: calc.grantedTotalBytes,
+              data_limit: calc.grantedDataLimitStr,
+              status: "active",
+              enable: true,
+              updated_at: finalNowIso
+            }).eq("id", vpnAccount.id);
+            if (accUpdErr) {
+              throw new Error(`Failed to update vpn_accounts after 3X-UI renewal: ${accUpdErr.message}`);
+            }
+            if (vpnConfig?.id) {
+              const { error: cfgUpdErr } = await dbClient.from("vpn_configs").update({
+                expiry_date: grantedExpiryIso,
+                data_limit: calc.grantedDataLimitStr,
+                enabled: true,
+                status: "active"
+              }).eq("id", vpnConfig.id);
+              if (cfgUpdErr) {
+                throw new Error(`Failed to update vpn_configs after 3X-UI renewal: ${cfgUpdErr.message}`);
+              }
+            }
+            const { error: ordUpdErr } = await dbClient.from("orders").update({
+              expiry_date: grantedExpiryIso,
+              updated_at: finalNowIso
+            }).eq("id", parentOrder.id);
+            if (ordUpdErr) {
+              throw new Error(`Failed to update orders.expiry_date after 3X-UI renewal: ${ordUpdErr.message}`);
+            }
+            const { error: grantPromErr } = await dbClient.from("vpn_entitlement_grants").update({
+              status: "provisional",
+              provisional: true,
+              last_error: null,
+              updated_at: finalNowIso
             }).eq("id", grantRowId);
-          } catch (_e) {
-          }
-          try {
-            await dbClient.from("renew_requests").update({
-              provisioning_status: "uncertain",
-              updated_at: (/* @__PURE__ */ new Date()).toISOString()
+            if (grantPromErr) {
+              throw new Error(`Failed to promote renewal vpn_entitlement_grants to provisional: ${grantPromErr.message}`);
+            }
+            const updatedExtra = {
+              ...extra,
+              old_expiry: new Date(calc.previousExpiryMs).toISOString(),
+              new_expiry: grantedExpiryIso,
+              data_allowance: dataAllowanceLabel,
+              provisional_renewal: true,
+              calculation_mode: calc.mode
+            };
+            const { error: reqUpdErr } = await dbClient.from("renew_requests").update({
+              status: "pending",
+              provisioning_status: "provisional",
+              notes: JSON.stringify(updatedExtra),
+              updated_at: finalNowIso
             }).eq("id", cleanRequestId);
-          } catch (_e) {
+            if (reqUpdErr) {
+              throw new Error(`Failed to update renew_requests provisioning_status to provisional: ${reqUpdErr.message}`);
+            }
+          } catch (postXuiDbErr) {
+            const dbErrText = postXuiDbErr?.message || String(postXuiDbErr);
+            console.error(
+              `[AutoRenew] CRITICAL: Database sync failed AFTER confirmed 3X-UI renewal write for request ${cleanRequestId} (client ${clientUuid}):`,
+              dbErrText
+            );
+            renewLockOutcome = "uncertain";
+            renewLockError = dbErrText;
+            try {
+              await dbClient.from("vpn_entitlement_grants").update({
+                status: "uncertain",
+                last_error: dbErrText,
+                updated_at: (/* @__PURE__ */ new Date()).toISOString()
+              }).eq("id", grantRowId);
+            } catch (_e) {
+            }
+            try {
+              await dbClient.from("renew_requests").update({
+                provisioning_status: "uncertain",
+                updated_at: (/* @__PURE__ */ new Date()).toISOString()
+              }).eq("id", cleanRequestId);
+            } catch (_e) {
+            }
+            const postDbFallbackRes = {
+              success: false,
+              autoRenewed: false,
+              provisional: false,
+              provisioningStatus: "uncertain",
+              fallbackToManual: true,
+              blockedReason: "post_xui_db_sync_failed",
+              uuid: clientUuid,
+              inboundId,
+              message: `3X-UI renewal succeeded but database sync failed (${dbErrText}). Marked 'uncertain' for safe admin reconciliation.`
+            };
+            throw makeClientLockFallbackError(postDbFallbackRes, true, dbErrText);
+          }
+          if (!options?.skipSideEffects) {
+            try {
+              await createCustomerNotification({
+                userId: requestUserId || vpnAccount.user_id || null,
+                userEmail: requestEmail || vpnAccount.email,
+                title: "VPN Renewed (Payment Pending Verification)",
+                message: `Your VPN subscription "${packageName}" has been renewed until ${new Date(calc.grantedExpiryMs).toLocaleDateString()}! Payment verification is pending admin review.`,
+                type: "renewal_approved",
+                vpnName: packageName
+              });
+            } catch (notifErr) {
+              console.warn("[AutoRenew] Customer notification warning:", notifErr?.message || notifErr);
+            }
+            triggerBackgroundSyncIfNeeded("VPN Provisionally Renewed", true);
           }
           return {
-            success: false,
-            autoRenewed: false,
-            provisional: false,
-            provisioningStatus: "uncertain",
-            fallbackToManual: true,
-            blockedReason: "post_xui_db_sync_failed",
+            success: true,
+            autoRenewed: true,
+            provisional: true,
+            provisioningStatus: "provisional",
+            mode: calc.mode,
             uuid: clientUuid,
             inboundId,
-            message: `3X-UI renewal succeeded but database sync failed (${dbErrText}). Marked 'uncertain' for safe admin reconciliation.`
+            oldExpiryIso: new Date(calc.previousExpiryMs).toISOString(),
+            newExpiryIso: grantedExpiryIso,
+            grantedExpiryMs: calc.grantedExpiryMs,
+            grantedTotalBytes: calc.grantedTotalBytes,
+            addedQuotaBytes: calc.addedQuotaBytes,
+            dataAllowanceLabel,
+            packageName,
+            message: "VPN subscription renewed and provisionally activated pending payment verification."
           };
         }
-        if (!options?.skipSideEffects) {
-          try {
-            await createCustomerNotification({
-              userId: requestUserId || vpnAccount.user_id || null,
-              userEmail: requestEmail || vpnAccount.email,
-              title: "VPN Renewed (Payment Pending Verification)",
-              message: `Your VPN subscription "${packageName}" has been renewed until ${new Date(calc.grantedExpiryMs).toLocaleDateString()}! Payment verification is pending admin review.`,
-              type: "renewal_approved",
-              vpnName: packageName
-            });
-          } catch (notifErr) {
-            console.warn("[AutoRenew] Customer notification warning:", notifErr?.message || notifErr);
-          }
-          triggerBackgroundSyncIfNeeded("VPN Provisionally Renewed", true);
-        }
+      );
+    } catch (clientLockErr) {
+      if (clientLockErr?.__provisionalFallbackResult) {
+        return clientLockErr.__provisionalFallbackResult;
+      }
+      if (clientLockErr?.beforeExternalWrite === true && clientLockErr?.xuiUncertain === false) {
+        renewLockOutcome = "failed";
+        renewLockError = clientLockErr?.message || String(clientLockErr);
         return {
-          success: true,
-          autoRenewed: true,
-          provisional: true,
-          provisioningStatus: "provisional",
-          mode: calc.mode,
+          success: false,
+          autoRenewed: false,
+          provisional: false,
+          provisioningStatus: "pending",
+          fallbackToManual: true,
+          blockedReason: clientLockErr?.blockedReason || clientLockErr?.code || "REQUEST_TIMEOUT_BEFORE_MUTATION",
           uuid: clientUuid,
-          inboundId,
-          oldExpiryIso: new Date(calc.previousExpiryMs).toISOString(),
-          newExpiryIso: grantedExpiryIso,
-          grantedExpiryMs: calc.grantedExpiryMs,
-          grantedTotalBytes: calc.grantedTotalBytes,
-          addedQuotaBytes: calc.addedQuotaBytes,
-          dataAllowanceLabel,
-          packageName,
-          message: "VPN subscription renewed and provisionally activated pending payment verification."
+          message: clientLockErr?.message || "Automatic renewal aborted safely before 3X-UI mutation."
         };
       }
-    );
+      throw clientLockErr;
+    }
+  } catch (outerErr) {
+    if (outerErr?.beforeExternalWrite === true && outerErr?.xuiUncertain === false) {
+      renewLockOutcome = "failed";
+      renewLockError = outerErr?.message || String(outerErr);
+      return {
+        success: false,
+        autoRenewed: false,
+        provisional: false,
+        provisioningStatus: "pending",
+        fallbackToManual: true,
+        blockedReason: outerErr?.blockedReason || outerErr?.code || "REQUEST_TIMEOUT_BEFORE_MUTATION",
+        uuid: targetClientUuid || void 0,
+        message: outerErr?.message || "Automatic renewal aborted safely before 3X-UI mutation."
+      };
+    }
+    renewLockOutcome = outerErr?.xuiUncertain === true ? "uncertain" : "failed";
+    renewLockError = outerErr?.message || String(outerErr);
+    throw outerErr;
   } finally {
     if (renewLockRes.tableAvailable) {
       await finalizeDurableProvisioningOperationLock({
@@ -9977,14 +10983,17 @@ async function confirmProvisionalRenewal(renewRequestId, options) {
     conflictErr.statusCode = 409;
     throw conflictErr;
   }
-  if (grantRow.status === "provisioning") {
+  if (grantRow.status === "provisioning" || grantRow.status === "uncertain") {
     const conflictErr = new Error(
-      `Renewal request '${cleanRequestId}' currently has an in-flight provisioning grant (status=provisioning). Please wait or verify live 3X-UI client state before approving.`
+      grantRow.status === "uncertain" ? `Renewal request '${cleanRequestId}' has an uncertain external 3X-UI state (grant status=uncertain). Manual reconciliation required before confirming.` : `Renewal request '${cleanRequestId}' currently has an in-flight provisioning grant (status=provisioning). Please wait or verify live 3X-UI client state before approving.`
     );
     conflictErr.statusCode = 409;
+    conflictErr.code = "RECONCILIATION_REQUIRED";
+    conflictErr.beforeExternalWrite = true;
+    conflictErr.xuiUncertain = false;
     throw conflictErr;
   }
-  const isUncertainReconciliation = grantRow.status === "uncertain";
+  const isUncertainReconciliation = false;
   const clientUuid = String(grantRow.client_uuid || "").trim();
   const grantedExpiryMs = Number(grantRow.granted_expiry_ms || 0);
   const grantedTotalBytes = Number(grantRow.granted_total_bytes || 0);
@@ -9997,7 +11006,7 @@ async function confirmProvisionalRenewal(renewRequestId, options) {
       operationType: "client_lock",
       targetId: `approve_renew:${cleanRequestId}`,
       requireDurableLock: true,
-      allowUncertainRecovery: true,
+      allowUncertainRecovery: false,
       metadata: { renewRequestId: cleanRequestId, action: "confirm_provisional_renewal" }
     },
     async (assertClientLockStillHeld) => {
@@ -10188,6 +11197,16 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
     conflictErr.statusCode = 409;
     throw conflictErr;
   }
+  if (grantRow.status === "provisioning" || grantRow.status === "uncertain") {
+    const conflictErr = new Error(
+      `Renewal request '${cleanRequestId}' has an unresolved or uncertain external 3X-UI state (grant status=${grantRow.status}); manual reconciliation required before rejection.`
+    );
+    conflictErr.statusCode = 409;
+    conflictErr.code = "RECONCILIATION_REQUIRED";
+    conflictErr.beforeExternalWrite = true;
+    conflictErr.xuiUncertain = false;
+    throw conflictErr;
+  }
   const clientUuid = String(grantRow.client_uuid || "").trim();
   const inboundId = Number(grantRow.inbound_id || 0);
   const prevExpiryMs = Math.max(0, Math.trunc(Number(grantRow.previous_expiry_ms || 0)));
@@ -10210,7 +11229,7 @@ async function revokeProvisionalRenewal(renewRequestId, reason, options) {
       operationType: "client_lock",
       targetId: `reject_renew:${cleanRequestId}`,
       requireDurableLock: true,
-      allowUncertainRecovery: true,
+      allowUncertainRecovery: false,
       metadata: { renewRequestId: cleanRequestId, action: "revoke_provisional_renewal", reason }
     },
     async (assertClientLockStillHeld) => {
@@ -10845,6 +11864,7 @@ var init_xuiService = __esm({
     init_telegramService();
     init_notificationService();
     init_emailService();
+    init_discountService();
     TRIAL_GRACE_PERIOD_MINUTES = Number(process.env.TRIAL_GRACE_PERIOD_MINUTES) || 5;
     TRIAL_GRACE_PERIOD_MS = TRIAL_GRACE_PERIOD_MINUTES * 60 * 1e3;
     cachedInbounds = [];
@@ -11984,31 +13004,63 @@ var init_xuiService = __esm({
               const now = deps?.nowMs ?? Date.now();
               const baseTime = currentExpiry > now ? currentExpiry : now;
               const new_expiryTime = addCalendarMonths(baseTime, durationMonths);
-              let isLimitedPlan = false;
-              let packageDataLimitBytes = 0;
               const safeMonths = Math.max(1, Math.round(Number(durationMonths) || 1));
-              if (planName) {
-                const lowerPlan = planName.toLowerCase();
-                if (lowerPlan.includes("unlimited") || lowerPlan.includes("unlimit")) {
-                  isLimitedPlan = false;
-                } else if (lowerPlan.includes("100gb") || lowerPlan.includes("100 gb") || lowerPlan.includes("100")) {
-                  isLimitedPlan = true;
-                  packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
-                } else {
-                  const gbMatch = lowerPlan.match(/(\d+)\s*gb/);
-                  if (gbMatch) {
-                    isLimitedPlan = true;
-                    packageDataLimitBytes = parseInt(gbMatch[1], 10) * 1024 * 1024 * 1024 * safeMonths;
-                  }
-                }
+              const parsedLiveTotal = parseVerifiedLiveTotalBytes(c.totalGB);
+              if (!parsedLiveTotal.valid) {
+                const invalidLiveQuotaErr = new Error(
+                  `Live 3X-UI client '${uuid}' has missing or invalid totalGB (${String(c.totalGB)}); refusing to interpret invalid quota as Unlimited.`
+                );
+                invalidLiveQuotaErr.statusCode = 409;
+                invalidLiveQuotaErr.code = "INVALID_LIVE_CLIENT_QUOTA";
+                invalidLiveQuotaErr.beforeExternalWrite = true;
+                invalidLiveQuotaErr.xuiUncertain = false;
+                throw invalidLiveQuotaErr;
               }
-              const currentTotalBytes = Number(c.totalGB || 0);
+              const currentTotalBytes = parsedLiveTotal.totalBytes;
+              const inboundClientStats = Array.isArray(inbound.clientStats) ? inbound.clientStats : [];
+              const liveStat = inboundClientStats.find((s) => String(s.id || "").trim().toLowerCase() === normalizedTargetUuid) || inboundClientStats.find(
+                (s) => c.email && String(s.email || "").trim().toLowerCase() === String(c.email).trim().toLowerCase()
+              );
+              const liveUpBytes = Math.max(0, Math.trunc(Number(liveStat?.up ?? c.up ?? 0) || 0));
+              const liveDownBytes = Math.max(0, Math.trunc(Number(liveStat?.down ?? c.down ?? 0) || 0));
+              const liveUsedBytes = liveUpBytes + liveDownBytes;
               let newTotalBytes = currentTotalBytes;
-              if (planName) {
-                if (isLimitedPlan) {
-                  newTotalBytes = currentTotalBytes + packageDataLimitBytes;
+              if (deps?.verifiedQuota) {
+                if (deps.verifiedQuota.quotaMode === "finite") {
+                  const verifiedAddedBytes = Math.max(0, Math.trunc(Number(deps.verifiedQuota.addedQuotaBytes) || 0));
+                  if (verifiedAddedBytes <= 0) {
+                    const invalidQuotaErr = new Error(
+                      "Verified finite renewal quota has non-positive addedQuotaBytes; refusing to modify 3X-UI."
+                    );
+                    invalidQuotaErr.statusCode = 409;
+                    invalidQuotaErr.code = "UNVERIFIED_RENEWAL_QUOTA_METADATA";
+                    invalidQuotaErr.beforeExternalWrite = true;
+                    invalidQuotaErr.xuiUncertain = false;
+                    throw invalidQuotaErr;
+                  }
+                  const baseBytes = currentExpiry <= now && liveUsedBytes > 0 ? liveUsedBytes : Math.max(currentTotalBytes, liveUsedBytes);
+                  newTotalBytes = baseBytes + verifiedAddedBytes;
                 } else {
                   newTotalBytes = 0;
+                }
+              } else {
+                const parsedPlanSignal = parseExplicitRenewalQuotaSignal(planName);
+                const isCanonicalFiniteRate = parsedPlanSignal.kind === "finite" && (parsedPlanSignal.monthlyGb === 100 || safeMonths > 1 && parsedPlanSignal.monthlyGb === 100 * safeMonths);
+                if (isCanonicalFiniteRate) {
+                  const packageDataLimitBytes = 100 * 1024 * 1024 * 1024 * safeMonths;
+                  const baseBytes = currentExpiry <= now && liveUsedBytes > 0 ? liveUsedBytes : Math.max(currentTotalBytes, liveUsedBytes);
+                  newTotalBytes = baseBytes + packageDataLimitBytes;
+                } else if (parsedPlanSignal.kind === "unlimited") {
+                  newTotalBytes = 0;
+                } else {
+                  const unverifiedErr = new Error(
+                    `Cannot verify renewal data quota tier (100GB vs Unlimited) from plan metadata ('${String(planName || "")}'). Refusing to default to Unlimited; manual reconciliation required.`
+                  );
+                  unverifiedErr.statusCode = 409;
+                  unverifiedErr.code = parsedPlanSignal.kind === "ambiguous" ? "AMBIGUOUS_QUOTA_METADATA" : "UNVERIFIED_RENEWAL_QUOTA_METADATA";
+                  unverifiedErr.beforeExternalWrite = true;
+                  unverifiedErr.xuiUncertain = false;
+                  throw unverifiedErr;
                 }
               }
               const clientAny = c;
@@ -27357,71 +28409,7 @@ var errorMiddleware = (err, _req, res, _next) => {
 // server.ts
 init_xuiService();
 init_telegramService();
-
-// src/utils/apiTimeoutRoutes.ts
-var BACKEND_EXTENDED_API_TIMEOUT_MS = 7e4;
-var BACKEND_DEFAULT_API_TIMEOUT_MS = 25e3;
-var EXACT_EXTENDED_ADMIN_POST_PATHS = /* @__PURE__ */ new Set([
-  "/admin/approve-order",
-  "/admin/reject-order",
-  "/admin/verify-payment",
-  "/renew/orders",
-  "/renew/request"
-]);
-var EXACT_EXTENDED_TELEGRAM_POST_PATHS = /* @__PURE__ */ new Set([
-  "/telegram/webhook",
-  "/telegram/callback"
-]);
-var EXACT_EXTENDED_ADMIN_POST_PATTERNS = [
-  /^\/admin\/orders\/[^/]+\/approve$/,
-  /^\/admin\/orders\/[^/]+\/reject$/,
-  /^\/admin\/orders\/[^/]+\/verify-payment$/,
-  /^\/renew\/approve\/[^/]+$/,
-  /^\/renew\/reject\/[^/]+$/
-];
-var EXACT_CLAIM_TRIAL_POST_PATTERNS = [
-  /^\/vpn\/claim-trial$/,
-  /^\/client\/claim-trial$/,
-  /^\/trial\/claim-trial$/,
-  /^\/claim-trial$/
-];
-function normalizeApiRoutePath(rawPath) {
-  let clean = String(rawPath || "").split("?")[0].trim();
-  if (!clean.startsWith("/")) {
-    clean = `/${clean}`;
-  }
-  if (clean.toLowerCase().startsWith("/api/")) {
-    clean = clean.slice(4);
-  } else if (clean.toLowerCase() === "/api") {
-    clean = "/";
-  }
-  return clean.replace(/\/+$/, "") || "/";
-}
-function isExtendedTimeoutBackendApiRequest(method, path3) {
-  const normalizedMethod = String(method || "GET").toUpperCase();
-  if (normalizedMethod !== "POST") {
-    return false;
-  }
-  const normalizedPath = normalizeApiRoutePath(path3);
-  if (EXACT_EXTENDED_ADMIN_POST_PATHS.has(normalizedPath)) {
-    return true;
-  }
-  if (EXACT_EXTENDED_TELEGRAM_POST_PATHS.has(normalizedPath)) {
-    return true;
-  }
-  if (EXACT_EXTENDED_ADMIN_POST_PATTERNS.some((pattern) => pattern.test(normalizedPath))) {
-    return true;
-  }
-  if (EXACT_CLAIM_TRIAL_POST_PATTERNS.some((pattern) => pattern.test(normalizedPath))) {
-    return true;
-  }
-  return false;
-}
-function getBackendApiTimeoutMs(method, path3) {
-  return isExtendedTimeoutBackendApiRequest(method, path3) ? BACKEND_EXTENDED_API_TIMEOUT_MS : BACKEND_DEFAULT_API_TIMEOUT_MS;
-}
-
-// server.ts
+init_apiTimeoutRoutes();
 dotenv2.config();
 process.on("unhandledRejection", (reason, promise) => {
   console.error("[Server] Unhandled Rejection at:", promise, "reason:", reason);
